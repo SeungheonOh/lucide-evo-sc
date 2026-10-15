@@ -1,3 +1,8 @@
+import {
+  scCertificateBuilder,
+  recordScBlock,
+  scWitness,
+} from "../../sc-tools/intent.js";
 import { Lovelace, Redeemer, RewardAddress } from "@lucid-evolution/core-types";
 import * as TxBuilder from "../TxBuilder.js";
 import { Effect, pipe } from "effect";
@@ -49,7 +54,9 @@ export const registerStake = (
 
     if (redeemer !== undefined) {
       const buildCert = (credential: CML.Credential) =>
-        CML.SingleCertificateBuilder.new(
+        scCertificateBuilder(
+          config,
+          redeemer,
           CML.Certificate.new_reg_cert(
             credential,
             config.lucidConfig.protocolParameters.keyDeposit,
@@ -59,7 +66,9 @@ export const registerStake = (
       return;
     }
 
-    const certBuilder = CML.SingleCertificateBuilder.new(
+    const certBuilder = scCertificateBuilder(
+      config,
+      redeemer,
       CML.Certificate.new_stake_registration(credential),
     );
     config.txBuilder.add_cert(certBuilder.skip_witness());
@@ -91,7 +100,9 @@ export const deRegisterStake = (
       credential: CML.Credential,
       config: TxBuilder.TxBuilderConfig,
     ): CML.SingleCertificateBuilder => {
-      return CML.SingleCertificateBuilder.new(
+      return scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_unreg_cert(
           credential,
           config.lucidConfig.protocolParameters.keyDeposit,
@@ -205,6 +216,15 @@ export const withdraw =
         ),
       );
 
+      if (config.lucidConfig.balancer)
+        recordScBlock(config, {
+          type: "withdrawal",
+          address: rewardAddress,
+          lovelace: String(amount),
+          ...(stakeCredential.type === "Script"
+            ? { witness: scWitness(config, stakeCredential.hash, redeemer) }
+            : {}),
+        });
       const handleRedeemer = () =>
         pipe(
           Effect.fromNullable(redeemer),

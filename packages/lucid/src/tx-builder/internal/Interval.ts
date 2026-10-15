@@ -1,3 +1,4 @@
+import { recordScValidity } from "../../sc-tools/intent.js";
 import { Effect } from "effect";
 import { UnixTime } from "@lucid-evolution/core-types";
 import * as TxBuilder from "../TxBuilder.js";
@@ -12,6 +13,7 @@ export const validFrom = (unixTime: UnixTime) =>
       config.lucidConfig.slotConfig,
     );
     config.txBuilder.set_validity_start_interval(BigInt(slot));
+    recordScValidity(config, "from", slot);
   });
 export const validTo = (unixTime: UnixTime) =>
   Effect.gen(function* () {
@@ -21,4 +23,5 @@ export const validTo = (unixTime: UnixTime) =>
       config.lucidConfig.slotConfig,
     );
     config.txBuilder.set_ttl(BigInt(slot));
+    recordScValidity(config, "until", slot);
   });

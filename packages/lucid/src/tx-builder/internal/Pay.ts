@@ -1,3 +1,4 @@
+import { recordScOutput } from "../../sc-tools/intent.js";
 import { Effect, Scope } from "effect";
 import {
   addAssets,
@@ -74,6 +75,7 @@ const addOutput = (
     );
     config.payToOutputs = [...config.payToOutputs, coreToTxOutput(output)];
     config.txBuilder.add_output(outputResult);
+    recordScOutput(config, output, outputResult);
   });
 
 /** Pay to a public key or native script address with datum or scriptRef. */

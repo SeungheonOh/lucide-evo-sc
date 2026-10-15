@@ -1,3 +1,8 @@
+import { recordScInput } from "../../sc-tools/intent.js";
+import {
+  balanceScTools,
+  ScToolsRedeemerRefresh,
+} from "../../sc-tools/complete.js";
 import {
   Effect,
   pipe,
@@ -34,6 +39,7 @@ import * as UPLC from "@lucid-evolution/uplc";
 import * as TxBuilder from "../TxBuilder.js";
 import * as TxSignBuilder from "../../tx-sign-builder/TxSignBuilder.js";
 import {
+  createCostModels,
   assetsToValue,
   coreToTxOutput,
   isEqualUTxO,
@@ -242,101 +248,132 @@ const completeCurrentConfig = (
     yield* Effect.all(config.programs);
     yield* GovernanceAction.finalizeVotes();
     yield* applyTreasuryDonationToBuilder(config);
-    const hasPlutusScriptExecutions: boolean = Array.from(
-      config.scripts.values(),
-    ).some((value) => value.type !== "Native");
-
-    // First round of coin selection and UPLC evaluation. The fee estimation is lacking
-    // the script execution costs as they aren't available yet.
-    let evaluatedScriptBody = yield* selectionAndEvaluation(
-      walletInputs,
-      changeAddress,
-      coinSelection,
-      localUPLCEval,
-      evaluator,
-      includeLeftoverLovelaceAsFee,
-      false,
-      internalOptions.bootstrapExUnits === true,
-      internalOptions.knownRedeemerExUnits,
-      internalOptions.redeemerInputFingerprint,
-    );
-    // Second round of coin selection by including script execution costs in fee estimation.
-    // UPLC evaluation need to be performed again if new inputs are selected during coin selection.
-    // Because increasing the inputs can increase the script execution budgets.
-    // Set collateral input if there are script executions
-    if (hasPlutusScriptExecutions) {
-      const estimatedFee = yield* estimateFee(config, true);
-
-      const totalCollateral = BigInt(
-        Math.ceil(
-          Math.max(
-            (config.lucidConfig.protocolParameters.collateralPercentage *
-              Number(estimatedFee)) /
-              100,
-            Number(setCollateral),
+    let transaction: CML.Transaction;
+    if (config.lucidConfig.balancer) {
+      transaction = yield* Effect.tryPromise({
+        try: () =>
+          balanceScTools(
+            config,
+            walletInputs,
+            changeAddress,
+            options,
+            internalOptions,
+            async (tx, chain) => {
+              const models = createCostModels(
+                chain.protocolParameters
+                  .costModels as import("@lucid-evolution/core-types").CostModels,
+              );
+              try {
+                return await Effect.runPromise(
+                  refreshScriptDataHash(tx, {
+                    ...config,
+                    lucidConfig: { ...config.lucidConfig, costModels: models },
+                  }),
+                );
+              } finally {
+                models.free();
+              }
+            },
           ),
-        ),
-      );
-      const collateralInput = yield* findCollateral(
-        config.lucidConfig.protocolParameters.coinsPerUtxoByte,
-        totalCollateral,
+        catch: (error) =>
+          error instanceof ScToolsRedeemerRefresh
+            ? new RedeemerInputRefreshRequired(error.transaction)
+            : completeTxError(error),
+      });
+    } else {
+      const hasPlutusScriptExecutions: boolean = Array.from(
+        config.scripts.values(),
+      ).some((value) => value.type !== "Native");
+
+      // First round of coin selection and UPLC evaluation. The fee estimation is lacking
+      // the script execution costs as they aren't available yet.
+      let evaluatedScriptBody = yield* selectionAndEvaluation(
         walletInputs,
+        changeAddress,
+        coinSelection,
+        localUPLCEval,
+        evaluator,
+        includeLeftoverLovelaceAsFee,
+        false,
+        internalOptions.bootstrapExUnits === true,
+        internalOptions.knownRedeemerExUnits,
+        internalOptions.redeemerInputFingerprint,
       );
-      yield* applyCollateral(totalCollateral, collateralInput, changeAddress);
-      evaluatedScriptBody =
-        (yield* selectionAndEvaluation(
-          walletInputs,
-          changeAddress,
-          coinSelection,
-          localUPLCEval,
-          evaluator,
-          includeLeftoverLovelaceAsFee,
-          true,
-          internalOptions.bootstrapExUnits === true,
-          internalOptions.knownRedeemerExUnits,
-          internalOptions.redeemerInputFingerprint,
-        )) || evaluatedScriptBody;
-    }
-    yield* applyEffectiveFee(config, true, evaluatedScriptBody);
-    withCMLScope((own) =>
-      config.txBuilder.add_change_if_needed(
-        own(CML.Address.from_bech32(changeAddress)),
-        true,
-      ),
-    );
-    const builtTransaction = yield* Effect.try({
-      try: () =>
-        withCMLScope((own) =>
-          own(
-            config.txBuilder.build(
-              CML.ChangeSelectionAlgo.Default,
-              own(CML.Address.from_bech32(changeAddress)),
+      // Second round of coin selection by including script execution costs in fee estimation.
+      // UPLC evaluation need to be performed again if new inputs are selected during coin selection.
+      // Because increasing the inputs can increase the script execution budgets.
+      // Set collateral input if there are script executions
+      if (hasPlutusScriptExecutions) {
+        const estimatedFee = yield* estimateFee(config, true);
+
+        const totalCollateral = BigInt(
+          Math.ceil(
+            Math.max(
+              (config.lucidConfig.protocolParameters.collateralPercentage *
+                Number(estimatedFee)) /
+                100,
+              Number(setCollateral),
             ),
-          ).build_unchecked(),
+          ),
+        );
+        const collateralInput = yield* findCollateral(
+          config.lucidConfig.protocolParameters.coinsPerUtxoByte,
+          totalCollateral,
+          walletInputs,
+        );
+        yield* applyCollateral(totalCollateral, collateralInput, changeAddress);
+        evaluatedScriptBody =
+          (yield* selectionAndEvaluation(
+            walletInputs,
+            changeAddress,
+            coinSelection,
+            localUPLCEval,
+            evaluator,
+            includeLeftoverLovelaceAsFee,
+            true,
+            internalOptions.bootstrapExUnits === true,
+            internalOptions.knownRedeemerExUnits,
+            internalOptions.redeemerInputFingerprint,
+          )) || evaluatedScriptBody;
+      }
+      yield* applyEffectiveFee(config, true, evaluatedScriptBody);
+      withCMLScope((own) =>
+        config.txBuilder.add_change_if_needed(
+          own(CML.Address.from_bech32(changeAddress)),
+          true,
         ),
-      catch: (error) => completeTxError(error),
-    });
-    const shouldCanonicalize = canonical || internalOptions.forceCanonical;
-    const transactionBeforeScriptDataHash = shouldCanonicalize
-      ? CML.Transaction.from_cbor_bytes(
-          builtTransaction.to_canonical_cbor_bytes(),
-        )
-      : builtTransaction;
-    const normalizedTransaction = yield* Effect.try({
-      try: () =>
-        normalizeGovernanceRedeemerIndices(
-          transactionBeforeScriptDataHash,
-          config.governanceVoteWitnessKeys,
-          config.governanceProposalWitnessIndices,
-        ).transaction,
-      catch: (error) => completeTxError(error),
-    });
-    freeCML(builtTransaction, transactionBeforeScriptDataHash);
-    const transaction = yield* refreshScriptDataHash(
-      normalizedTransaction,
-      config,
-    );
-    if (transaction !== normalizedTransaction) normalizedTransaction.free();
+      );
+      const builtTransaction = yield* Effect.try({
+        try: () =>
+          withCMLScope((own) =>
+            own(
+              config.txBuilder.build(
+                CML.ChangeSelectionAlgo.Default,
+                own(CML.Address.from_bech32(changeAddress)),
+              ),
+            ).build_unchecked(),
+          ),
+        catch: (error) => completeTxError(error),
+      });
+      const shouldCanonicalize = canonical || internalOptions.forceCanonical;
+      const transactionBeforeScriptDataHash = shouldCanonicalize
+        ? CML.Transaction.from_cbor_bytes(
+            builtTransaction.to_canonical_cbor_bytes(),
+          )
+        : builtTransaction;
+      const normalizedTransaction = yield* Effect.try({
+        try: () =>
+          normalizeGovernanceRedeemerIndices(
+            transactionBeforeScriptDataHash,
+            config.governanceVoteWitnessKeys,
+            config.governanceProposalWitnessIndices,
+          ).transaction,
+        catch: (error) => completeTxError(error),
+      });
+      freeCML(builtTransaction, transactionBeforeScriptDataHash);
+      transaction = yield* refreshScriptDataHash(normalizedTransaction, config);
+      if (transaction !== normalizedTransaction) normalizedTransaction.free();
+    }
 
     const derivedInputs = deriveInputsFromTransaction(transaction);
 
@@ -473,7 +510,11 @@ const completeDelayedFromActions = (
       const result = completion.right;
       const tx = result[2].toTransaction();
       if (usedBootstrapExUnits) {
-        bootstrapWalletInputs = replayConfig.collectedInputs.filter((utxo) =>
+        bootstrapWalletInputs = (
+          replayConfig.lucidConfig.balancer
+            ? replayConfig.consumedInputs
+            : replayConfig.collectedInputs
+        ).filter((utxo) =>
           fixedWalletInputs.some((walletInput) =>
             isEqualUTxO(walletInput, utxo),
           ),
@@ -564,6 +605,7 @@ const addWalletInputs = (
           config.txBuilder.add_input(own(builder.payment_key()));
         });
         config.collectedInputs = [...config.collectedInputs, utxo];
+        recordScInput(config, utxo);
       }
     },
     catch: (error) => completeTxError(error),

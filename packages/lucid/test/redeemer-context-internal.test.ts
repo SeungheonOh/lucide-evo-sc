@@ -1682,7 +1682,7 @@ describe("context-dependent redeemers internal coverage", () => {
     expect(stableRedeemer).toHaveBeenCalled();
   });
 
-  test("vote context counts key voters before Plutus voting witnesses", async () => {
+  test("vote context orders script credentials before key credentials, as the ledger does", async () => {
     const walletInput = makeRichUtxo("c7");
     const keyVoter = {
       type: "DRep" as const,
@@ -1699,13 +1699,13 @@ describe("context-dependent redeemers internal coverage", () => {
     const evaluateTx = vi.fn<Provider["evaluateTx"]>(async () => [
       {
         redeemer_tag: "vote",
-        redeemer_index: 1,
+        redeemer_index: 0,
         ex_units: { mem: 641_000, steps: 741_000 },
       },
     ]);
     const stableRedeemer = vi.fn<BuildTxWithRedeemer>((ctx) => {
       expect(ctx.ownPurpose.tag).toBe("vote");
-      expect(ctx.ownPurpose.index).toBe(1n);
+      expect(ctx.ownPurpose.index).toBe(0n);
       return Data.to(88n);
     });
 
@@ -1726,7 +1726,7 @@ describe("context-dependent redeemers internal coverage", () => {
     expect(tx.body().voting_procedures()?.len()).toBe(2);
     const [redeemer] = canonicalRedeemerEntries(tx.witness_set().redeemers()!);
     expect(redeemer.tag).toBe("vote");
-    expect(redeemer.index).toBe(1n);
+    expect(redeemer.index).toBe(0n);
     expect(redeemer.data.to_canonical_cbor_hex()).toBe(
       redeemerData(88n).to_canonical_cbor_hex(),
     );

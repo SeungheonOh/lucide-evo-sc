@@ -27,10 +27,16 @@ export const completeTxSigner = (
           config.witnessSetBuilder.add_plutus_datum(plutus_datums.get(i));
         }
       }
+      const mergedWitnesses = own(config.witnessSetBuilder.build());
+      const redeemers = own(witnessSet.redeemers());
+      // The signing builder flattens Conway redeemer maps into legacy arrays.
+      // Preserve the original representation: its bytes are part of the script
+      // data hash already committed to by the body and every signature.
+      if (redeemers) mergedWitnesses.set_redeemers(redeemers);
       // `Transaction.new` takes ownership of the auxiliary data.
       return CML.Transaction.new(
         own(config.txComplete.body()),
-        own(config.witnessSetBuilder.build()),
+        mergedWitnesses,
         true,
         config.txComplete.auxiliary_data(),
       );

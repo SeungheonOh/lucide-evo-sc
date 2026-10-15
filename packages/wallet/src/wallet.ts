@@ -326,6 +326,17 @@ export function discoverOwnUsedTxKeyHashes(
     }
     keyHashFromCert(txBody);
 
+    // Governance votes can require the wallet's stake key even when there is
+    // no withdrawal or certificate in the transaction.
+    const votingProcedures = own(txBody.voting_procedures());
+    const voters = votingProcedures && own(votingProcedures.keys());
+    if (voters) {
+      for (let i = 0; i < voters.len(); i++) {
+        const key = own(own(voters.get(i)).key_hash());
+        if (key) usedKeyHashes.push(key.to_hex());
+      }
+    }
+
     // key hashes from withdrawals
 
     const withdrawals = own(txBody.withdrawals());

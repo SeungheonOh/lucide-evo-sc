@@ -1,3 +1,4 @@
+import { scCertificateBuilder } from "../../sc-tools/intent.js";
 import {
   Anchor,
   DRep,
@@ -62,7 +63,9 @@ export const delegateVoteToDRep = (
     );
     const cmlDRep: CML.DRep = toCMLDRep(drep);
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_vote_deleg_cert(credential, cmlDRep),
       );
 
@@ -83,7 +86,9 @@ export const delegateVoteToPoolAndDRep = (
     );
     const cmlDRep = toCMLDRep(drep);
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_stake_vote_deleg_cert(
           credential,
           CML.Ed25519KeyHash.from_bech32(poolId),
@@ -107,7 +112,9 @@ export const registerAndDelegateToPool = (
     );
 
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_stake_reg_deleg_cert(
           credential,
           CML.Ed25519KeyHash.from_bech32(poolId),
@@ -131,7 +138,9 @@ export const registerAndDelegateToDRep = (
     );
     const cmlDRep = toCMLDRep(drep);
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_vote_reg_deleg_cert(
           credential,
           cmlDRep,
@@ -156,7 +165,9 @@ export const registerAndDelegateToPoolAndDRep = (
     );
     const cmlDRep = toCMLDRep(drep);
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_stake_vote_reg_deleg_cert(
           credential,
           CML.Ed25519KeyHash.from_bech32(poolId),
@@ -187,7 +198,9 @@ export const registerDRep = (
       : undefined;
 
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_reg_drep_cert(
           credential,
           config.lucidConfig.protocolParameters.drepDeposit,
@@ -209,7 +222,9 @@ export const deregisterDRep = (
     );
 
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_unreg_drep_cert(
           credential,
           config.lucidConfig.protocolParameters.drepDeposit,
@@ -237,7 +252,9 @@ export const updateDRep = (
         )
       : undefined;
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_update_drep_cert(credential, cmlAnchor),
       );
     yield* processCertificate(stakeCredential, config, buildCert, redeemer);
@@ -257,7 +274,9 @@ export const authCommitteeHot = (
         ? CML.Credential.new_pub_key(CML.Ed25519KeyHash.from_hex(hotCred.hash))
         : CML.Credential.new_script(CML.ScriptHash.from_hex(hotCred.hash));
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_auth_committee_hot_cert(credential, hotCredential),
       );
 
@@ -280,7 +299,9 @@ export const resignCommitteeHot = (
       : undefined;
 
     const buildCert = (credential: CML.Credential) =>
-      CML.SingleCertificateBuilder.new(
+      scCertificateBuilder(
+        config,
+        redeemer,
         CML.Certificate.new_resign_committee_cold_cert(credential, cmlAnchor),
       );
 

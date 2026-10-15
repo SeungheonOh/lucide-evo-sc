@@ -1,3 +1,4 @@
+import { recordScBlock } from "../../sc-tools/intent.js";
 import {
   Address,
   PaymentKeyHash,
@@ -48,6 +49,7 @@ export const addSigner = (address: Address | RewardAddress) =>
 export const addSignerKey = (keyHash: PaymentKeyHash | StakeKeyHash) =>
   Effect.gen(function* () {
     const { config } = yield* TxConfig;
+    recordScBlock(config, { type: "signer", keyHash });
     withCMLScope((own) =>
       config.txBuilder.add_required_signer(
         own(CML.Ed25519KeyHash.from_hex(keyHash)),

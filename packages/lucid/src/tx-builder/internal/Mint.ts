@@ -1,3 +1,4 @@
+import { recordScMint } from "../../sc-tools/intent.js";
 import { Effect, pipe } from "effect";
 import { withCMLScope } from "@lucid-evolution/core-utils";
 import { Assets, Redeemer } from "@lucid-evolution/core-types";
@@ -73,5 +74,6 @@ export const mintAssets = (assets: Assets) => (redeemer?: Redeemer) =>
             ),
       );
       config.txBuilder.add_mint(result);
+      recordScMint(config, assets, red);
     });
   });

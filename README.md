@@ -15,6 +15,8 @@
   <img alt="NPM Version" src="https://img.shields.io/npm/v/%40lucid-evolution%2Flucid?color=%2350C62A">
 </p>
 
+This fork adds an optional [sc-tools WASM balancing backend and convex-mockchain integration](docs/integrations/sc-tools.md). Full Lucid parity is not yet achieved; see the guide for known compatibility limits, setup, and verification. The WASM bridge is maintained as a separate project.
+
 There are a growing number of projects that are built on top of `lucid-evolution`! If you've built a library or a project on top of lucid-evolution, tell me about it [on X](https://twitter.com/solidsnakedev) or [on Discord](https://discord.gg/s89P9gpEff) . I'll add it below and tweet it out.
 
 <h3 align="center">Powered by Lucid Evolution</span></h1>

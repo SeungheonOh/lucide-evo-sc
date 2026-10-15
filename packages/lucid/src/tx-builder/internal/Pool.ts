@@ -1,3 +1,4 @@
+import { scCertificateBuilder } from "../../sc-tools/intent.js";
 import {
   PoolId,
   PoolParams,
@@ -17,7 +18,7 @@ import {
 } from "./TxUtils.js";
 import * as CML from "@anastasia-labs/cardano-multiplatform-lib-nodejs";
 import { LucidConfig } from "../../lucid-evolution/LucidEvolution.js";
-import { fromText } from "@lucid-evolution/core-utils";
+import { blake2b } from "@noble/hashes/blake2b";
 import { TxConfig } from "./Service.js";
 
 export const poolError = (cause: unknown) =>
@@ -51,7 +52,9 @@ export const delegateTo = (
         const credential = CML.Credential.new_pub_key(
           CML.Ed25519KeyHash.from_hex(stakeCredential.hash),
         );
-        const certBuilder = CML.SingleCertificateBuilder.new(
+        const certBuilder = scCertificateBuilder(
+          config,
+          redeemer,
           CML.Certificate.new_stake_delegation(
             credential,
             CML.Ed25519KeyHash.from_bech32(poolId),
@@ -65,7 +68,9 @@ export const delegateTo = (
         const credential = CML.Credential.new_script(
           CML.ScriptHash.from_hex(stakeCredential.hash),
         );
-        const certBuilder = CML.SingleCertificateBuilder.new(
+        const certBuilder = scCertificateBuilder(
+          config,
+          redeemer,
           CML.Certificate.new_stake_delegation(
             credential,
             CML.Ed25519KeyHash.from_bech32(poolId),
@@ -137,7 +142,9 @@ export const registerPool = (poolParams: PoolParams) =>
       poolParams,
       config.lucidConfig,
     );
-    const certBuilder = CML.SingleCertificateBuilder.new(
+    const certBuilder = scCertificateBuilder(
+      config,
+      undefined,
       CML.Certificate.new_pool_registration(poolRegistration.pool_params()),
     );
 
@@ -147,7 +154,9 @@ export const registerPool = (poolParams: PoolParams) =>
 export const retirePool = (poolId: PoolId, epoch: bigint) =>
   Effect.gen(function* () {
     const { config } = yield* TxConfig;
-    const certBuilder = CML.SingleCertificateBuilder.new(
+    const certBuilder = scCertificateBuilder(
+      config,
+      undefined,
       CML.Certificate.new_pool_retirement(
         CML.Ed25519KeyHash.from_bech32(poolId),
         epoch,
@@ -177,25 +186,24 @@ const createPoolRegistration = (poolParams: PoolParams, lucid: LucidConfig) =>
     for (const relay of poolParams.relays) {
       switch (relay.type) {
         case "SingleHostIp": {
-          //TODO: missing test
           const ipV4 = relay.ipV4
             ? CML.Ipv4.from_cbor_bytes(
-                new Uint8Array(relay.ipV4.split(".").map((b) => parseInt(b))),
+                Uint8Array.of(0x44, ...ipv4Bytes(relay.ipV4)),
               )
             : undefined;
-          //TODO: missing test
           const ipV6 = relay.ipV6
-            ? CML.Ipv6.from_cbor_hex(relay.ipV6.replaceAll(":", ""))
+            ? CML.Ipv6.from_cbor_bytes(
+                Uint8Array.of(0x50, ...ipv6Bytes(relay.ipV6)),
+              )
             : undefined;
           relays.add(CML.Relay.new_single_host_addr(relay.port, ipV4, ipV6));
           break;
         }
-        //TODO: missing test
         case "SingleHostDomainName": {
           relays.add(
             CML.Relay.new_single_host_name(
               relay.port,
-              CML.DNSName.from_cbor_hex(fromText(relay.domainName!)),
+              CML.DNSName.from_json(JSON.stringify(relay.domainName)),
             ),
           );
           break;
@@ -203,7 +211,7 @@ const createPoolRegistration = (poolParams: PoolParams, lucid: LucidConfig) =>
         case "MultiHost": {
           relays.add(
             CML.Relay.new_multi_host_name(
-              CML.DNSName.from_cbor_hex(fromText(relay.domainName!)),
+              CML.DNSName.from_json(JSON.stringify(relay.domainName)),
             ),
           );
           break;
@@ -216,10 +224,7 @@ const createPoolRegistration = (poolParams: PoolParams, lucid: LucidConfig) =>
         CML.VRFKeyHash.from_hex(poolParams.vrfKeyHash),
         poolParams.pledge,
         poolParams.cost,
-        CML.UnitInterval.new(
-          BigInt(poolParams.margin),
-          BigInt(poolParams.margin),
-        ),
+        poolMargin(poolParams.margin),
         CML.RewardAddress.from_address(
           yield* toCMLAddress(poolParams.rewardAddress, lucid),
         )!,
@@ -227,7 +232,7 @@ const createPoolRegistration = (poolParams: PoolParams, lucid: LucidConfig) =>
         relays,
         metadataHash
           ? CML.PoolMetadata.new(
-              CML.Url.from_cbor_hex(fromText(poolParams.metadataUrl!)),
+              CML.Url.from_json(JSON.stringify(poolParams.metadataUrl)),
               metadataHash,
             )
           : undefined,
@@ -243,13 +248,67 @@ const getMetadataHash = (metadataUrl?: string) =>
           try: () => fetch(metadataUrl),
           catch: (cause) => poolError(cause),
         }),
-        Effect.andThen((resp) => Effect.promise(() => resp.arrayBuffer())),
+        Effect.andThen((resp) =>
+          resp.ok
+            ? Effect.tryPromise({
+                try: () => resp.arrayBuffer(),
+                catch: poolError,
+              })
+            : Effect.fail(
+                poolError(`Pool metadata request failed: ${resp.status}`),
+              ),
+        ),
       );
       const metadataHash = CML.PoolMetadataHash.from_raw_bytes(
-        new Uint8Array(metadata),
+        blake2b(new Uint8Array(metadata), { dkLen: 32 }),
       );
       return metadataHash;
     } else {
       return null;
     }
   });
+
+// Convert the public decimal margin to an exact ledger fraction, including 0.
+const poolMargin = (margin: number): CML.UnitInterval => {
+  if (!Number.isFinite(margin) || margin < 0 || margin > 1) {
+    throw new Error("Pool margin must be between 0 and 1");
+  }
+  const [coefficient, exponent = "0"] = String(margin).split("e");
+  const [whole, fraction = ""] = coefficient.split(".");
+  let numerator = BigInt(whole + fraction);
+  let denominator = 10n ** BigInt(fraction.length - Number(exponent));
+  let a = numerator,
+    b = denominator;
+  while (b !== 0n) [a, b] = [b, a % b];
+  numerator /= a;
+  denominator /= a;
+  return CML.UnitInterval.new(numerator, denominator);
+};
+
+const ipv4Bytes = (address: string): number[] => {
+  const parts = address.split(".");
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)
+  )
+    throw new Error(`Invalid IPv4 pool relay: ${address}`);
+  return parts.map(Number);
+};
+
+const ipv6Bytes = (address: string): number[] => {
+  // URL validates and canonicalizes IPv6, including compressed and IPv4-mapped forms.
+  const host = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  const [left, right] = host.split("::");
+  const head = left ? left.split(":") : [];
+  const tail = right ? right.split(":") : [];
+  const groups =
+    right === undefined
+      ? head
+      : [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail];
+  if (groups.length !== 8)
+    throw new Error(`Invalid IPv6 pool relay: ${address}`);
+  return groups.flatMap((part) => {
+    const value = parseInt(part, 16);
+    return [value >> 8, value & 255];
+  });
+};

@@ -1,3 +1,4 @@
+import { recordScInput } from "../../sc-tools/intent.js";
 import { Effect, pipe } from "effect";
 import { Data } from "@lucid-evolution/plutus";
 import { utxoToCore } from "@lucid-evolution/utils";
@@ -31,6 +32,7 @@ export const collectFromUTxO =
         // Skip adding UTxO to collectedInputs when building redeemers to prevent duplicate inputs
         // Store inputs for later use in the txBuilder
         if (collectInputs) config.collectedInputs.push(utxo);
+        recordScInput(config, utxo, redeemer);
         //TODO: Add config.collectedAssets
         const input = withCMLScope((own) =>
           CML.SingleInputBuilder.from_transaction_unspent_output(

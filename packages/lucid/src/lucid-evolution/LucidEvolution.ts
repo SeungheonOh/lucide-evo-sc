@@ -1,3 +1,4 @@
+import type { ScToolsBalancer } from "../sc-tools/types.js";
 import {
   AwaitTransactionOptions,
   Credential,
@@ -115,6 +116,8 @@ export type LucidConfig = {
   costModels: CML.CostModels;
   protocolParameters: ProtocolParameters;
   evaluator?: EvaluatorAdapter;
+  /** Optional sc-tools backend; transaction and signing APIs are unchanged. */
+  balancer?: ScToolsBalancer;
   /**
    * Per-instance slot-to-time mapping. Low-level callers that omit it retain
    * the legacy network-table snapshot when constructing a transaction builder.
@@ -133,6 +136,8 @@ export type LucidOptions = {
    * Defaults to the built-in Aiken/WASM-backed evaluator.
    */
   evaluator?: EvaluatorAdapter;
+  /** Optional sc-tools backend; transaction and signing APIs are unchanged. */
+  balancer?: ScToolsBalancer;
   /** Per-instance slot-to-time mapping. Required for uninitialized Custom networks. */
   slotConfig?: SlotConfig;
 };
@@ -162,6 +167,7 @@ export const Lucid = async (
         : undefined,
     protocolParameters,
     evaluator: options.evaluator,
+    balancer: options.balancer,
     slotConfig,
   };
   const configuredProvider = (): Provider => {
@@ -213,6 +219,7 @@ export const Lucid = async (
           txbuilderconfig,
           protocolParameters,
           evaluator: config.evaluator,
+          balancer: config.balancer,
           slotConfig,
         });
       }).pipe(Effect.runSync),

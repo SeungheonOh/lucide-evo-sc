@@ -351,6 +351,23 @@ export const proposalProcedureForRedeemerIndex = (
     return target < proposals.len() ? proposals.get(target) : undefined;
   });
 
+// Ledger Voter ordering differs from CBOR tag ordering: script credentials
+// precede key credentials within committee and DRep voters.
+const ledgerVoterOrder = (voters: CML.VoterList): number[] => {
+  const rank = [1, 0, 3, 2, 4];
+  return withCMLScope((own) =>
+    Array.from({ length: voters.len() }, (_, index) => {
+      const voter = own(voters.get(index));
+      return { index, rank: rank[voter.kind()], key: cmlVoterKey(voter) };
+    })
+      .sort(
+        (a, b) =>
+          a.rank - b.rank || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
+      )
+      .map(({ index }) => index),
+  );
+};
+
 export const voterForRedeemerIndex = (
   tx: CML.Transaction,
   index: bigint,
@@ -361,7 +378,9 @@ export const voterForRedeemerIndex = (
     const target = indexToSafeNumber(index);
     if (target === undefined) return undefined;
 
-    return target < voters.len() ? voters.get(target) : undefined;
+    return target < voters.len()
+      ? voters.get(ledgerVoterOrder(voters)[target])
+      : undefined;
   });
 
 /**
@@ -385,8 +404,9 @@ const voterIndexByKey = (
   withCMLScope((own) => {
     const voters = own(own(own(tx.body()).voting_procedures())?.keys());
     if (!voters) return undefined;
-    for (let i = 0; i < voters.len(); i++) {
-      if (cmlVoterKey(own(voters.get(i))) === voterKey) return BigInt(i);
+    const order = ledgerVoterOrder(voters);
+    for (let i = 0; i < order.length; i++) {
+      if (cmlVoterKey(own(voters.get(order[i]))) === voterKey) return BigInt(i);
     }
     return undefined;
   });

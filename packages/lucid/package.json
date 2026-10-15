@@ -56,6 +56,7 @@
   "dependencies": {
     "@anastasia-labs/cardano-multiplatform-lib-browser": "6.2.0-1",
     "@anastasia-labs/cardano-multiplatform-lib-nodejs": "6.2.0-1",
+    "@bjorn3/browser_wasi_shim": "0.4.2",
     "@effect/schema": "^0.66.16",
     "@emurgo/cardano-message-signing-nodejs": "^1.1.0",
     "@lucid-evolution/core-types": "workspace:*",
@@ -67,6 +68,7 @@
     "@lucid-evolution/uplc": "workspace:*",
     "@lucid-evolution/utils": "workspace:*",
     "@lucid-evolution/wallet": "workspace:*",
+    "@noble/hashes": "1.8.0",
     "effect": "^3.12.7"
   },
   "devDependencies": {

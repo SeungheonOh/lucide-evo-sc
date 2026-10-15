@@ -1,4 +1,9 @@
 import {
+  recordScVote,
+  recordScBlock,
+  scWitness,
+} from "../../sc-tools/intent.js";
+import {
   Anchor,
   Credential,
   GovernanceAction,
@@ -408,19 +413,26 @@ export const vote = (
         const partial = toPartial(toV3(script.script), red);
         builder = yield* Effect.try({
           try: () =>
-            builder.with_plutus_vote(
+            builder.with_plutus_vote_inline_datum(
               cmlVoter,
               cmlActionId,
               procedure,
               partial,
               CML.Ed25519KeyHashList.new(),
-              CML.PlutusData.from_cbor_hex(red),
             ),
           catch: governanceActionError,
         });
       }
     }
 
+    recordScVote(
+      config,
+      cmlVoter,
+      cmlActionId,
+      procedure,
+      credential,
+      redeemer,
+    );
     config.governanceVoteBuilder = builder;
     if (credential?.type === "Script") {
       config.governanceVoteWitnessKeys.push(cmlVoter.to_canonical_cbor_hex());
@@ -456,6 +468,10 @@ export const propose = (
     let builder = CML.ProposalBuilder.new();
     const scriptHash = govAction.script_hash()?.to_hex();
 
+    const proposalCbor = config.lucidConfig.balancer
+      ? proposalProcedure.to_cbor_hex()
+      : undefined;
+
     if (!scriptHash) {
       builder = builder.with_proposal(proposalProcedure);
     } else {
@@ -485,11 +501,10 @@ export const propose = (
           ),
         );
         const partial = toPartial(toV3(script.script), red);
-        builder = builder.with_plutus_proposal(
+        builder = builder.with_plutus_proposal_inline_datum(
           proposalProcedure,
           partial,
           CML.Ed25519KeyHashList.new(),
-          CML.PlutusData.from_cbor_hex(red),
         );
       }
     }
@@ -498,6 +513,15 @@ export const propose = (
       try: () => config.txBuilder.add_proposal(builder.build()),
       catch: governanceActionError,
     });
+
+    if (proposalCbor)
+      recordScBlock(config, {
+        type: "proposal",
+        cbor: proposalCbor,
+        ...(scriptHash
+          ? { witness: scWitness(config, scriptHash, redeemer) }
+          : {}),
+      });
     config.governanceProposalCount += 1n;
     if (scriptHash) {
       config.governanceProposalWitnessIndices.push(proposalIndex);
