@@ -1,5 +1,6 @@
 import { recordScOutput } from "../../sc-tools/intent.js";
-import { Effect, Scope } from "effect";
+import * as Effect from "effect/Effect";
+import * as Scope from "effect/Scope";
 import {
   addAssets,
   assetsToValue,

@@ -14,6 +14,12 @@ export default mergeConfig(
           const source = fileURLToPath(
             new URL("./src/index.ts", import.meta.url),
           );
+          if (id.includes("/packages/provider/test/")) {
+            code = code.replace(
+              /from (["'])\.\.\/src\/index\.js\1/g,
+              `from "${source}"`,
+            );
+          }
           return code.replace(
             /from (["'])(?:@lucid-evolution\/provider|[^"']*\/provider\/src(?:\/index\.js)?)\1/g,
             `from "${source}"`,
@@ -27,6 +33,10 @@ export default mergeConfig(
         "**/onchain-*.test.ts",
         "**/sc-tools.test.ts",
         "**/sc-tools-emulator.test.ts",
+        // Instruments Aiken calls and CML's draft/replay counts. SC uses Haskell
+        // locally; its fee-dependent and external-evaluator contracts are tested
+        // against the actual ledger in sc-tools-emulator.test.ts instead.
+        "**/completion-evaluation.test.ts",
         "**/node_modules/**",
       ],
       maxWorkers: 2,

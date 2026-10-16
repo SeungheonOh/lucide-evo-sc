@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import * as CML from "@anastasia-labs/cardano-multiplatform-lib-nodejs";
+import * as CML from "@lucid-evolution/cml";
 import { coreToUtxo, utxoToCore } from "../src/index.js";
 import { UTxO } from "@lucid-evolution/core-types";
 
@@ -58,6 +58,24 @@ it("should deserialize to utxo withn datumHash", () => {
     address: "addr_test1wqn7wnkhny2j475ac709vg3kw6wf59f3hdl3htfpwg8xmtqtxyz6a",
     datumHash:
       "48300c087b5dbc6198ed7cfbd5c04028360e0d9270eec318addbae8b6305a909",
+    datum: undefined,
+    scriptRef: undefined,
+  });
+});
+
+it("preserves a datum hash when the datum has not been fetched", () => {
+  const utxo: UTxO = {
+    txHash: "11".repeat(32),
+    outputIndex: 0,
+    address: "addr_test1wqn7wnkhny2j475ac709vg3kw6wf59f3hdl3htfpwg8xmtqtxyz6a",
+    assets: { lovelace: 2_000_000n },
+    datumHash:
+      "48300c087b5dbc6198ed7cfbd5c04028360e0d9270eec318addbae8b6305a909",
+  };
+  const encoded = utxoToCore(utxo);
+  expect(encoded.output().datum()!.as_hash()!.to_hex()).toBe(utxo.datumHash);
+  expect(coreToUtxo(encoded)).toEqual({
+    ...utxo,
     datum: undefined,
     scriptRef: undefined,
   });

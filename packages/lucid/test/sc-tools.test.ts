@@ -80,6 +80,110 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
     expect(wallet.length).toBe(funds.length - consumed + outputs.length);
     expect(lucid.fromTx(tx.toCBOR()).toHash()).toBe(tx.toHash());
   });
+  test("accepts Byron payment destinations like CML", async () => {
+    const key = CML.Bip32PrivateKey.from_bip39_entropy(
+      new Uint8Array(32).fill(1),
+      new Uint8Array(),
+    );
+    const byron = CML.AddressContent.icarus_from_key(
+      key.to_public(),
+      CML.ProtocolMagic.new(1),
+    ).to_address();
+    const legacy = await Lucid(provider, "Preprod");
+    legacy.selectWallet.fromAddress(address, funds);
+    const sc = await setup(runtime);
+    for (const lucid of [legacy, sc]) {
+      const tx = await lucid
+        .newTx()
+        .pay.ToAddress(byron.to_base58(), { lovelace: 2_000_000n })
+        .complete();
+      expect(
+        tx.toTransaction().body().outputs().get(0).address().to_hex(),
+      ).toBe(byron.to_address().to_hex());
+    }
+  });
+
+  test("uses ordinary Provider parameters without a chain-context callback", async () => {
+    const lucid = await Lucid(provider, "Preprod", {
+      balancer: { type: "sc-tools", runtime },
+    });
+    lucid.selectWallet.fromAddress(address, funds);
+    const script = {
+      type: "PlutusV2" as const,
+      script: "49480100002221200101",
+    };
+    const utxo = {
+      ...funds[0],
+      txHash: "33".repeat(32),
+      address: validatorToAddress("Preprod", script),
+      datum: Data.void(),
+    };
+    const tx = await lucid
+      .newTx()
+      .collectFrom([utxo], Data.void())
+      .attach.SpendingValidator(script)
+      .validTo(1_900_000_000_000)
+      .pay.ToAddress(address, { lovelace: 2_000_000n })
+      .complete();
+    expect(tx.toTransaction().body().fee()).toBeGreaterThan(0n);
+    expect(
+      tx
+        .toTransaction()
+        .witness_set()
+        .redeemers()!
+        .to_flat_format()
+        .get(0)
+        .ex_units()
+        .steps(),
+    ).toBeGreaterThan(0n);
+    // switchProvider refreshes the same parameter snapshot used by both backends.
+    const changed = {
+      ...provider,
+      getProtocolParameters: async () => ({
+        ...(await provider.getProtocolParameters()),
+        minFeeB: 5_000_000,
+      }),
+    };
+    await lucid.switchProvider(changed);
+    const next = await lucid
+      .newTx()
+      .pay.ToAddress(address, { lovelace: 2_000_000n })
+      .complete();
+    expect(next.toTransaction().body().fee()).toBeGreaterThan(5_000_000n);
+  });
+
+  test("keeps millisecond slot mappings when deriving a provider context", async () => {
+    const slotConfig = {
+      zeroTime: 1_700_000_000_123,
+      zeroSlot: 10,
+      slotLength: 500,
+    };
+    const lucid = await Lucid(provider, "Custom", {
+      slotConfig,
+      balancer: { type: "sc-tools", runtime },
+    });
+    lucid.selectWallet.fromAddress(address, funds);
+    const script = {
+      type: "PlutusV2" as const,
+      script: "49480100002221200101",
+    };
+    const utxo = {
+      ...funds[0],
+      txHash: "33".repeat(32),
+      address: validatorToAddress("Custom", script),
+      datum: Data.void(),
+    };
+    const tx = await lucid
+      .newTx()
+      .collectFrom([utxo], Data.void())
+      .attach.SpendingValidator(script)
+      .validFrom(slotConfig.zeroTime)
+      .validTo(slotConfig.zeroTime + 5_000)
+      .complete();
+    expect(tx.toTransaction().body().validity_interval_start()).toBe(10n);
+    expect(tx.toTransaction().body().ttl()).toBe(20n);
+  });
+
   test("mints native tokens with exact quantities and metadata", async () => {
     const script = CML.NativeScript.new_script_pubkey(
       CML.Ed25519KeyHash.from_hex("11".repeat(28)),

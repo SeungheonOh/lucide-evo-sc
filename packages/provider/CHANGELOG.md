@@ -1,5 +1,84 @@
 # @lucid-evolution/provider
 
+## 0.4.1
+
+### Patch Changes
+
+- [#755](https://github.com/Anastasia-Labs/lucid-evolution/pull/755) [`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc) Thanks [@colll78](https://github.com/colll78)! - Speed up importing Lucid, building transactions and running the emulator without changing the transactions built. Effect modules are imported by path, and DRep ids are parsed without loading `@cardano-sdk/core`, so importing Lucid takes about 430 ms instead of about 515 ms. Canonicalising a transaction is a single CML call (`Transaction.to_canonical_keeping_plutus_data`), about four times faster. Plutus schemas are built without cloning nested schemas. On Node, the emulator verifies vkey witnesses with the native Ed25519 (about three times faster), seed wallets derive their root key with the native PBKDF2, and hex is encoded and decoded with the native codec; other runtimes keep the existing code. In a benchmark of 24 transaction shapes, the geometric mean time to build a transaction fell by about a quarter (2.9 to 2.1 ms). Most of that is for wallets that hold many tokens, which take about 39% less time, and where simple payments and mints build about twice as fast; for an ada-only wallet the gain is about 12%. CML sizes packed change and output fees without rebuilding the transaction, hashes the keys of its maps (policy ids, asset names and the like) with foldhash instead of SipHash, and has a new `TransactionBuilder.has_redeemers`, so Lucid no longer builds a draft just to check for redeemers.
+
+  `@lucid-evolution/utils` now depends on `@scure/base` for bech32, and `@cardano-sdk/core` is only a development dependency, used by its tests.
+
+- Updated dependencies [[`bd0591b`](https://github.com/Anastasia-Labs/lucid-evolution/commit/bd0591b0d3ae5424464f5f3082c7ab7d5b45614b), [`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc)]:
+  - @lucid-evolution/utils@0.2.1
+  - @lucid-evolution/cml@0.1.1
+  - @lucid-evolution/core-utils@0.2.1
+  - @lucid-evolution/wallet@0.4.1
+  - @lucid-evolution/core-types@0.5.1
+
+## 0.4.0
+
+### Minor Changes
+
+- [#752](https://github.com/Anastasia-Labs/lucid-evolution/pull/752) [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0) Thanks [@colll78](https://github.com/colll78)! - Vendor cardano-multiplatform-lib as `@lucid-evolution/cml` and depend on it instead of `@anastasia-labs/cardano-multiplatform-lib-nodejs` and `-browser`. The API is unchanged. The Node build's wasm shadow stack is raised to 16 MiB so deeply nested Plutus data decodes; the browser build keeps the 1 MiB stack. Import CML from `@lucid-evolution/lucid` (or `@lucid-evolution/cml`): objects created by a separately installed `@anastasia-labs` CML belong to another wasm instance and cannot be passed to Lucid.
+
+### Patch Changes
+
+- Updated dependencies [[`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0), [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0)]:
+  - @lucid-evolution/cml@0.1.0
+  - @lucid-evolution/utils@0.2.0
+  - @lucid-evolution/core-types@0.5.0
+  - @lucid-evolution/core-utils@0.2.0
+  - @lucid-evolution/wallet@0.4.0
+
+## 0.3.0
+
+### Minor Changes
+
+- [#747](https://github.com/Anastasia-Labs/lucid-evolution/pull/747) [`1068b3a`](https://github.com/Anastasia-Labs/lucid-evolution/commit/1068b3a1004af7d4a4670e7216b479ed526f37dd) Thanks [@colll78](https://github.com/colll78)! - Remove Maestro provider (Maestro has shut down its Cardano API).
+
+  The `Maestro` class and its `MaestroConfig` / `MaestroSupportedNetworks` types are no longer exported from `@lucid-evolution/provider` or re-exported from `@lucid-evolution/lucid`. Use Blockfrost, Koios, Kupmios or a custom `Provider` instead.
+
+### Patch Changes
+
+- [#749](https://github.com/Anastasia-Labs/lucid-evolution/pull/749) [`a05edf1`](https://github.com/Anastasia-Labs/lucid-evolution/commit/a05edf18182eb9ab3bcb383ccbdc71ab36488a61) Thanks [@colll78](https://github.com/colll78)! - The emulator now rejects under-collateralised transactions as the ledger does. A transaction with redeemers must have collateral inputs (at most `maxCollateralInputs`), its collateral inputs minus the collateral return must hold only ADA and cover `collateralPercentage` of the fee, `total_collateral`, when present, must equal that balance, and a collateral return must hold at least its minimum ADA (`NoCollateralInputs`, `TooManyCollateralInputs`, `CollateralContainsNonADA`, `InsufficientCollateral`, `IncorrectTotalCollateralField`, `BabbageOutputTooSmallUTxO`). Lucid's completion now fails with a clear error on insufficient collateral rather than producing such a transaction.
+
+- [#749](https://github.com/Anastasia-Labs/lucid-evolution/pull/749) [`53a7061`](https://github.com/Anastasia-Labs/lucid-evolution/commit/53a706182cf6355ec8345a3f9be01bb128260b62) Thanks [@colll78](https://github.com/colll78)! - Make every emulator query and block agree with a scan of `emulator.ledger` again, however the ledger is edited. `ledger` and `transactionHistory` are plain own enumerable records once more, so `structuredClone`, spreading the emulator, `Object.defineProperty`, assigning `undefined` to an entry and sharing one record between emulators behave as they did before the indexed ledger. Editing a UTxO in place (its address, its assets, or swapping `utxo`) is seen by the next query, and a `pending` entry written into `transactionHistory` by hand is confirmed by the next block. Queries stay fast while only the emulator writes to the ledger; after a caller reads or replaces `emulator.ledger`, queries and blocks scan the record as they used to.
+
+- [#749](https://github.com/Anastasia-Labs/lucid-evolution/pull/749) [`be630b1`](https://github.com/Anastasia-Labs/lucid-evolution/commit/be630b1be2eaafebf8802aaf12e2e8f9988a5c2c) Thanks [@colll78](https://github.com/colll78)! - Speed up the emulator. UTxO queries no longer enumerate the ledger record or parse every address, and keep returning results in ledger order. Blocks no longer enumerate the ledger or the transaction history. Reference script hashes are computed once per script. `submitTx` frees every CML object it creates, uses sets for its witness checks, and no longer reads a freed key list when it verifies a native script supplied through a script reference, which used to fail with "null pointer passed to rust". Direct edits to `emulator.ledger` (adding, replacing or deleting entries, setting `spent`, or assigning a new record) are still honoured.
+
+- [#745](https://github.com/Anastasia-Labs/lucid-evolution/pull/745) [`53b85ee`](https://github.com/Anastasia-Labs/lucid-evolution/commit/53b85eef8b82397bc7918faff53cfc01fb3ae81b) Thanks [@colll78](https://github.com/colll78)! - Add `KupmiosOptions.fetchImpl`, the `fetch` a `Kupmios` instance uses for its Kupo and Ogmios requests. It receives the provider's abort signal. Without it, requests use the global `fetch` as before.
+
+- [#749](https://github.com/Anastasia-Labs/lucid-evolution/pull/749) [`9e2a10a`](https://github.com/Anastasia-Labs/lucid-evolution/commit/9e2a10af3ba1570af3a7890b154cb12646cac705) Thanks [@colll78](https://github.com/colll78)! - Stop deserializing and hashing the same script over and over. `validatorToScriptHash` (and with it `mintingPolicyToId`, `validatorToAddress` and `validatorToRewardAddress`), `toScriptRef` and `applyDoubleCborEncoding` remember their results for up to 4096 distinct scripts (64 MiB at most), so `readFrom` with reference scripts, `attach.*` and the actions that delayed completion replays reuse one hash and one decoded copy of each script instead of decoding it from hex on every call. `applyDoubleCborEncoding` now reads the CBOR headers to tell raw, single and double encoded scripts apart rather than trial-decoding the whole script with cbor-x, and returns byte-identical results. A `complete()` that reads six 10 KB PlutusV3 reference scripts and spends one input locked by each is about 35% faster, and about 30% faster when a RedeemerBuilder makes completion replay the actions.
+
+  The new `scriptCborBytes(script)` returns the CBOR bytes CML reads for a script, and `ScriptCache` is the bounded table behind these caches. The emulator uses it for its reference script hashes, which used to be an unbounded `Map` keyed by script text: V8 hashes strings longer than 16383 characters by their length only, so a lookup among many same-length scripts compared each of them in full.
+
+- Updated dependencies [[`7583d72`](https://github.com/Anastasia-Labs/lucid-evolution/commit/7583d72107446cbca8b977cca661758e42d035ec), [`9e2a10a`](https://github.com/Anastasia-Labs/lucid-evolution/commit/9e2a10af3ba1570af3a7890b154cb12646cac705), [`5ca7f92`](https://github.com/Anastasia-Labs/lucid-evolution/commit/5ca7f925136d9c8054fe2986b612a8a269f77fa5), [`b95feb8`](https://github.com/Anastasia-Labs/lucid-evolution/commit/b95feb819f9860e7bf8da61118e52db738f4c8e0), [`636661e`](https://github.com/Anastasia-Labs/lucid-evolution/commit/636661ec7fd9c42d9f9f5be393f961cb1ebf080f)]:
+  - @lucid-evolution/wallet@0.3.0
+  - @lucid-evolution/utils@0.1.76
+  - @lucid-evolution/core-types@0.4.0
+
+## 0.2.6
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @lucid-evolution/utils@0.1.75
+  - @lucid-evolution/wallet@0.2.3
+
+## 0.2.5
+
+### Patch Changes
+
+- [#738](https://github.com/Anastasia-Labs/lucid-evolution/pull/738) [`5119df3`](https://github.com/Anastasia-Labs/lucid-evolution/commit/5119df3120ad77c327363fdb1c43e4e2565d92c6) Thanks [@nau](https://github.com/nau)! - Report the protocol version from Koios, Kupmios and Maestro.
+
+  `ProtocolParameters.protocolMajorVersion` was set only by Blockfrost and the emulator, so a build on
+  any other provider left it `undefined`. Anything costing scripts then had to guess the protocol
+  version, and a guess is wrong for any chain not on the version it assumes.
+
+  No new requests: all three already fetch the field and dropped it on the floor. Koios decodes
+  `protocol_major` / `protocol_minor`, Ogmios decodes `version: { major, minor }`, and Maestro returns
+  `version` in the same response.
+
 ## 0.2.4
 
 ### Patch Changes

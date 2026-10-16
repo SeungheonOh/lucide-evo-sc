@@ -7,7 +7,8 @@ import {
 } from "@lucid-evolution/core-types";
 import { ERROR_MESSAGE, TxBuilderError } from "../../Errors.js";
 import * as TxBuilder from "../TxBuilder.js";
-import { Effect, pipe } from "effect";
+import * as Effect from "effect/Effect";
+import { pipe } from "effect/Function";
 import {
   toCMLAddress,
   toPartial,
@@ -16,7 +17,7 @@ import {
   toV3,
   validateAddressDetails,
 } from "./TxUtils.js";
-import * as CML from "@anastasia-labs/cardano-multiplatform-lib-nodejs";
+import * as CML from "@lucid-evolution/cml";
 import { LucidConfig } from "../../lucid-evolution/LucidEvolution.js";
 import { blake2b } from "@noble/hashes/blake2b";
 import { TxConfig } from "./Service.js";

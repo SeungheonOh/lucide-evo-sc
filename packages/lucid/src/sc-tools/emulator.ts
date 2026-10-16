@@ -1,3 +1,4 @@
+import { protocolOverrides } from "./context.js";
 import { CML } from "../core.js";
 import { Emulator, type EmulatorAccount } from "@lucid-evolution/provider";
 import type {
@@ -42,34 +43,6 @@ type Snapshot = {
   poolId?: string | null;
 };
 
-// The rest of the Conway parameters come from convex-mockchain's bundled defaults.
-function protocolOverrides(p: ProtocolParameters): Record<string, unknown> {
-  return {
-    protocolVersion: {
-      major: p.protocolMajorVersion ?? 11,
-      minor: p.protocolMinorVersion ?? 0,
-    },
-    txFeePerByte: p.minFeeA,
-    txFeeFixed: p.minFeeB,
-    maxTxSize: p.maxTxSize,
-    maxValueSize: p.maxValSize,
-    stakeAddressDeposit: String(p.keyDeposit),
-    stakePoolDeposit: String(p.poolDeposit),
-    dRepDeposit: String(p.drepDeposit),
-    govActionDeposit: String(p.govActionDeposit),
-    executionUnitPrices: { priceMemory: p.priceMem, priceSteps: p.priceStep },
-    maxTxExecutionUnits: {
-      memory: String(p.maxTxExMem),
-      steps: String(p.maxTxExSteps),
-    },
-    utxoCostPerByte: String(p.coinsPerUtxoByte),
-    collateralPercentage: p.collateralPercentage,
-    maxCollateralInputs: p.maxCollateralInputs,
-    minFeeRefScriptCostPerByte: p.minFeeRefScriptCostPerByte,
-    costModels: p.costModels,
-  };
-}
-
 export type ScToolsEmulatorOptions = {
   /** Pools present at genesis, with zero deposit and default mockchain pool data. */
   stakePools?: string[];
@@ -91,6 +64,7 @@ export class ScToolsEmulator extends Emulator {
   private snapshot!: Snapshot;
   private deferredError?: unknown;
   private pendingRewards = 0;
+  private fixtureFingerprint: string;
 
   constructor(
     accounts: EmulatorAccount[],
@@ -101,7 +75,7 @@ export class ScToolsEmulator extends Emulator {
   ) {
     super(accounts, protocolParameters, treasury);
     this.runtime = runtime;
-    this.time = Math.floor(this.time / 1000) * 1000;
+    this.fixtureFingerprint = JSON.stringify(this.fixtures());
     this.balancer = {
       type: "sc-tools",
       runtime,
@@ -125,7 +99,12 @@ export class ScToolsEmulator extends Emulator {
       treasury: String(treasury),
       slot: 0,
     }).then((snapshot) => {
-      this.applySnapshot(snapshot, true);
+      if (JSON.stringify(this.fixtures()) === this.fixtureFingerprint) {
+        this.applySnapshot(snapshot, true);
+      } else {
+        // Preserve fixture edits made immediately after construction.
+        this.snapshot = snapshot;
+      }
     });
     // Initialization errors are reported by every asynchronous provider method.
     void this.ready.catch(() => {});
@@ -152,7 +131,6 @@ export class ScToolsEmulator extends Emulator {
   private async settled(): Promise<void> {
     await this.ready;
     await this.pending;
-    await this.enqueue(async () => {});
     if (this.deferredError) {
       const error = this.deferredError;
       this.deferredError = undefined;
@@ -166,7 +144,7 @@ export class ScToolsEmulator extends Emulator {
   ): Promise<T> {
     const result = this.pending.then(async () => {
       await this.ready;
-      if (synchronize) await this.syncRewardOverrides();
+      if (synchronize) await this.syncFixtures();
       return operation();
     });
     this.pending = result.then(
@@ -176,29 +154,62 @@ export class ScToolsEmulator extends Emulator {
     return result;
   }
 
-  private async syncRewardOverrides(): Promise<void> {
-    // Synchronous reward projections must not be mistaken for manual fixtures
-    // by a submission already queued before distributeRewards().
-    if (this.pendingRewards > 0) return;
-    // Preserve Emulator's public reward-fixture interface. Transaction validation
-    // still runs against the updated Haskell ledger, including complete withdrawals.
-    const updates = this.snapshot.accounts.flatMap(({ address, rewards }) => {
-      const account = this.chain[address];
-      return account?.registeredStake &&
-        account.delegation.rewards !== BigInt(rewards)
-        ? [{ address, rewards: String(account.delegation.rewards) }]
-        : [];
-    });
-    if (updates.length)
-      this.applySnapshot(
-        await this.request({
-          operation: "setRewards",
-          state: this.snapshot.state,
-          chain: this.snapshot.chain,
-          slot: this.slot,
-          updates,
-        }),
+  private fixtures() {
+    return {
+      utxos: Object.values({ ...this.ledger, ...this.mempool })
+        .filter(({ spent }) => !spent)
+        .map(({ utxo }) => encodeUtxo(utxo))
+        .sort(),
+      accounts:
+        this.pendingRewards > 0 && this.snapshot
+          ? this.snapshot.accounts
+          : Object.entries(this.chain)
+              .filter(([, a]) => a.registeredStake)
+              .map(([address, a]) => ({
+                address,
+                rewards: String(a.delegation.rewards),
+                poolId: a.delegation.poolId,
+              })),
+      treasury: String(this.treasury),
+      datums: Object.values(this.datumTable).sort(),
+      protocolParameters: protocolOverrides(this.protocolParameters),
+    };
+  }
+
+  private async syncFixtures(edits?: {
+    updated: Snapshot["accounts"];
+    removed: Set<string>;
+  }): Promise<void> {
+    const fixtures = this.fixtures();
+    if (edits) {
+      const accounts = new Map(
+        this.snapshot.accounts.map((a) => [a.address, a]),
       );
+      for (const address of edits.removed) accounts.delete(address);
+      for (const account of edits.updated)
+        accounts.set(account.address, account);
+      fixtures.accounts = [...accounts.values()];
+    }
+    const fingerprint = JSON.stringify(fixtures);
+    if (fingerprint === this.fixtureFingerprint) return;
+    const chain = {
+      ...this.snapshot.chain,
+      protocolParameters: {
+        ...this.snapshot.chain.protocolParameters,
+        ...fixtures.protocolParameters,
+      },
+    };
+    const snapshot = await this.request({
+      operation: "setFixtures",
+      state: this.snapshot.state,
+      chain,
+      slot: this.slot,
+      ...fixtures,
+    });
+    // These are explicit public fixture edits. Keep their confirmed/pending
+    // placement, but make the actual ledger authoritative for validation too.
+    this.snapshot = snapshot;
+    this.fixtureFingerprint = fingerprint;
   }
 
   private applySnapshot(snapshot: Snapshot, initial = false): void {
@@ -213,7 +224,6 @@ export class ScToolsEmulator extends Emulator {
         return [txHash + index, utxo] as const;
       }),
     );
-    if (initial) this.ledger = {};
     for (const entries of [this.ledger, this.mempool]) {
       for (const [key, entry] of Object.entries(entries))
         entry.spent = !available.has(key);
@@ -241,10 +251,12 @@ export class ScToolsEmulator extends Emulator {
     );
     this.treasury = BigInt(snapshot.treasury);
     this.snapshot = snapshot;
+    this.fixtureFingerprint = JSON.stringify(this.fixtures());
   }
 
   async getChainContext(): Promise<ScToolsChainContext> {
     await this.settled();
+    await this.enqueue(async () => {});
     return structuredClone(this.snapshot.chain);
   }
 
@@ -268,9 +280,11 @@ export class ScToolsEmulator extends Emulator {
     await this.settled();
     return super.getUtxosWithUnit(address, unit);
   }
-  override async getUtxoByUnit(unit: Unit) {
-    await this.settled();
-    return super.getUtxoByUnit(unit);
+  override getUtxoByUnit(unit: Unit): Promise<UTxO> {
+    // Emulator throws synchronously when more than one UTxO holds the unit.
+    // Preserve that observable API, then re-query after queued ledger updates.
+    super.getUtxoByUnit(unit);
+    return this.settled().then(() => super.getUtxoByUnit(unit));
   }
   override async getUtxosByOutRef(refs: OutRef[]) {
     await this.settled();
@@ -311,8 +325,28 @@ export class ScToolsEmulator extends Emulator {
   override distributeRewards(rewards: Lovelace): void {
     if (rewards < 0n) throw new Error("Negative reward");
     const slot = this.slot;
+    // Capture explicit account edits before the synchronous reward projection.
+    // Apply only changed accounts after earlier queued submissions have settled.
+    const before = this.fixtures().accounts;
+    const previous = new Map(
+      (this.snapshot?.accounts ?? []).map((a) => [a.address, a]),
+    );
+    const current = new Set(before.map((a) => a.address));
+    const edits =
+      this.pendingRewards === 0
+        ? {
+            updated: before.filter(
+              (a) =>
+                JSON.stringify(a) !== JSON.stringify(previous.get(a.address)),
+            ),
+            removed: new Set(
+              [...previous.keys()].filter((a) => !current.has(a)),
+            ),
+          }
+        : undefined;
     this.pendingRewards++;
     void this.enqueue(async () => {
+      await this.syncFixtures(edits);
       const next = await this.request({
         operation: "reward",
         state: this.snapshot.state,
@@ -354,7 +388,7 @@ export class ScToolsEmulator extends Emulator {
     tx: Transaction,
     additionalUTxOs: UTxO[] = [],
   ): Promise<EvalRedeemer[]> {
-    await this.settled();
+    const chain = await this.getChainContext();
     const known = new Map<string, UTxO>();
     for (const { utxo, spent } of [
       ...Object.values(this.ledger),
@@ -371,7 +405,7 @@ export class ScToolsEmulator extends Emulator {
     });
     const response = (await this.runtime.run({
       action: "evaluateV2",
-      chain: this.snapshot.chain,
+      chain,
       blocks: [],
       wallet: { changeAddress, utxos: [] },
       resolvedInputs: [...known.values()].map(encodeUtxo),

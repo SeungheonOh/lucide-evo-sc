@@ -46,7 +46,8 @@ import {
 } from "@lucid-evolution/wallet";
 import { isEmulatorProvider } from "@lucid-evolution/provider";
 import { resolveSlotConfig } from "./slotConfig.js";
-import { Effect, pipe } from "effect";
+import * as Effect from "effect/Effect";
+import { pipe } from "effect/Function";
 import { NullableError } from "../Errors.js";
 import {
   awaitTransactionConfirmation,

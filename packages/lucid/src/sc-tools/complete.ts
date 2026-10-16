@@ -1,12 +1,18 @@
+import { scChainContext } from "./context.js";
 import type { ScToolsChainContext } from "./types.js";
 import { CML } from "../core.js";
-import { withCMLScope } from "@lucid-evolution/core-utils";
+import { canonicalTransaction } from "../CanonicalTransaction.js";
+import { fromHex, withCMLScope } from "@lucid-evolution/core-utils";
 import {
   utxoToCore,
   paymentCredentialOf,
   coreToOutRef,
 } from "@lucid-evolution/utils";
-import type { EvalRedeemer, UTxO } from "@lucid-evolution/core-types";
+import type {
+  EvalRedeemer,
+  EvaluatorAdapter,
+  UTxO,
+} from "@lucid-evolution/core-types";
 import type { TxBuilderConfig } from "../tx-builder/TxBuilder.js";
 import type { CompleteOptions } from "../tx-builder/internal/CompleteTxBuilder.js";
 import { scBlocks, scOutRef, resolveScReferences } from "./intent.js";
@@ -18,6 +24,7 @@ export class ScToolsRedeemerRefresh extends Error {
 }
 export type ScToolsCompletionContext = {
   bootstrapExUnits?: boolean;
+  collateralInputs?: UTxO[];
   redeemerInputFingerprint?: string;
 };
 
@@ -33,7 +40,7 @@ export async function balanceScTools(
   ) => Promise<CML.Transaction>,
 ): Promise<CML.Transaction> {
   const backend = config.lucidConfig.balancer!;
-  const chain = await backend.chainContext(config.lucidConfig);
+  const chain = await scChainContext(config.lucidConfig);
   if (chain.network !== config.lucidConfig.network.toLowerCase())
     throw new Error("sc-tools chain context does not match Lucid network");
   const parameterNames = {
@@ -77,10 +84,16 @@ export async function balanceScTools(
       lovelace: String(config.treasuryDonation.donation),
       currentTreasury: String(config.treasuryDonation.currentTreasuryValue),
     });
+  const collateral = (internal.collateralInputs ?? []).filter(
+    (u) => !u.scriptRef && paymentCredentialOf(u.address).type === "Key",
+  );
   const byRef = new Map(
-    [...walletInputs, ...config.collectedInputs, ...config.readInputs].map(
-      (u) => [scOutRef(u), u],
-    ),
+    [
+      ...walletInputs,
+      ...collateral,
+      ...config.collectedInputs,
+      ...config.readInputs,
+    ].map((u) => [scOutRef(u), u]),
   );
   const encode = (u: UTxO) =>
     withCMLScope((own) => own(utxoToCore(u)).to_cbor_hex());
@@ -99,7 +112,7 @@ export async function balanceScTools(
               ),
             ),
         );
-  const external =
+  const external: EvaluatorAdapter | undefined =
     options.localUPLCEval === false
       ? {
           name: "provider",
@@ -119,8 +132,11 @@ export async function balanceScTools(
     wallet: {
       changeAddress,
       utxos: funding.map(encode),
-      collateral: walletInputs
-        .filter((u) => paymentCredentialOf(u.address).type === "Key")
+      collateral: collateral.map(encode),
+      collateralFallback: walletInputs
+        .filter(
+          (u) => !u.scriptRef && paymentCredentialOf(u.address).type === "Key",
+        )
         .map(encode),
     },
     resolvedInputs: [...byRef.values()].map(encode),
@@ -147,6 +163,7 @@ export async function balanceScTools(
       options: {
         coinSelection: options.coinSelection ?? true,
         minFee: String(config.minFee ?? 0n),
+        explicitFee: config.minFee !== undefined,
         setCollateral: String(options.setCollateral ?? 5_000_000n),
         includeLeftoverLovelaceAsFee:
           options.includeLeftoverLovelaceAsFee ?? false,
@@ -174,9 +191,7 @@ export async function balanceScTools(
       );
     let tx = CML.Transaction.from_cbor_hex(result.transaction.cborHex);
     if (options.canonical) {
-      const canonical = CML.Transaction.from_cbor_bytes(
-        tx.to_canonical_cbor_bytes(),
-      );
+      const canonical = canonicalTransaction(tx);
       tx.free();
       tx = canonical;
       if (refreshHash) {
@@ -242,8 +257,7 @@ export async function balanceScTools(
     if (expected.size === 0 || hex === previous) return tx;
     previous = hex;
     tx.free();
-    const evaluated = await external.evaluate({
-      tx: hex,
+    const evaluationInput = {
       additionalUTxOs: [...consumed, ...config.readInputs],
       context: {
         network: config.lucidConfig.network,
@@ -251,7 +265,10 @@ export async function balanceScTools(
         protocolParameters: config.lucidConfig.protocolParameters,
         costModels: config.lucidConfig.costModels,
       },
-    });
+    };
+    const evaluated = external.evaluateBytes
+      ? await external.evaluateBytes({ ...evaluationInput, tx: fromHex(hex) })
+      : await external.evaluate({ ...evaluationInput, tx: hex });
     const tags = {
       spend: 0,
       mint: 1,

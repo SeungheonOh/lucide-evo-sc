@@ -2,12 +2,15 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import {
   mintingPolicyToId,
+  applyParamsToScript,
+  makeAikenEvaluator,
   CML,
   Data,
   Lucid,
   ScToolsEmulator,
   createScToolsWasmRuntime,
   generateEmulatorAccount,
+  getAddressDetails,
   validatorToAddress,
   validatorToRewardAddress,
   type ScToolsRuntime,
@@ -16,7 +19,10 @@ import {
   type EmulatorAccount,
   PROTOCOL_PARAMETERS_DEFAULT,
 } from "../src/index.js";
-import { alwaysSucceedV3Script } from "./fixtures/scripts.js";
+import {
+  alwaysSucceedV3Script,
+  feeThresholdV3Script,
+} from "./fixtures/scripts.js";
 
 const wasmPath = process.env.SC_TOOLS_WASM;
 describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
@@ -46,6 +52,299 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
     await lucid.awaitTx(hash);
     return signed;
   };
+  test.each([undefined, 9, 10, 11])(
+    "matches Lucid's protocol-version semantics for %s",
+    async (version) => {
+      const emulator = new ScToolsEmulator(
+        [],
+        { ...PROTOCOL_PARAMETERS_DEFAULT, protocolMajorVersion: version },
+        0n,
+        runtime,
+      );
+      const context = await emulator.getChainContext();
+      expect(context.protocolParameters.protocolVersion).toEqual({
+        major: version ?? 10,
+        minor: 0,
+      });
+    },
+  );
+
+  test.each([false, true])(
+    "evaluates fee-dependent scripts in the final context (delayed: %s)",
+    async (delayed) => {
+      const { lucid, account, emulator } = await setup();
+      const script = {
+        type: "PlutusV3" as const,
+        script: applyParamsToScript(feeThresholdV3Script.script, [220_000n]),
+      };
+      const address = validatorToAddress("Custom", script);
+      await submit(
+        lucid,
+        await lucid
+          .newTx()
+          .pay.ToContract(
+            address,
+            { kind: "inline", value: Data.void() },
+            { lovelace: 20_000_000n },
+          )
+          .complete(),
+      );
+      const [input] = await lucid.utxosAt(address);
+      const calls: string[] = [];
+      const observed: ScToolsRuntime = {
+        run: async (request) => {
+          if (request.action === "balanceV2")
+            calls.push((request.options as { evaluation: string }).evaluation);
+          return runtime.run(request);
+        },
+      };
+      const sc = await Lucid(emulator, "Custom", {
+        balancer: { ...emulator.balancer, runtime: observed },
+      });
+      sc.selectWallet.fromSeed(account.seedPhrase);
+      const tx = await sc
+        .newTx()
+        .collectFrom([input], delayed ? () => Data.void() : Data.void())
+        .attach.SpendingValidator(script)
+        .pay.ToAddress(account.address, { lovelace: 2_000_000n })
+        .complete({ setCollateral: 0n });
+      expect(calls).toContain("local");
+      expect(calls).not.toContain("provided");
+      if (delayed) expect(calls).toContain("bootstrap");
+      const evaluated = await emulator.evaluateTx(tx.toCBOR());
+      const redeemer = tx
+        .toTransaction()
+        .witness_set()
+        .redeemers()!
+        .to_flat_format()
+        .get(0);
+      expect(redeemer.ex_units().steps()).toBe(
+        BigInt(evaluated[0].ex_units.steps),
+      );
+      expect(redeemer.ex_units().mem()).toBe(BigInt(evaluated[0].ex_units.mem));
+      await submit(sc, tx);
+    },
+  );
+
+  test("accepts explicit Aiken and byte evaluators with delayed redeemers", async () => {
+    const { lucid, account, emulator } = await setup();
+    const script = alwaysSucceedV3Script;
+    const address = validatorToAddress("Custom", script);
+    await submit(
+      lucid,
+      await lucid
+        .newTx()
+        .pay.ToContract(
+          address,
+          { kind: "inline", value: Data.void() },
+          { lovelace: 20_000_000n },
+        )
+        .complete(),
+    );
+    const [input] = await lucid.utxosAt(address);
+    let bytesCalls = 0;
+    let hexCalls = 0;
+    const bytes = {
+      evaluate: async () => {
+        hexCalls++;
+        throw new Error("hex path should not run");
+      },
+      evaluateBytes: async ({
+        tx,
+        additionalUTxOs,
+      }: {
+        tx: Uint8Array;
+        additionalUTxOs: import("../src/index.js").UTxO[];
+      }) => {
+        bytesCalls++;
+        return emulator.evaluateTx(
+          Buffer.from(tx).toString("hex"),
+          additionalUTxOs,
+        );
+      },
+    };
+    const build = (evaluator: import("../src/index.js").EvaluatorAdapter) =>
+      lucid
+        .newTx()
+        .collectFrom([input], () => Data.void())
+        .attach.SpendingValidator(script)
+        .pay.ToAddress(account.address, { lovelace: 2_000_000n })
+        .complete({ evaluator });
+    const fromBytes = await build(bytes);
+    expect(bytesCalls).toBeGreaterThan(0);
+    expect(hexCalls).toBe(0);
+    const fromAiken = await build(makeAikenEvaluator());
+    const final = fromAiken
+      .toTransaction()
+      .witness_set()
+      .redeemers()!
+      .to_flat_format()
+      .get(0)
+      .ex_units();
+    const expected = await emulator.evaluateTx(fromAiken.toCBOR());
+    expect(final.steps()).toBe(BigInt(expected[0].ex_units.steps));
+    expect(final.mem()).toBe(BigInt(expected[0].ex_units.mem));
+    expect(fromBytes.toTransaction().body().fee()).toBeGreaterThan(0n);
+    await submit(lucid, fromAiken);
+  });
+
+  test("synchronizes public ledger fixtures into actual ledger validation", async () => {
+    const account = generateEmulatorAccount({ lovelace: 100_000_000n });
+    const emulator = new ScToolsEmulator([account], undefined, 0n, runtime);
+    // Original Emulator permits replacement before its first async call.
+    const fixture = {
+      txHash: "ab".repeat(32),
+      outputIndex: 0,
+      address: account.address,
+      assets: { lovelace: 300_000_000n },
+    };
+    emulator.ledger = {
+      [fixture.txHash + fixture.outputIndex]: { utxo: fixture, spent: false },
+    };
+    const lucid = await Lucid(emulator, "Custom", {
+      balancer: emulator.balancer,
+    });
+    lucid.selectWallet.fromSeed(account.seedPhrase);
+    expect((await lucid.wallet().getUtxos())[0].txHash).toBe(fixture.txHash);
+    // Edits through an existing ledger entry are also public fixture operations.
+    emulator.ledger[fixture.txHash + fixture.outputIndex].utxo.assets.lovelace =
+      400_000_000n;
+    emulator.protocolParameters = {
+      ...emulator.protocolParameters,
+      minFeeB: 300_000,
+    };
+    await lucid.switchProvider(emulator);
+    const tx = await lucid
+      .newTx()
+      .pay.ToAddress(account.address, { lovelace: 200_000_000n })
+      .complete();
+    expect(tx.toTransaction().body().fee()).toBeGreaterThan(300_000n);
+    await submit(lucid, tx);
+    expect(
+      (await lucid.wallet().getUtxos()).reduce(
+        (sum, u) => sum + u.assets.lovelace,
+        0n,
+      ),
+    ).toBe(400_000_000n - tx.toTransaction().body().fee());
+  });
+
+  test("synchronizes stake, reward and treasury fixtures without losing ledger deposits", async () => {
+    const account = generateEmulatorAccount({ lovelace: 100_000_000n });
+    const emulator = new ScToolsEmulator(
+      [account],
+      { ...PROTOCOL_PARAMETERS_DEFAULT, protocolMajorVersion: 9 },
+      0n,
+      runtime,
+    );
+    const lucid = await Lucid(emulator, "Custom", {
+      balancer: emulator.balancer,
+    });
+    lucid.selectWallet.fromSeed(account.seedPhrase);
+    const reward = (await lucid.wallet().rewardAddress())!;
+    emulator.chain[reward] = {
+      registeredStake: true,
+      delegation: {
+        poolId: CML.Ed25519KeyHash.from_hex("11".repeat(28)).to_bech32("pool"),
+        rewards: 10_000_000n,
+      },
+    };
+    emulator.treasury = 100_000_000n;
+    emulator.distributeRewards(1_000_000n);
+    expect(emulator.chain[reward].delegation.rewards).toBe(11_000_000n);
+    await submit(
+      lucid,
+      await lucid
+        .newTx()
+        .withdraw(reward, 11_000_000n)
+        .donateToTreasury(1_000_000n)
+        .complete(),
+    );
+    expect((await emulator.getDelegation(reward)).rewards).toBe(0n);
+    expect(await emulator.getTreasury()).toBe(101_000_000n);
+    await submit(
+      lucid,
+      await lucid.newTx().deregister.Stake(reward).complete(),
+    );
+    expect((await emulator.getRewardAccount(reward)).registered).toBe(false);
+    await submit(lucid, await lucid.newTx().register.Stake(reward).complete());
+    expect((await emulator.getRewardAccount(reward)).registered).toBe(true);
+  });
+
+  test.each(["sc-tools", "cml"] as const)(
+    "spends Plutus V1 datum hashes through the real ledger with %s",
+    async (backend) => {
+      const { account, emulator } = await setup();
+      const lucid = await Lucid(
+        emulator,
+        "Custom",
+        backend === "sc-tools" ? { balancer: emulator.balancer } : {},
+      );
+      lucid.selectWallet.fromSeed(account.seedPhrase);
+      const script = {
+        type: "PlutusV1" as const,
+        script: "49480100002221200101",
+      };
+      const address = validatorToAddress("Custom", script);
+      await submit(
+        lucid,
+        await lucid
+          .newTx()
+          .pay.ToContract(
+            address,
+            { kind: "asHash", value: Data.void() },
+            { lovelace: 20_000_000n },
+          )
+          .complete(),
+      );
+      const utxos = await lucid.utxosAt(address);
+      expect(utxos[0].datumHash).toBeDefined();
+      const tx = await lucid
+        .newTx()
+        .collectFrom(utxos, Data.void())
+        .attach.SpendingValidator(script)
+        .complete({ canonical: true });
+      await submit(lucid, tx);
+      expect(await lucid.utxosAt(address)).toHaveLength(0);
+    },
+  );
+
+  test("mints and burns native tokens and validates a Byron destination", async () => {
+    const { lucid, account, emulator } = await setup();
+    const hash = getAddressDetails(account.address).paymentCredential!.hash;
+    const native = CML.NativeScript.new_script_pubkey(
+      CML.Ed25519KeyHash.from_hex(hash),
+    );
+    const policy = { type: "Native" as const, script: native.to_cbor_hex() };
+    const unit = mintingPolicyToId(policy) + "abcd";
+    const key = CML.Bip32PrivateKey.from_bip39_entropy(
+      new Uint8Array(32).fill(1),
+      new Uint8Array(),
+    );
+    const byron = CML.AddressContent.icarus_from_key(
+      key.to_public(),
+      CML.ProtocolMagic.new(1),
+    )
+      .to_address()
+      .to_base58();
+    await submit(
+      lucid,
+      await lucid
+        .newTx()
+        .mintAssets({ [unit]: 7n })
+        .attach.MintingPolicy(policy)
+        .pay.ToAddress(byron, { lovelace: 2_000_000n })
+        .complete(),
+    );
+    expect((await emulator.getUtxoByUnit(unit)).assets[unit]).toBe(7n);
+    const burned = await lucid
+      .newTx()
+      .mintAssets({ [unit]: -7n })
+      .attach.MintingPolicy(policy)
+      .complete();
+    await submit(lucid, burned);
+    expect(await emulator.getUtxoByUnit(unit)).toBeUndefined();
+  });
+
   test("validates signed payments, confirms, rejects double spends atomically, and recovers", async () => {
     const { lucid, account, emulator } = await setup();
     const recipient = generateEmulatorAccount({ lovelace: 0n });

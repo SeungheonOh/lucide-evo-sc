@@ -1,5 +1,57 @@
 # @lucid-evolution/wallet
 
+## 0.4.1
+
+### Patch Changes
+
+- [#755](https://github.com/Anastasia-Labs/lucid-evolution/pull/755) [`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc) Thanks [@colll78](https://github.com/colll78)! - Speed up importing Lucid, building transactions and running the emulator without changing the transactions built. Effect modules are imported by path, and DRep ids are parsed without loading `@cardano-sdk/core`, so importing Lucid takes about 430 ms instead of about 515 ms. Canonicalising a transaction is a single CML call (`Transaction.to_canonical_keeping_plutus_data`), about four times faster. Plutus schemas are built without cloning nested schemas. On Node, the emulator verifies vkey witnesses with the native Ed25519 (about three times faster), seed wallets derive their root key with the native PBKDF2, and hex is encoded and decoded with the native codec; other runtimes keep the existing code. In a benchmark of 24 transaction shapes, the geometric mean time to build a transaction fell by about a quarter (2.9 to 2.1 ms). Most of that is for wallets that hold many tokens, which take about 39% less time, and where simple payments and mints build about twice as fast; for an ada-only wallet the gain is about 12%. CML sizes packed change and output fees without rebuilding the transaction, hashes the keys of its maps (policy ids, asset names and the like) with foldhash instead of SipHash, and has a new `TransactionBuilder.has_redeemers`, so Lucid no longer builds a draft just to check for redeemers.
+
+  `@lucid-evolution/utils` now depends on `@scure/base` for bech32, and `@cardano-sdk/core` is only a development dependency, used by its tests.
+
+- Updated dependencies [[`bd0591b`](https://github.com/Anastasia-Labs/lucid-evolution/commit/bd0591b0d3ae5424464f5f3082c7ab7d5b45614b), [`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc)]:
+  - @lucid-evolution/utils@0.2.1
+  - @lucid-evolution/cml@0.1.1
+  - @lucid-evolution/core-utils@0.2.1
+  - @lucid-evolution/core-types@0.5.1
+  - @lucid-evolution/sign_data@0.2.1
+
+## 0.4.0
+
+### Minor Changes
+
+- [#752](https://github.com/Anastasia-Labs/lucid-evolution/pull/752) [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0) Thanks [@colll78](https://github.com/colll78)! - Vendor cardano-multiplatform-lib as `@lucid-evolution/cml` and depend on it instead of `@anastasia-labs/cardano-multiplatform-lib-nodejs` and `-browser`. The API is unchanged. The Node build's wasm shadow stack is raised to 16 MiB so deeply nested Plutus data decodes; the browser build keeps the 1 MiB stack. Import CML from `@lucid-evolution/lucid` (or `@lucid-evolution/cml`): objects created by a separately installed `@anastasia-labs` CML belong to another wasm instance and cannot be passed to Lucid.
+
+### Patch Changes
+
+- Updated dependencies [[`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0), [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0)]:
+  - @lucid-evolution/cml@0.1.0
+  - @lucid-evolution/utils@0.2.0
+  - @lucid-evolution/core-types@0.5.0
+  - @lucid-evolution/core-utils@0.2.0
+  - @lucid-evolution/sign_data@0.2.0
+
+## 0.3.0
+
+### Minor Changes
+
+- [#744](https://github.com/Anastasia-Labs/lucid-evolution/pull/744) [`636661e`](https://github.com/Anastasia-Labs/lucid-evolution/commit/636661ec7fd9c42d9f9f5be393f961cb1ebf080f) Thanks [@colll78](https://github.com/colll78)! - Add an optional `getCollateral(amount?)` to `Wallet`, and prefer the wallet's own collateral when completing script transactions. A wallet created with `selectWallet.fromAPI` provides it when the CIP-30 wallet implements `getCollateral`, passing the required amount and returning only candidates in the UTxO override when one is set. Candidates are also limited to `presetWalletInputs` when given. If the wallet returns nothing, its candidates cannot cover the collateral, or the call fails, collateral is selected from the wallet's UTxOs as before. A candidate holding exactly the collateral amount in ADA is used without a collateral return.
+
+### Patch Changes
+
+- [#749](https://github.com/Anastasia-Labs/lucid-evolution/pull/749) [`7583d72`](https://github.com/Anastasia-Labs/lucid-evolution/commit/7583d72107446cbca8b977cca661758e42d035ec) Thanks [@colll78](https://github.com/colll78)! - Seed wallets find the keys a transaction needs by looking inputs and collateral up in an index of the wallet's UTxOs instead of scanning every UTxO for every input, and `readFrom` checks for already-read UTxOs the same way. With 5000 wallet UTxOs and 200 inputs, finding the signing keys drops from about 6.3 ms to 1.4 ms.
+
+- Updated dependencies [[`9e2a10a`](https://github.com/Anastasia-Labs/lucid-evolution/commit/9e2a10af3ba1570af3a7890b154cb12646cac705), [`5ca7f92`](https://github.com/Anastasia-Labs/lucid-evolution/commit/5ca7f925136d9c8054fe2986b612a8a269f77fa5), [`b95feb8`](https://github.com/Anastasia-Labs/lucid-evolution/commit/b95feb819f9860e7bf8da61118e52db738f4c8e0), [`636661e`](https://github.com/Anastasia-Labs/lucid-evolution/commit/636661ec7fd9c42d9f9f5be393f961cb1ebf080f)]:
+  - @lucid-evolution/utils@0.1.76
+  - @lucid-evolution/core-types@0.4.0
+  - @lucid-evolution/sign_data@0.1.33
+
+## 0.2.3
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @lucid-evolution/utils@0.1.75
+
 ## 0.2.2
 
 ### Patch Changes

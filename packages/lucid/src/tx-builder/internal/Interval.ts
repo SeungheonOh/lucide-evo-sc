@@ -1,5 +1,5 @@
 import { recordScValidity } from "../../sc-tools/intent.js";
-import { Effect } from "effect";
+import * as Effect from "effect/Effect";
 import { UnixTime } from "@lucid-evolution/core-types";
 import * as TxBuilder from "../TxBuilder.js";
 import { unixTimeToEnclosingSlot } from "@lucid-evolution/plutus";

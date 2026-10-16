@@ -87,7 +87,7 @@ export function recordScOutput(
     recordScBlock(config, {
       type: "output",
       output: {
-        address: out.address,
+        address: own(output.address()).to_hex(),
         lovelace: String(out.assets.lovelace ?? 0n),
         assets: scAssets(out.assets),
         ...(communication

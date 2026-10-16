@@ -4,11 +4,33 @@ import { CML } from "./core.js";
 import { fromScriptRef, toScriptRef } from "./scripts.js";
 import { assetsToValue, valueToAssets } from "./value.js";
 
+/**
+ * Builds the output directly rather than through `TransactionOutputBuilder`,
+ * whose every stage copies the datum and script; the result is the same.
+ */
 export const utxoToTransactionOutput = (utxo: UTxO): CML.TransactionOutput =>
   withCMLScope((own) => {
+    const address = own(CML.Address.from_bech32(utxo.address));
     const value = own(assetsToValue(utxo.assets));
-    const builder = own(buildOutput(utxo, own).with_value(value));
-    return own(builder.build()).output();
+    const datum = utxo.datum
+      ? own(CML.PlutusData.from_cbor_hex(utxo.datum))
+      : undefined;
+    const datumHash = utxo.datumHash
+      ? own(
+          datum
+            ? CML.hash_plutus_data(datum)
+            : CML.DatumHash.from_hex(utxo.datumHash),
+        )
+      : undefined;
+    // `TransactionOutput.new` consumes the script and datum option, so they
+    // are created last and left out of the scope.
+    const scriptRef = utxo.scriptRef ? toScriptRef(utxo.scriptRef) : undefined;
+    const datumOption = datumHash
+      ? CML.DatumOption.new_hash(datumHash)
+      : datum
+        ? CML.DatumOption.new_datum(datum)
+        : undefined;
+    return CML.TransactionOutput.new(address, value, datumOption, scriptRef);
   });
 
 export const utxoToTransactionInput = (utxo: UTxO): CML.TransactionInput =>
@@ -296,6 +318,11 @@ const buildDatum = (
   if (utxo.datumHash && utxo.datum) {
     const datum = own(CML.PlutusData.from_cbor_hex(utxo.datum));
     return own(builder.with_communication_data(datum));
+  }
+  // The datum need not be fetched to preserve the hash on a resolved UTxO.
+  if (utxo.datumHash) {
+    const hash = own(CML.DatumHash.from_hex(utxo.datumHash));
+    return own(builder.with_data(own(CML.DatumOption.new_hash(hash))));
   }
   // with InlineDatum
   if (utxo.datum) {

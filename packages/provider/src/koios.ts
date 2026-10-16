@@ -21,8 +21,12 @@ import { fromHex } from "@lucid-evolution/core-utils";
 import { fromUnit } from "@lucid-evolution/utils";
 import * as _Koios from "./internal/koios.js";
 import * as _Ogmios from "./internal/ogmios.js";
-import { Data, Effect, pipe, Schedule, Schema as S } from "effect";
-import { FetchHttpClient } from "@effect/platform";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Schedule from "effect/Schedule";
+import * as S from "effect/Schema";
+import { pipe } from "effect/Function";
+import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
 import * as HttpUtils from "./internal/HttpUtils.js";
 
 export class KoiosError extends Data.TaggedError("KoiosError")<{
@@ -86,6 +90,8 @@ export class Koios implements Provider {
     );
 
     return {
+      protocolMajorVersion: result.protocol_major,
+      protocolMinorVersion: result.protocol_minor,
       minFeeA: result.min_fee_a,
       minFeeB: result.min_fee_b,
       maxTxSize: result.max_tx_size,

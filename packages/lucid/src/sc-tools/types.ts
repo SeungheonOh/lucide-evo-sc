@@ -1,6 +1,6 @@
 import type { Network, Provider } from "@lucid-evolution/core-types";
 
-/** Exact cardano-cli Conway parameters and node era history, as used by LiveTx.hs. */
+/** Conway parameters and slot-to-time context consumed by the WASM bridge. */
 export type ScToolsChainContext = {
   network: "mainnet" | "preprod" | "preview" | "custom";
   networkMagic?: number;
@@ -36,8 +36,8 @@ export interface ScToolsRuntime {
 export type ScToolsBalancer = {
   type: "sc-tools";
   runtime: ScToolsRuntime;
-  /** Called for each completion, including after switchProvider(). */
-  chainContext: (context: {
+  /** Optional full node context. By default, uses Lucid's provider parameters and slot mapping. */
+  chainContext?: (context: {
     provider: Provider;
     network: Network;
   }) => Promise<ScToolsChainContext>;

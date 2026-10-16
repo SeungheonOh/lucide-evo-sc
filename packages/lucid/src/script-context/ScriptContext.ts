@@ -3,7 +3,7 @@ import {
   type Data as PlutusData,
   slotToBeginUnixTime,
 } from "@lucid-evolution/plutus";
-import { Effect } from "effect";
+import * as Effect from "effect/Effect";
 import type { Credential, SlotConfig, UTxO } from "@lucid-evolution/core-types";
 import {
   fromScriptRef,
@@ -12,6 +12,7 @@ import {
   validatorToScriptHash,
 } from "@lucid-evolution/utils";
 import { CML } from "../core.js";
+import { canonicalTransaction } from "../CanonicalTransaction.js";
 import { withCMLScope } from "@lucid-evolution/core-utils";
 import {
   buildCanonicalRedeemerInfo,
@@ -1113,9 +1114,6 @@ const txInfoFromTransaction = (
     txInfoTreasuryDonation: body.donation() ?? null,
   };
 };
-
-const canonicalTransaction = (tx: CML.Transaction): CML.Transaction =>
-  CML.Transaction.from_cbor_bytes(tx.to_canonical_cbor_bytes());
 
 const canonicalInfo = (
   tx: CML.Transaction,

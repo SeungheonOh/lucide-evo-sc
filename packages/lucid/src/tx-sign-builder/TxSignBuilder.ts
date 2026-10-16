@@ -1,7 +1,7 @@
 import { CML, makeReturn } from "../core.js";
 import { withCMLScope } from "@lucid-evolution/core-utils";
 import { LucidConfig } from "../lucid-evolution/LucidEvolution.js";
-import { Effect } from "effect";
+import * as Effect from "effect/Effect";
 import * as S from "@effect/schema/Schema";
 //TODO: move to commont utils
 import {
@@ -12,6 +12,7 @@ import {
   Wallet,
 } from "@lucid-evolution/core-types";
 import { TransactionSignError } from "../Errors.js";
+import { canonicalTransactionHex } from "../CanonicalTransaction.js";
 import { TxSigned } from "../tx-submit/TxSubmit.js";
 import * as CompleteTxSigner from "./internal/CompleteTxSigner.js";
 import { Either } from "effect/Either";
@@ -191,7 +192,7 @@ export const makeTxSignBuilder = (
     },
     toCBOR: (options = { canonical: false }) =>
       options.canonical
-        ? config.txComplete.to_canonical_cbor_hex()
+        ? canonicalTransactionHex(config.txComplete)
         : config.txComplete.to_cbor_hex(),
     toTransaction: () => config.txComplete,
     toScriptContext: (purpose, options) =>

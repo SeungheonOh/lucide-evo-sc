@@ -13,8 +13,9 @@ import {
   GovernanceVote,
   Redeemer,
 } from "@lucid-evolution/core-types";
-import * as CML from "@anastasia-labs/cardano-multiplatform-lib-nodejs";
-import { Effect, pipe } from "effect";
+import * as CML from "@lucid-evolution/cml";
+import * as Effect from "effect/Effect";
+import { pipe } from "effect/Function";
 import {
   ERROR_MESSAGE,
   TxBuilderError,

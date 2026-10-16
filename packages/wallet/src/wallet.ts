@@ -10,6 +10,7 @@ import {
 } from "@lucid-evolution/core-types";
 import { CML } from "./core.js";
 import { mnemonicToEntropy } from "bip39";
+import { bip32RootKeyFromEntropy } from "./root_key.js";
 
 export type FromSeed = {
   address: Address;
@@ -40,7 +41,7 @@ export function walletFromSeed(
   }
 
   const entropy = mnemonicToEntropy(seed);
-  const rootKey = CML.Bip32PrivateKey.from_bip39_entropy(
+  const rootKey = bip32RootKeyFromEntropy(
     fromHex(entropy),
     options?.password
       ? new TextEncoder().encode(options.password)
@@ -112,6 +113,14 @@ export function discoverOwnUsedTxKeyHashes(
 ): Array<KeyHash> {
   return withCMLScope((own) => {
     const usedKeyHashes = [];
+    // Inputs and collateral are matched by out-ref, so index the wallet's
+    // UTxOs once instead of scanning them for every input.
+    const ownUtxoByOutRef = new Map<string, UTxO>();
+    for (const utxo of ownUtxos) {
+      const key = `${utxo.txHash}#${utxo.outputIndex}`;
+      // The first match wins, as with `Array.prototype.find`.
+      if (!ownUtxoByOutRef.has(key)) ownUtxoByOutRef.set(key, utxo);
+    }
 
     // key hashes from inputs
     const txBody = own(tx.body());
@@ -120,9 +129,7 @@ export function discoverOwnUsedTxKeyHashes(
       const input = own(inputs.get(i));
       const txHash = own(input.transaction_id()).to_hex();
       const outputIndex = Number(input.index());
-      const utxo = ownUtxos.find(
-        (utxo) => utxo.txHash === txHash && utxo.outputIndex === outputIndex,
-      );
+      const utxo = ownUtxoByOutRef.get(`${txHash}#${outputIndex}`);
       if (utxo) {
         const { paymentCredential } = getAddressDetails(utxo.address);
         usedKeyHashes.push(paymentCredential?.hash!);
@@ -400,9 +407,7 @@ export function discoverOwnUsedTxKeyHashes(
         const input = own(collateral.get(i));
         const txHash = own(input.transaction_id()).to_hex();
         const outputIndex = Number(input.index());
-        const utxo = ownUtxos.find(
-          (utxo) => utxo.txHash === txHash && utxo.outputIndex === outputIndex,
-        );
+        const utxo = ownUtxoByOutRef.get(`${txHash}#${outputIndex}`);
         if (utxo) {
           const { paymentCredential } = getAddressDetails(utxo.address);
           usedKeyHashes.push(paymentCredential?.hash!);
@@ -410,6 +415,7 @@ export function discoverOwnUsedTxKeyHashes(
       }
     }
 
-    return usedKeyHashes.filter((k) => ownKeyHashes.includes(k));
+    const ownKeyHashSet = new Set(ownKeyHashes);
+    return usedKeyHashes.filter((k) => ownKeyHashSet.has(k));
   });
 }

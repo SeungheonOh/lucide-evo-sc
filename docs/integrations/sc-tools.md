@@ -19,11 +19,7 @@ uncompressed WASM artifact. Build output remains outside either repository.
 
 ```ts
 import { readFile } from "node:fs/promises";
-import {
-  Lucid,
-  createScToolsWasmRuntime,
-  type ScToolsChainContext,
-} from "@lucid-evolution/lucid";
+import { Lucid, createScToolsWasmRuntime } from "@lucid-evolution/lucid";
 
 const runtime = await createScToolsWasmRuntime(
   await WebAssembly.compile(await readFile(wasmPath)),
@@ -32,14 +28,6 @@ const lucid = await Lucid(provider, "Preprod", {
   balancer: {
     type: "sc-tools",
     runtime,
-    chainContext: async ({
-      provider,
-      network,
-    }): Promise<ScToolsChainContext> => {
-      // Fetch an up-to-date snapshot from your node or provider integration.
-      // This callback receives the current provider, including after switchProvider().
-      return getScToolsChainContext(provider, network);
-    },
   },
 });
 
@@ -54,9 +42,9 @@ const signed = await tx.sign.withWallet().complete();
 
 `wasmPath` normally points to
 `~/.cache/lucid-sctools-wasm/output/sc-tools.wasm`; expand `~` in application code.
-`provider`, `getScToolsChainContext`, wallet credentials, and recipient above are
-application-supplied. Neither the runtime nor this adapter fetches chain state or
-submits transactions automatically. Each request has isolated WASI memory; the
+`provider`, wallet credentials, and recipient above are
+application-supplied. The adapter uses the protocol parameters fetched by Lucid from the provider;
+it does not submit transactions automatically. Each request has isolated WASI memory; the
 compiled module is reused. Run the WASM runtime in a worker when you need to keep
 ledger evaluation off the main thread.
 
@@ -81,7 +69,24 @@ No WASM binary is bundled into the Lucid package.
 
 ## Chain context
 
-Supply the same schema used by `wasm/app/LiveTx.hs`:
+A chain-context callback is optional. With just `{ type: "sc-tools", runtime }`,
+all existing providers work through their unchanged `Provider` interface. The
+bridge uses the same protocol-parameter snapshot and per-instance slot mapping
+as Lucid's CML backend, including after `switchProvider()`. Fractional-second
+slot lengths and system starts are preserved.
+
+If a provider omits the protocol version, the bridge defaults to major version
+10, matching Lucid's Aiken evaluator. An explicit provider version takes precedence.
+
+This default is a **balancing context**, not a node consensus snapshot. Every
+parameter used for fees, execution, deposits, collateral, and transaction limits
+comes from Lucid. Unused epoch/ratification fields are filled from the bridge's
+bundled Conway configuration. Slot-to-time conversion follows Lucid's mapping;
+it does not invent historical era transitions.
+
+For applications with a full node snapshot, supply
+`balancer.chainContext: async ({ provider, network }) => snapshot` using the schema
+from `wasm/app/LiveTx.hs`:
 
 - `network`: `mainnet`, `preprod`, `preview`, or `custom` (with optional `networkMagic`).
 - `systemStart`: Unix seconds as a decimal string.
@@ -90,16 +95,13 @@ Supply the same schema used by `wasm/app/LiveTx.hs`:
   Each boundary has `time`, `slot`, and `epoch`. Parameters contain `epoch_length`,
   `slot_length`, and optionally `safe_zone`.
 
-Lucid's standard `Provider` interface is unchanged. Its reduced protocol-parameter
-object cannot reconstruct the full snapshot; do not fill missing parameters or era
-history with invented defaults. The caller owns snapshot freshness. Lucid and the
-snapshot must agree on network, output minimum ADA, and deposit parameters; the
-adapter rejects mismatches. Proposal deposits must match the snapshot's protocol
-parameter. The fixture in the tests is historical test data, not a live snapshot.
+Lucid and an explicit snapshot must agree on network, minimum ADA, and deposits;
+the adapter rejects mismatches. The caller owns explicit snapshot freshness.
+The test fixture is historical data, not a live snapshot.
 
 ## Transaction behavior
 
-The sc backend supports Lucid's existing payment, mint/burn, input, reference
+The sc backend supports Lucid's existing Shelley and Byron destination payments, mint/burn, input, reference
 script, datum, validity, signer, metadata, withdrawal, certificate, voting,
 proposal, treasury, composition, signing, and chaining APIs. Asset amounts,
 Plutus data, native scripts, and metadata cross the bridge without converting
@@ -119,7 +121,13 @@ bundles are partitioned to respect the maximum value size. Chaining removes the
 inputs actually consumed by sc-tools. Key-witness fee estimates are conservative. External evaluators can supply synthetic
 budgets for transaction inspection, as with CML; the ledger still enforces
 execution limits at submission.
-The signing path preserves the redeemer encoding covered by the body hash.
+Canonical completion preserves the order and encoding of Plutus data, while
+canonicalizing ledger containers. The signing path preserves the redeemer
+encoding covered by the body hash. Wallet-provided collateral is preferred,
+subject to preset inputs and protocol limits; unusable candidates fall back to
+wallet UTxOs. Reference inputs may also provide collateral without being spent.
+Explicit `evaluateBytes` adapters are supported. With no evaluator override,
+local evaluation runs inside the sc-tools Haskell ledger.
 
 For live chains, include `stakePools` (raw pool-key hashes), `stakeDeposits`, and
 `drepDeposits` when balancing state-dependent registrations or refunds. Deposit
@@ -160,8 +168,12 @@ calls. It validates signatures, fees, conservation of value, minimum ADA,
 collateral, scripts, certificates, rewards, and governance transitions. A failed
 submission leaves the state unchanged, and concurrent submissions are serialized.
 The JavaScript `ledger`, `mempool`, `chain`, and status fields are projections of
-that state. Explicit reward-fixture changes through `chain[address].delegation.rewards`
-are synchronized into the ledger before the next operation.
+that state. Direct edits to `ledger`, `mempool`, `chain`, `datumTable`, `treasury`, and
+`protocolParameters` remain available for fixtures. Queries retain the original
+Emulator's behavior, including synchronous NFT multiplicity errors. Fixture
+changes are synchronized into the actual ledger before balancing, evaluation,
+reward distribution, or submission. They do not bypass validation of submitted
+transactions.
 
 `awaitSlot` and `awaitBlock` advance the simulation clock and confirm pending
 transactions. `distributeRewards` credits registered, delegated accounts. As in
@@ -175,19 +187,34 @@ API, or seed pool IDs at genesis using the optional fifth constructor argument
 mockchain pool data. The simulator supplies its complete chain context through
 `emulator.balancer`; applications do not need to manufacture an era history.
 
-## Known compatibility limits
+## Compatibility baseline
 
-Full compatibility with every original Lucid behavior has not been achieved.
-The bridge currently rejects Byron addresses, including Byron output destinations.
-Existing live providers also need an additional full chain-context callback; merely
-selecting the sc-tools backend is not sufficient. The bridge source and rebuilt
-WASM are maintained separately in `lucid-sctools-wasm` and are not bundled in this
-repository.
+This fork includes Lucid Evolution 0.8.1, upstream commit
+`5394f993c22e12d090b06bbb1af3ad8d005c2b6f`, including its vendored CML,
+wallet collateral API, byte evaluators, and exact `setMinFee` behavior. The older
+`Maestro` export is retained so existing applications continue to compile.
 
-The regression results below cover the tested Conway transaction features.
-Live-network submission and exhaustive behavior/error equivalence remain
-unverified. The simulator's lack of epoch processing is a separate limitation,
-not evidence of a regression against the original Emulator.
+The existing builder, wallet, signing, provider, and completion interfaces are
+preserved. Balancer coin choices and conservative fees can differ. Real ledger
+validation is stricter than the original JavaScript Emulator, so transactions
+that violate Conway rules are rejected. The bridge is Conway-specific, as is
+the current transaction-building target. Byron wallet spending is not added;
+original Lucid's payment-credential path does not support it either.
+
+Live-network submission has not been exercised. The simulator does not run node
+epoch transitions, automatic epoch rewards, or governance ratification; the
+original Emulator does not supply those capabilities either. Test results below
+establish the covered contracts, not a proof of every possible input or error.
+
+The WASM source is a separate project on the repository's `sc-tools-wasm` branch;
+Lucid lives on `main`. To reproduce the bridge in a new checkout:
+
+```sh
+git clone --single-branch --branch sc-tools-wasm \
+  https://github.com/SeungheonOh/lucide-evo-sc.git ~/fun/lucid-sctools-wasm
+cd ~/fun/lucid-sctools-wasm
+bash wasm/build.sh
+```
 
 ## Verification
 
@@ -200,6 +227,8 @@ SC_TOOLS_WASM="$HOME/.cache/lucid-sctools-wasm/output/sc-tools.wasm" \
   corepack pnpm --filter @lucid-evolution/lucid exec vitest run test/sc-tools.test.ts test/sc-tools-emulator.test.ts
 SC_TOOLS_WASM="$HOME/.cache/lucid-sctools-wasm/output/sc-tools.wasm" \
   corepack pnpm --filter @lucid-evolution/lucid exec vitest run --config vitest.sctools.config.ts
+SC_TOOLS_WASM="$HOME/.cache/lucid-sctools-wasm/output/sc-tools.wasm" \
+  corepack pnpm --filter @lucid-evolution/lucid exec vitest run --config vitest.sctools-provider.config.ts
 corepack pnpm --filter @lucid-evolution/lucid exec tsc --noEmit
 ```
 
@@ -208,8 +237,12 @@ anything to a network. They use the actual compiled Haskell ledger, including
 successful and rejected Plutus evaluation. Without `SC_TOOLS_WASM`, those tests are
 explicitly skipped; adapter error-path tests still run.
 
-The parity configuration runs the existing 148 offline regression tests with the
-sc backend and actual mockchain. Its legacy reward fixtures use Conway protocol
+The parity configuration runs the upstream transaction regressions with the
+sc backend and actual mockchain. The 12 tests in `completion-evaluation.test.ts`
+instrument Aiken's internal calls and CML's draft counts; they run under CML.
+Equivalent SC contracts (fee-dependent final evaluation, delayed redeemers,
+explicit Aiken and byte adapters) have dedicated actual-ledger tests.
+`vitest.sctools-provider.config.ts` also runs upstream's 14 mutable-ledger tests. Its legacy reward fixtures use Conway protocol
 version 9 and seed their assumed existing pool; the dedicated mockchain tests use
 the current default parameters and explicitly delegate to a DRep for withdrawals.
 Network-dependent tests retain their existing skip conditions.
@@ -217,6 +250,8 @@ Network-dependent tests retain their existing skip conditions.
 Ledger validation also exposed shared CML adapter bugs corrected in this checkout:
 script voter ordering, unnecessary governance datums, vote signing keys, preservation
 of signed redeemer encoding, and pool margins, relay encoding, and metadata hashing.
+UTxO conversion also preserves a datum hash when the datum has not been fetched,
+so hash-datum Plutus V1 spending and reference inputs retain their ledger data.
 These corrections preserve the public API.
 
 See the [verification record](sc-tools-verification.md) for test results and the rebuilt artifact hash.

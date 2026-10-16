@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import * as Effect from "effect/Effect";
 import {
   Assets,
   BuildTxWithRedeemer,
@@ -20,6 +20,7 @@ import {
   fromCMLRedeemerTag,
 } from "@lucid-evolution/utils";
 import { CML } from "../../core.js";
+import { canonicalTransaction } from "../../CanonicalTransaction.js";
 import { withCMLScope } from "@lucid-evolution/core-utils";
 import { TxBuilderError } from "../../Errors.js";
 import type { TxBuilderConfig } from "../TxBuilder.js";
@@ -189,22 +190,25 @@ export const registerPendingRedeemer = (
     config.pendingRedeemers.push(pending);
   });
 
-const findResolvedInput = (
-  outRef: OutRef,
+/**
+ * Indexes `candidates` by out-ref. Where several candidates share an out-ref,
+ * the most complete one wins, and the first of equally complete ones.
+ */
+const indexResolvedInputs = (
   candidates: ReadonlyArray<UTxO>,
-): UTxO | undefined => {
-  const key = outRefKey(outRef);
-  let best: UTxO | undefined;
-  let bestScore = -1;
+): Map<string, UTxO> => {
+  const best = new Map<string, { utxo: UTxO; score: number }>();
   for (const candidate of candidates) {
-    if (outRefKey(candidate) !== key) continue;
+    const key = outRefKey(candidate);
     const score = resolvedUtxoCompletenessScore(candidate);
-    if (score > bestScore) {
-      best = candidate;
-      bestScore = score;
+    const current = best.get(key);
+    if (current === undefined || score > current.score) {
+      best.set(key, { utxo: candidate, score });
     }
   }
-  return best;
+  const index = new Map<string, UTxO>();
+  for (const [key, { utxo }] of best) index.set(key, utxo);
+  return index;
 };
 
 const resolvedUtxoCompletenessScore = (utxo: UTxO): number =>
@@ -221,9 +225,10 @@ export const resolveCanonicalInputs = (
         coreToOutRef(own(bodyInputs.get(i))),
       );
     });
+    const resolvedInputs = indexResolvedInputs(candidates);
     const inputs: UTxO[] = [];
     for (const outRef of outRefs) {
-      const resolved = findResolvedInput(outRef, candidates);
+      const resolved = resolvedInputs.get(outRefKey(outRef));
       if (!resolved) {
         yield* redeemerContextError(
           `Could not resolve transaction input ${outRefKey(outRef)}`,
@@ -247,9 +252,11 @@ export const resolveCanonicalReferenceInputs = (
         coreToOutRef(own(bodyInputs.get(i))),
       );
     });
+    if (outRefs.length === 0) return [];
+    const resolvedInputs = indexResolvedInputs(candidates);
     const inputs: UTxO[] = [];
     for (const outRef of outRefs) {
-      const resolved = findResolvedInput(outRef, candidates);
+      const resolved = resolvedInputs.get(outRefKey(outRef));
       if (!resolved) {
         yield* redeemerContextError(
           `Could not resolve reference input ${outRefKey(outRef)}`,
@@ -454,7 +461,26 @@ const governanceIndex = (
   return ledgerIndex;
 };
 
+/**
+ * Rewrites the builder's vote and propose redeemer indices to the ledger's.
+ * Returns `tx` itself when there is nothing to rewrite (no governance
+ * witnesses were registered, so every index is already the ledger's);
+ * otherwise the returned transaction is a new one the caller owns.
+ */
 export const normalizeGovernanceRedeemerIndices = (
+  tx: CML.Transaction,
+  voteWitnessKeys: readonly string[],
+  proposalWitnessIndices: readonly bigint[],
+): GovernanceRedeemerNormalization =>
+  voteWitnessKeys.length === 0 && proposalWitnessIndices.length === 0
+    ? { transaction: tx, builderKeyByLedgerKey: new Map() }
+    : remapGovernanceRedeemerIndices(
+        tx,
+        voteWitnessKeys,
+        proposalWitnessIndices,
+      );
+
+const remapGovernanceRedeemerIndices = (
   tx: CML.Transaction,
   voteWitnessKeys: readonly string[],
   proposalWitnessIndices: readonly bigint[],
@@ -462,9 +488,7 @@ export const normalizeGovernanceRedeemerIndices = (
   withCMLScope((own) => {
     // The returned transaction is always a fresh copy; the caller owns it.
     const transaction = CML.Transaction.from_cbor_bytes(tx.to_cbor_bytes());
-    const ledgerIndexTransaction = own(
-      CML.Transaction.from_cbor_bytes(tx.to_canonical_cbor_bytes()),
-    );
+    const ledgerIndexTransaction = own(canonicalTransaction(tx));
     const witnessSet = own(transaction.witness_set());
     const redeemers = own(witnessSet.redeemers());
     const builderKeyByLedgerKey = new Map<string, BuilderRedeemerKey>();
@@ -716,9 +740,7 @@ export const buildCanonicalRedeemerInfo = (
   resolvedInputs: ReadonlyArray<UTxO>,
 ): Effect.Effect<CanonicalRedeemerInfo, TxBuilderError> =>
   Effect.gen(function* () {
-    const canonicalTx = CML.Transaction.from_cbor_bytes(
-      tx.to_canonical_cbor_bytes(),
-    );
+    const canonicalTx = canonicalTransaction(tx);
     const txBody = canonicalTx.body();
     const inputs = yield* resolveCanonicalInputs(canonicalTx, resolvedInputs);
     const referenceInputs = yield* resolveCanonicalReferenceInputs(
@@ -949,7 +971,7 @@ export const redeemerMapsEqual = (
 
 export const transactionFixedPointFingerprint = (tx: CML.Transaction): string =>
   withCMLScope((own) => {
-    const body = own(tx.body()).to_canonical_cbor_hex();
+    const body = own(own(canonicalTransaction(tx)).body()).to_cbor_hex();
     const redeemers = own(own(tx.witness_set()).redeemers());
     const redeemerData: string[] = [];
     const redeemerExUnits: string[] = [];
@@ -959,7 +981,7 @@ export const transactionFixedPointFingerprint = (tx: CML.Transaction): string =>
         for (const redeemer of entries) {
           const index = redeemer.index.toString();
           redeemerData.push(
-            `${redeemer.tag}:${index}:${redeemer.data.to_canonical_cbor_hex()}`,
+            `${redeemer.tag}:${index}:${redeemer.data.to_cbor_hex()}`,
           );
           redeemerExUnits.push(
             `${redeemer.tag}:${index}:${redeemer.exUnits.mem()}:${redeemer.exUnits.steps()}`,

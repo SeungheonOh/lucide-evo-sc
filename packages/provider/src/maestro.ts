@@ -36,7 +36,7 @@ export interface MaestroConfig {
   turboSubmit?: boolean; // Read about paid turbo transaction submission feature at https://docs-v1.gomaestro.org/docs/Dapp%20Platform/Turbo%20Transaction.
 }
 
-// FY8uMdjKfGwdZJcCj0y4I0j0OJTx0xfD
+// Retained for existing Lucid applications; upstream removed this export in 0.3.0.
 export class Maestro implements Provider {
   url: string;
   apiKey: string;
@@ -62,6 +62,8 @@ export class Maestro implements Provider {
       );
     };
     return {
+      protocolMajorVersion: result.version?.major,
+      protocolMinorVersion: result.version?.minor,
       minFeeA: parseInt(result.min_fee_coefficient),
       minFeeB: parseInt(result.min_fee_constant.ada.lovelace),
       maxTxSize: parseInt(result.max_transaction_size.bytes),

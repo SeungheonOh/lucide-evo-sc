@@ -1,5 +1,34 @@
 # @lucid-evolution/sign_data
 
+## 0.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc)]:
+  - @lucid-evolution/cml@0.1.1
+  - @lucid-evolution/core-utils@0.2.1
+  - @lucid-evolution/core-types@0.5.1
+
+## 0.2.0
+
+### Minor Changes
+
+- [#752](https://github.com/Anastasia-Labs/lucid-evolution/pull/752) [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0) Thanks [@colll78](https://github.com/colll78)! - Vendor cardano-multiplatform-lib as `@lucid-evolution/cml` and depend on it instead of `@anastasia-labs/cardano-multiplatform-lib-nodejs` and `-browser`. The API is unchanged. The Node build's wasm shadow stack is raised to 16 MiB so deeply nested Plutus data decodes; the browser build keeps the 1 MiB stack. Import CML from `@lucid-evolution/lucid` (or `@lucid-evolution/cml`): objects created by a separately installed `@anastasia-labs` CML belong to another wasm instance and cannot be passed to Lucid.
+
+### Patch Changes
+
+- Updated dependencies [[`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0), [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0)]:
+  - @lucid-evolution/cml@0.1.0
+  - @lucid-evolution/core-types@0.5.0
+  - @lucid-evolution/core-utils@0.2.0
+
+## 0.1.33
+
+### Patch Changes
+
+- Updated dependencies [[`b95feb8`](https://github.com/Anastasia-Labs/lucid-evolution/commit/b95feb819f9860e7bf8da61118e52db738f4c8e0), [`636661e`](https://github.com/Anastasia-Labs/lucid-evolution/commit/636661ec7fd9c42d9f9f5be393f961cb1ebf080f)]:
+  - @lucid-evolution/core-types@0.4.0
+
 ## 0.1.32
 
 ### Patch Changes

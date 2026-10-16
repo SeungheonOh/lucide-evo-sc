@@ -1,5 +1,40 @@
 # @lucid-evolution/plutus
 
+## 0.2.1
+
+### Patch Changes
+
+- [#755](https://github.com/Anastasia-Labs/lucid-evolution/pull/755) [`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc) Thanks [@colll78](https://github.com/colll78)! - Speed up importing Lucid, building transactions and running the emulator without changing the transactions built. Effect modules are imported by path, and DRep ids are parsed without loading `@cardano-sdk/core`, so importing Lucid takes about 430 ms instead of about 515 ms. Canonicalising a transaction is a single CML call (`Transaction.to_canonical_keeping_plutus_data`), about four times faster. Plutus schemas are built without cloning nested schemas. On Node, the emulator verifies vkey witnesses with the native Ed25519 (about three times faster), seed wallets derive their root key with the native PBKDF2, and hex is encoded and decoded with the native codec; other runtimes keep the existing code. In a benchmark of 24 transaction shapes, the geometric mean time to build a transaction fell by about a quarter (2.9 to 2.1 ms). Most of that is for wallets that hold many tokens, which take about 39% less time, and where simple payments and mints build about twice as fast; for an ada-only wallet the gain is about 12%. CML sizes packed change and output fees without rebuilding the transaction, hashes the keys of its maps (policy ids, asset names and the like) with foldhash instead of SipHash, and has a new `TransactionBuilder.has_redeemers`, so Lucid no longer builds a draft just to check for redeemers.
+
+  `@lucid-evolution/utils` now depends on `@scure/base` for bech32, and `@cardano-sdk/core` is only a development dependency, used by its tests.
+
+- Updated dependencies [[`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc)]:
+  - @lucid-evolution/cml@0.1.1
+  - @lucid-evolution/core-utils@0.2.1
+  - @lucid-evolution/core-types@0.5.1
+
+## 0.2.0
+
+### Minor Changes
+
+- [#752](https://github.com/Anastasia-Labs/lucid-evolution/pull/752) [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0) Thanks [@colll78](https://github.com/colll78)! - Vendor cardano-multiplatform-lib as `@lucid-evolution/cml` and depend on it instead of `@anastasia-labs/cardano-multiplatform-lib-nodejs` and `-browser`. The API is unchanged. The Node build's wasm shadow stack is raised to 16 MiB so deeply nested Plutus data decodes; the browser build keeps the 1 MiB stack. Import CML from `@lucid-evolution/lucid` (or `@lucid-evolution/cml`): objects created by a separately installed `@anastasia-labs` CML belong to another wasm instance and cannot be passed to Lucid.
+
+### Patch Changes
+
+- Updated dependencies [[`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0), [`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0)]:
+  - @lucid-evolution/cml@0.1.0
+  - @lucid-evolution/core-types@0.5.0
+  - @lucid-evolution/core-utils@0.2.0
+
+## 0.1.37
+
+### Patch Changes
+
+- [#749](https://github.com/Anastasia-Labs/lucid-evolution/pull/749) [`66b728b`](https://github.com/Anastasia-Labs/lucid-evolution/commit/66b728b6222d90b2da76b275d77bb3d5e9eb3b2b) Thanks [@colll78](https://github.com/colll78)! - `Data.to` and `Data.from` encode and decode Plutus data in JavaScript instead of building a CML object per node, which was quadratic in nesting depth. They are 8 to 60 times faster and return byte-identical CBOR and identical values, in both node and canonical formats, including CML's map key ordering and deduplication. Input the JavaScript codec does not reproduce exactly (malformed values, unusual CBOR, maps with repeated keys) still goes through CML, so results and error messages are unchanged.
+
+- Updated dependencies [[`b95feb8`](https://github.com/Anastasia-Labs/lucid-evolution/commit/b95feb819f9860e7bf8da61118e52db738f4c8e0), [`636661e`](https://github.com/Anastasia-Labs/lucid-evolution/commit/636661ec7fd9c42d9f9f5be393f961cb1ebf080f)]:
+  - @lucid-evolution/core-types@0.4.0
+
 ## 0.1.36
 
 ### Patch Changes

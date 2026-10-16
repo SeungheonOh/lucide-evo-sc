@@ -1,6 +1,6 @@
 {
   "name": "@lucid-evolution/wallet",
-  "version": "0.2.2",
+  "version": "0.4.1",
   "description": "",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -27,12 +27,8 @@
   "keywords": [],
   "author": "",
   "license": "MIT",
-  "browser": {
-    "@anastasia-labs/cardano-multiplatform-lib-nodejs": "@anastasia-labs/cardano-multiplatform-lib-browser"
-  },
   "dependencies": {
-    "@anastasia-labs/cardano-multiplatform-lib-browser": "6.2.0-1",
-    "@anastasia-labs/cardano-multiplatform-lib-nodejs": "6.2.0-1",
+    "@lucid-evolution/cml": "workspace:*",
     "@lucid-evolution/core-types": "workspace:*",
     "@lucid-evolution/core-utils": "workspace:*",
     "@lucid-evolution/sign_data": "workspace:*",
@@ -41,6 +37,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.12.8",
+    "effect": "^3.12.7",
     "tsup": "^8.0.2",
     "typescript": "^5.4.5",
     "vitest": "^2.1.8"

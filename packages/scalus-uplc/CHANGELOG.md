@@ -1,5 +1,47 @@
 # @lucid-evolution/scalus-uplc
 
+## 0.2.3
+
+### Patch Changes
+
+- Updated dependencies [[`ebb5f33`](https://github.com/Anastasia-Labs/lucid-evolution/commit/ebb5f3391335e0c91e2d46b4978738eb333293bc)]:
+  - @lucid-evolution/core-utils@0.2.1
+  - @lucid-evolution/core-types@0.5.1
+
+## 0.2.2
+
+### Patch Changes
+
+- Updated dependencies [[`544ae00`](https://github.com/Anastasia-Labs/lucid-evolution/commit/544ae00309186ec335500c308078254594f4bcc0)]:
+  - @lucid-evolution/core-types@0.5.0
+  - @lucid-evolution/core-utils@0.2.0
+
+## 0.2.1
+
+### Patch Changes
+
+- [#750](https://github.com/Anastasia-Labs/lucid-evolution/pull/750) [`b95feb8`](https://github.com/Anastasia-Labs/lucid-evolution/commit/b95feb819f9860e7bf8da61118e52db738f4c8e0) Thanks [@colll78](https://github.com/colll78)! - Add an optional `EvaluatorAdapter.evaluateBytes`, the same evaluation as `evaluate` with the transaction as CBOR bytes. Lucid calls it when an adapter has it, skipping the hex round trip. The built-in Aiken evaluator now exposes its bytes path this way instead of through a private symbol.
+
+  The Scalus evaluator implements `evaluateBytes`, keeps the Scalus `Utxo` of each resolved UTxO of its latest request, and returns its last successful result again when the next request is the same, as the built-in evaluator does. A delayed-redeemer completion no longer runs Scalus twice on its repeated final request.
+
+- Updated dependencies [[`b95feb8`](https://github.com/Anastasia-Labs/lucid-evolution/commit/b95feb819f9860e7bf8da61118e52db738f4c8e0), [`636661e`](https://github.com/Anastasia-Labs/lucid-evolution/commit/636661ec7fd9c42d9f9f5be393f961cb1ebf080f)]:
+  - @lucid-evolution/core-types@0.4.0
+
+## 0.2.0
+
+### Minor Changes
+
+- [#737](https://github.com/Anastasia-Labs/lucid-evolution/pull/737) [`19c9abd`](https://github.com/Anastasia-Labs/lucid-evolution/commit/19c9abd0055534ebb6521b579b19b09d58b22ad1) Thanks [@nau](https://github.com/nau)! - Move to Scalus 1.3.0 and evaluate through its CBOR-first API.
+
+  Scalus now takes UTxOs as handles and a transaction as hex, so the adapter no longer builds the
+  CBOR UTxO map itself. That removes the hand-rolled CBOR map writer, the byte comparator, the
+  double-CBOR script encoder and the asset-to-CML-value conversion, and with them the dependencies on
+  `@anastasia-labs/cardano-multiplatform-lib-{nodejs,browser}` and `cbor-x`. The adapter is 325 lines
+  down to 100, and the `browser` field that swapped the two CML builds is no longer needed.
+
+  Scalus 1.x is ESM-only, so the adapter loads it with `import()` on the first evaluation. That keeps
+  the CommonJS build working on every Node version the repository supports, Node 18 included.
+
 ## 0.1.5
 
 ### Patch Changes

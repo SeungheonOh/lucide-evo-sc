@@ -1,4 +1,4 @@
-import * as CML from "@anastasia-labs/cardano-multiplatform-lib-nodejs";
+import * as CML from "@lucid-evolution/cml";
 
 export type CostModels = Record<PlutusVersion, number[]>;
 
@@ -99,9 +99,22 @@ export type EvaluationInput = {
   context: EvaluationContext;
 };
 
+/** An `EvaluationInput` with the transaction as CBOR bytes instead of hex. */
+export type EvaluationBytesInput = Omit<EvaluationInput, "tx"> & {
+  tx: Uint8Array;
+};
+
 export type EvaluatorAdapter = {
   name?: string;
   evaluate(input: EvaluationInput): Promise<EvalRedeemer[]>;
+  /**
+   * The same evaluation as `evaluate`, with the transaction as CBOR bytes.
+   * When an adapter has it, Lucid calls it instead of `evaluate` and skips
+   * the hex round trip. Define it as non-enumerable, so that an adapter
+   * copied with a replaced `evaluate` (`{ ...adapter, evaluate }`) does not
+   * keep a bytes path that bypasses the replacement.
+   */
+  evaluateBytes?(input: EvaluationBytesInput): Promise<EvalRedeemer[]>;
 };
 
 export type Credential = {
@@ -361,6 +374,14 @@ export interface Wallet {
   rewardAddress(): Promise<RewardAddress | null>;
   getUtxos(): Promise<UTxO[]>;
   getUtxosCore(): Promise<Array<CML.TransactionUnspentOutput>>;
+  /**
+   * Collateral candidates preferred by the wallet, separate from the UTxOs
+   * used for coin selection. `amount` is the collateral, in lovelace, the
+   * transaction needs. Transaction completion uses these first and falls back
+   * to the wallet's UTxOs when the list is empty, cannot cover the
+   * collateral, or the call fails.
+   */
+  getCollateral?(amount?: bigint): Promise<UTxO[]>;
   getDelegation(): Promise<Delegation>;
   signTx(tx: CML.Transaction): Promise<CML.TransactionWitnessSet>;
   signTxs?(txs: CML.Transaction[]): Promise<CML.TransactionWitnessSet[]>;
