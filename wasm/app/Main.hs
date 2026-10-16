@@ -24,7 +24,7 @@ import Data.ByteString.Base16 qualified as Base16
 import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.IORef
 import Data.Text.Encoding (decodeUtf8)
-import LiveTx (handleRequest)
+import LucidBridge (handleRequest)
 import MatchingNumber
 import PortChecks (portChecks)
 import System.Environment (getArgs)

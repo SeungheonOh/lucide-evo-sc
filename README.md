@@ -1,3 +1,7 @@
+# Lucid sc-tools WASM bridge
+
+This checkout adds the [Lucid bridge v2 and convex-mockchain API](wasm/LUCID-BRIDGE.md) for the separate `lucid-revolution` integration.
+
 # sc-tools transaction studio
 
 A browser transaction block editor backed by upstream
@@ -67,7 +71,7 @@ GHC_WASM_PREFIX=/path/to/ghc-wasm bash wasm/build.sh
 
 All downloads, dependency sources, compiler installations, build output, and
 browser test artifacts stay **outside this directory**, under
-`~/.cache/sc-tools-wasm` by default. `XDG_CACHE_HOME` is respected;
+`~/.cache/lucid-sctools-wasm` by default. `XDG_CACHE_HOME` is respected;
 `SC_TOOLS_WASM_CACHE` can select another external directory.
 
 - `wasm/patches/`: WASM32 portability patches.
@@ -96,7 +100,7 @@ Install Wrangler outside the project, then deploy with a Cloudflare API token
 provided in the `CLOUDFLARE_API_TOKEN` environment variable:
 
 ```sh
-npm install --prefix ~/.cache/sc-tools-wasm/cloudflare-cli --save-dev wrangler@4.131.1
+npm install --prefix ~/.cache/lucid-sctools-wasm/cloudflare-cli --save-dev wrangler@4.131.1
 python3 -B wasm/deploy.py --dry-run
 npm run deploy
 ```

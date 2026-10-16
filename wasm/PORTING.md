@@ -6,7 +6,7 @@ Plutus 1.63.0.0, and GHC WASM 9.12.4.20260731. The separate Cabal project
 selects the transaction, coin-selection, wallet, optics, and mockchain libraries
 from `deps/sc-tools/` in the external build cache.
 
-The cache defaults to `~/.cache/sc-tools-wasm`, respects `XDG_CACHE_HOME`, and
+The cache defaults to `~/.cache/lucid-sctools-wasm`, respects `XDG_CACHE_HOME`, and
 can be overridden with `SC_TOOLS_WASM_CACHE`. Downloads, extracted sources,
 compiler output, browser artifacts, and test dependencies all stay there.
 

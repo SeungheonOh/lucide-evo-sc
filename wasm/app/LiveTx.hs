@@ -8,12 +8,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
-module LiveTx (handleRequest) where
+module LiveTx where
 
 import Cardano.Api qualified as C
 import Cardano.Api.Experimental qualified as E
 import Cardano.Api.Ledger qualified as L
 import Cardano.Ledger.Core (ppKeyDepositL)
+import Cardano.Ledger.Address (getNetwork)
+import Data.Scientific (Scientific)
 import Cardano.Binary qualified as CB
 import Cardano.Ledger.Binary qualified as LB
 import Cardano.Slotting.Time (SystemStart(..), RelativeTime(..), mkSlotLength)
@@ -46,6 +48,9 @@ import Ouroboros.Consensus.HardFork.History qualified as H
 import Ouroboros.Consensus.Block.Abstract (GenesisWindow(..))
 import Text.Read (readMaybe)
 import ExampleScripts (exampleScripts)
+
+mergeJSON (Object a) (Object b) = Object (KM.unionWith mergeJSON a b)
+mergeJSON a _ = a
 
 type Era = C.ConwayEra
 type Builder = B.TxBuilder Era
@@ -130,11 +135,14 @@ plutus o = do
     "PlutusV2" -> SomePlutus C.PlutusScriptV2 <$> cbor (C.AsPlutusScript C.AsPlutusScriptV2) bytes
     "PlutusV3" -> SomePlutus C.PlutusScriptV3 <$> cbor (C.AsPlutusScript C.AsPlutusScriptV3) bytes
     _ -> fail "Choose PlutusV1, PlutusV2, or PlutusV3"
+nativeScriptP :: Object -> Parser C.SimpleScript
+nativeScriptP o = o .:? "nativeScriptCbor" >>= maybe (o .: "nativeScript" >>= parseJSON) (fmap (\(C.SimpleScript s) -> s) . cbor (C.AsScript C.AsSimpleScript))
+
 anyScript :: Value -> Parser C.ScriptInAnyLang
 anyScript = withObject "script" $ \o -> do
   lang <- o .: "language" :: Parser Text
   if lang == "Native"
-    then C.ScriptInAnyLang C.SimpleScriptLanguage . C.SimpleScript <$> (o .: "nativeScript" >>= parseJSON)
+    then C.ScriptInAnyLang C.SimpleScriptLanguage . C.SimpleScript <$> nativeScriptP o
     else do SomePlutus version script <- plutus o
             pure (C.ScriptInAnyLang (C.PlutusScriptLanguage version) (C.PlutusScript version script))
 scriptWitness :: forall ctx. C.ScriptDatum ctx -> Value -> Parser (C.ScriptWitness ctx Era)
@@ -144,10 +152,10 @@ scriptWitness dat = withObject "script witness" $ \o -> do
   if lang == "Native" then do
     s <- case ref of
       Just i -> pure (C.SReferenceScript i)
-      Nothing -> C.SScript <$> (o .: "nativeScript" >>= parseJSON)
+      Nothing -> C.SScript <$> nativeScriptP o
     pure (C.SimpleScriptWitness C.SimpleScriptInConway s)
   else do
-    red <- o .: "redeemer" >>= scriptData
+    red <- o .:? "redeemerCbor" >>= maybe (o .: "redeemer" >>= scriptData) (cbor C.AsHashableScriptData)
     let mk :: forall l. (C.HasScriptLanguageInEra l Era, C.IsPlutusScriptLanguage l) => C.PlutusScriptVersion l -> C.PlutusScript l -> C.ScriptWitness ctx Era
         mk version s = C.PlutusScriptWitness (C.scriptLanguageInEra @l @Era) version (maybe (C.PScript s) (\i -> C.PReferenceScript i) ref) dat red (C.ExecutionUnits 0 0)
     case ref of
@@ -197,7 +205,10 @@ block params = withObject "transaction block" $ \o -> do
       case wit of
         Nothing -> build (B.spendPublicKeyOutput i)
         Just w -> do
-          dat <- o .:? "datum" >>= maybe (pure C.InlineScriptDatum) (fmap (C.ScriptDatumForTxIn . Just) . scriptData)
+          supplied <- o .:? "datumCbor" >>= traverse (cbor C.AsHashableScriptData)
+          dat <- case supplied of
+            Just d -> pure (C.ScriptDatumForTxIn (Just d))
+            Nothing -> o .:? "datum" >>= maybe (pure C.InlineScriptDatum) (fmap (C.ScriptDatumForTxIn . Just) . scriptData)
           sw <- scriptWitness dat w
           build (B.addInputWithTxBody i (const (C.ScriptWitness C.ScriptWitnessForSpending sw)))
     "reference" -> o .: "input" >>= input >>= build . B.addReference
@@ -210,7 +221,7 @@ block params = withObject "transaction block" $ \o -> do
       when (maybe False id ((>=) <$> lower <*> upper)) (fail "Validity interval is empty")
       build $ B.addBtx $ \b -> b {C.txValidityLowerBound=maybe C.TxValidityNoLowerBound (C.TxValidityLowerBound C.AllegraEraOnwardsConway . fromInteger) lower, C.txValidityUpperBound=C.TxValidityUpperBound C.ShelleyBasedEraConway (fromInteger <$> upper)}
     "metadata" -> do
-      meta <- o .: "metadata" >>= rawJSON >>= eitherP . C.metadataFromJson C.TxMetadataJsonNoSchema
+      meta <- o .:? "cbor" >>= maybe (o .: "metadata" >>= rawJSON >>= eitherP . C.metadataFromJson C.TxMetadataJsonNoSchema) (cbor C.AsTxMetadata)
       build $ B.addBtx $ \b -> b {C.txMetadata=case C.txMetadata b of C.TxMetadataNone -> C.TxMetadataInEra C.ShelleyBasedEraConway meta; C.TxMetadataInEra e old -> C.TxMetadataInEra e (old <> meta)}
     "auxiliary" -> do
       s <- o .: "script" >>= anyScript
@@ -327,21 +338,25 @@ parseContext o = do
   wallet <- o .: "wallet"
   wutxos <- wallet .: "utxos" >>= traverse walletOutput
   collateral <- wallet .:? "collateral" .!= [] >>= traverse walletOutput
+  fallbackCollateral <- wallet .:? "collateralFallback" .!= [] >>= traverse walletOutput
   external <- o .:? "resolvedInputs" .!= [] >>= traverse resolvedOutput
   change <- wallet .: "changeAddress" >>= address
   chain <- o .: "chain"
-  params <- C.LedgerProtocolParameters <$> (chain .: "protocolParameters" >>= parseJSON)
+  params <- C.LedgerProtocolParameters <$> (chain .: "protocolParameters" >>= parseJSON . protocolJSON)
   eras <- chain .: "eraSummaries" >>= traverse eraSummary >>= history
-  start <- SystemStart . posixSecondsToUTCTime . fromInteger <$> intField chain "systemStart"
+  startValue <- chain .: "systemStart"
+  seconds <- case startValue of
+    String t -> either fail pure (eitherDecodeStrict (encodeUtf8 t) :: Either String Scientific)
+    v -> parseJSON v
+  let start = SystemStart (posixSecondsToUTCTime (realToFrac seconds))
   net <- chain .: "network" :: Parser Text
-  network <- case net of "mainnet" -> pure C.Mainnet; "preprod" -> pure (C.Testnet (C.NetworkMagic 1)); "preview" -> pure (C.Testnet (C.NetworkMagic 2)); _ -> fail "Unknown network"
-  let allUtxos = Map.fromList (wutxos <> collateral <> external)
+  network <- case net of "mainnet" -> pure C.Mainnet; "preprod" -> pure (C.Testnet (C.NetworkMagic 1)); "preview" -> pure (C.Testnet (C.NetworkMagic 2)); "custom" -> C.Testnet . C.NetworkMagic <$> (chain .:? "networkMagic" .!= 0); _ -> fail "Unknown network"
+  let allUtxos = Map.fromList (wutxos <> collateral <> fallbackCollateral <> external)
       addressNetwork :: C.AddressInEra Era -> L.Network
-      addressNetwork (C.AddressInEra _ (C.ShelleyAddress n _ _)) = n
-      addressNetwork _ = error "Byron addresses are not supported as wallet inputs"
+      addressNetwork = getNetwork . C.toShelleyAddr
   unless (addressNetwork change == C.toShelleyNetwork network) (fail "Change address does not match the selected network")
   blocks <- o .: "blocks" :: Parser [Value]
-  when (null blocks || length blocks > 200) (fail "Use between 1 and 200 transaction blocks")
+
   builder <- mconcat <$> traverse (block params) blocks
   let body = B.buildTx builder
       refs = case C.txInsReference body of C.TxInsReference _ is _ -> is; _ -> []
@@ -352,7 +367,7 @@ parseContext o = do
   forM_ (spent <> refs <> cols) $ \i -> unless (Map.member i allUtxos) (fail ("Missing resolved UTXO: " <> T.unpack (inputText i)))
   forM_ (C.txOuts body) $ \(C.TxOut a _ _ _) -> unless (addressNetwork a == C.toShelleyNetwork network) (fail "Recipient address is on a different network")
   extra <- o .:? "additionalWitnesses" .!= 0
-  pure (Context (C.UTxO allUtxos) params eras start network, C.UTxO (Map.withoutKeys (Map.fromList (wutxos <> collateral)) (Set.fromList refs)),change,builder,extra)
+  pure (Context (C.UTxO allUtxos) params eras start network, C.UTxO (Map.withoutKeys (Map.fromList wutxos) (Set.fromList refs)),change,builder,extra)
 
 resolvedOutput :: Value -> Parser (C.TxIn, C.TxOut C.CtxUTxO Era)
 resolvedOutput (String t) = walletOutput t
@@ -471,3 +486,12 @@ exactJSON (Number n) | abs n > 9007199254740991 = String (T.pack (show (truncate
 exactJSON (Array xs) = Array (fmap exactJSON xs)
 exactJSON (Object xs) = Object (fmap exactJSON xs)
 exactJSON v = v
+
+-- Accept decimal strings for exact protocol quantities crossing JavaScript's JSON boundary.
+protocolJSON :: Value -> Value
+protocolJSON (String t) = case eitherDecodeStrict (encodeUtf8 t) of
+  Right n@(Number _) -> n
+  _ -> String t
+protocolJSON (Object o) = Object (fmap protocolJSON o)
+protocolJSON (Array a) = Array (fmap protocolJSON a)
+protocolJSON v = v

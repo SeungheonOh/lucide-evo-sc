@@ -8,7 +8,8 @@
     "test:browser": "bash wasm/test-browser.sh",
     "deploy": "python3 -B wasm/deploy.py",
     "test:editor": "node wasm/check-editor.mjs",
-    "test:examples": "node wasm/check-examples.mjs"
+    "test:examples": "node wasm/check-examples.mjs",
+    "test:lucid-bridge": "node wasm/check-lucid-bridge.mjs"
   },
   "devDependencies": {
     "playwright-core": "1.62.1"

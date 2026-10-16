@@ -24,6 +24,7 @@ for license_name in ['LICENSE-APACHE', 'LICENSE-MIT']:
 (OUTPUT / 'sc-tools.wasm').write_bytes(data)
 (BROWSER / 'sc-tools.wasm.gz').write_bytes(compressed)
 metadata = {
+    'bridgeVersion': 2,
     'upstreamCommit': '4546122230491db4839a4a42fc2bc601f7900909',
     'compiler': 'wasm32-wasi-ghc 9.12.4.20260731',
     'wasmBytes': len(data),

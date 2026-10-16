@@ -25,7 +25,7 @@ because it includes the Cardano ledger. To reuse a toolchain:
 GHC_WASM_PREFIX=/path/to/ghc-wasm BUILD_JOBS=4 bash wasm/build.sh
 ```
 
-All generated paths are under `~/.cache/sc-tools-wasm`, respecting
+All generated paths are under `~/.cache/lucid-sctools-wasm`, respecting
 `XDG_CACHE_HOME`. Set `SC_TOOLS_WASM_CACHE` for another external location.
 Locations inside the source tree are rejected.
 
