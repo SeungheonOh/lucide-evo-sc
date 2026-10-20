@@ -57,6 +57,10 @@ jobs:
 
       - run: pnpm i
       - run: pnpm run build
+      - run: pnpm check:haskell
+      - run: pnpm test:package
+      - run: pnpm exec playwright-core install --with-deps chromium
+      - run: pnpm test:browser
       - run: pnpm run lint
       - run: pnpm run format-check
       - run: pnpm turbo run test --affected --env-mode=loose

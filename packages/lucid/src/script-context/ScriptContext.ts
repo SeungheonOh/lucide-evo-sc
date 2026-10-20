@@ -4,42 +4,40 @@ import {
   slotToBeginUnixTime,
 } from "@lucid-evolution/plutus";
 import * as Effect from "effect/Effect";
-import type { Credential, SlotConfig, UTxO } from "@lucid-evolution/core-types";
+import type {
+  Credential,
+  SlotConfig,
+  UTxO,
+  TxOutput,
+} from "@lucid-evolution/core-types";
 import {
-  fromScriptRef,
+  datumToHash,
   getAddressDetails,
-  utxoToTransactionOutput,
   validatorToScriptHash,
 } from "@lucid-evolution/utils";
-import { CML } from "../core.js";
-import { canonicalTransaction } from "../CanonicalTransaction.js";
-import { withCMLScope } from "@lucid-evolution/core-utils";
+import {
+  CborTag,
+  encodeCbor,
+  inspectTransaction,
+  type CborValue,
+  type TransactionSnapshot,
+  type LedgerRedeemer,
+} from "@lucid-evolution/ledger";
+import { toHex } from "@lucid-evolution/core-utils";
 import {
   buildCanonicalRedeemerInfo,
-  canonicalRedeemerEntries,
-  freeCanonicalRedeemerEntries,
-  proposalProcedureForRedeemerIndex,
-  type CanonicalRedeemerEntry,
+  orderedVoters,
   type CanonicalRedeemerInfo,
-  voterForRedeemerIndex,
 } from "../tx-builder/internal/RedeemerContext.js";
 import { ScriptPurposeData } from "./Schema.js";
 import type {
-  AddressData,
-  ChangedParametersData,
-  ConstitutionData,
   CredentialData,
   DRepData,
-  DelegateeData,
   GovernanceActionData,
   GovernanceActionIdData,
-  MintValueData,
-  POSIXTimeRangeData,
   ProposalProcedureData,
-  ProtocolVersionData,
   ScriptContextData,
   ScriptInfoData,
-  StakingCredentialData,
   TxCertData,
   TxInInfoData,
   TxInfoData,
@@ -49,1137 +47,505 @@ import type {
   VoteData,
   VoterData,
 } from "./Schema.js";
-
 export type ScriptContextOptions = {
   resolvedInputs?: ReadonlyArray<UTxO>;
   slotConfig?: SlotConfig;
 };
-
 export type ScriptContext = ScriptContextData;
 export type ScriptPurpose = ScriptPurposeData;
-
-type AssetMap =
-  | CML.MultiAsset
-  | CML.Mint
-  | {
-      keys(): CML.PolicyIdList;
-      get_assets(
-        key: CML.ScriptHash,
-      ): CML.MapAssetNameToCoin | CML.MapAssetNameToNonZeroInt64 | undefined;
-    };
-
-type PlutusDataValue = PlutusData;
-
-const slotToPosixTime = (
-  slot: bigint,
-  slotConfig: SlotConfig | undefined,
-): bigint => {
-  if (!slotConfig || slotConfig.slotLength === 0) {
-    throw new Error(
-      "ScriptContext translation requires a valid slotConfig to translate the transaction validity interval.",
-    );
-  }
-  return BigInt(slotToBeginUnixTime(Number(slot), slotConfig));
+const array = (value: CborValue | undefined): CborValue[] =>
+  value instanceof CborTag
+    ? array(value.value)
+    : Array.isArray(value)
+      ? value
+      : [];
+const map = (value: CborValue | undefined): Map<CborValue, CborValue> =>
+  value instanceof Map ? value : new Map();
+const hex = (value: CborValue | undefined): string => {
+  if (!(value instanceof Uint8Array))
+    throw new Error("Expected ledger bytes in ScriptContext");
+  return toHex(value);
 };
-
-const toArray = <T>(
-  list: { len(): number; get(index: number): T } | undefined,
-) => {
-  const result: T[] = [];
-  if (!list) return result;
-  for (let index = 0; index < list.len(); index++) {
-    result.push(list.get(index));
-  }
-  return result;
-};
-
-const byteLength = (hex: string): number => hex.length / 2;
-
-const compareByteArrayHex = (left: string, right: string): number => {
-  const leftLength = byteLength(left);
-  const rightLength = byteLength(right);
-  const sharedLength = Math.min(leftLength, rightLength);
-  for (let index = 0; index < sharedLength; index++) {
-    const leftByte = parseInt(left.slice(index * 2, index * 2 + 2), 16);
-    const rightByte = parseInt(right.slice(index * 2, index * 2 + 2), 16);
-    if (leftByte !== rightByte) return leftByte - rightByte;
-  }
-  return leftLength - rightLength;
-};
-
-const compareBigInt = (left: bigint, right: bigint): number =>
-  left < right ? -1 : left > right ? 1 : 0;
-
+const int = (value: CborValue): bigint => BigInt(value as bigint);
+const compareInteger = (a: bigint, b: bigint) => (a < b ? -1 : a > b ? 1 : 0);
 const sortedMap = <K, V>(
   entries: ReadonlyArray<readonly [K, V]>,
-  compareKey: (left: K, right: K) => number,
-): Map<K, V> =>
-  new Map([...entries].sort(([left], [right]) => compareKey(left, right)));
-
-const datumFromPlutusData = (data: CML.PlutusData): PlutusDataValue =>
-  Data.from(data.to_cbor_hex());
-
-const txOutRefFromCml = (input: CML.TransactionInput): TxOutRefData => ({
-  txOutRefId: input.transaction_id().to_hex(),
-  txOutRefIdx: input.index(),
-});
-
-const compareTxOutRef = (left: TxOutRefData, right: TxOutRefData): number =>
-  compareByteArrayHex(left.txOutRefId, right.txOutRefId) ||
-  compareBigInt(left.txOutRefIdx, right.txOutRefIdx);
-
-const credentialFromCml = (credential: CML.Credential): CredentialData => {
-  const pubKey = credential.as_pub_key();
-  if (pubKey) return { PubKeyCredential: [pubKey.to_hex()] };
-  const script = credential.as_script();
-  if (script) return { ScriptCredential: [script.to_hex()] };
-  throw new Error("Unsupported credential in ScriptContext translation.");
+  compare: (a: K, b: K) => number,
+): Map<K, V> => new Map([...entries].sort(([a], [b]) => compare(a, b)));
+const credential = (value: CborValue): CredentialData => {
+  const [kind, hash] = array(value);
+  return kind === 0n
+    ? { PubKeyCredential: [hex(hash)] }
+    : { ScriptCredential: [hex(hash)] };
 };
-
-const credentialFromCore = (credential: Credential): CredentialData =>
-  credential.type === "Key"
-    ? { PubKeyCredential: [credential.hash] }
-    : { ScriptCredential: [credential.hash] };
-
-const credentialFromRewardAddress = (
-  rewardAddress: CML.RewardAddress,
-): CredentialData => credentialFromCml(rewardAddress.payment());
-
-const compareCredential = (
-  left: CredentialData,
-  right: CredentialData,
-): number => {
-  const leftPubKey = "PubKeyCredential" in left;
-  const rightPubKey = "PubKeyCredential" in right;
-  if (leftPubKey !== rightPubKey) return leftPubKey ? 1 : -1;
-  const leftHash = leftPubKey
-    ? left.PubKeyCredential[0]
-    : left.ScriptCredential[0];
-  const rightHash = rightPubKey
-    ? right.PubKeyCredential[0]
-    : right.ScriptCredential[0];
-  return compareByteArrayHex(leftHash, rightHash);
-};
-
-const stakingCredentialFromAddress = (
-  address: CML.Address,
-): StakingCredentialData | null => {
-  const base = CML.BaseAddress.from_address(address);
-  if (base) return { StakingHash: [credentialFromCml(base.stake())] };
-
-  const enterprise = CML.EnterpriseAddress.from_address(address);
-  if (enterprise) return null;
-
-  const pointer = CML.PointerAddress.from_address(address);
-  if (pointer) {
-    throw new Error(
-      "Pointer address ScriptContext translation is not supported by the current CML bindings.",
-    );
+const coreCredential = (c: Credential): CredentialData =>
+  c.type === "Key"
+    ? { PubKeyCredential: [c.hash] }
+    : { ScriptCredential: [c.hash] };
+const rewardCredential = (value: string | CborValue): CredentialData => {
+  if (typeof value === "string") {
+    const c = getAddressDetails(value).stakeCredential;
+    if (!c) throw new Error("Expected reward credential");
+    return coreCredential(c);
   }
-
-  throw new Error("Unsupported address in ScriptContext translation.");
+  const bytes = value as Uint8Array;
+  return bytes[0] >> 4 === 14
+    ? { PubKeyCredential: [toHex(bytes.subarray(1))] }
+    : { ScriptCredential: [toHex(bytes.subarray(1))] };
 };
-
-const addressFromCml = (address: CML.Address): AddressData => {
-  const details = getAddressDetails(address.to_bech32(undefined));
-  if (!details.paymentCredential) {
-    throw new Error(
-      "ScriptContext transaction outputs cannot use reward addresses.",
-    );
-  }
-  return {
-    addressCredential: credentialFromCore(details.paymentCredential),
-    addressStakingCredential: stakingCredentialFromAddress(address),
-  };
+const compareCredential = (a: CredentialData, b: CredentialData): number => {
+  const ak = "PubKeyCredential" in a,
+    bk = "PubKeyCredential" in b;
+  if (ak !== bk) return ak ? 1 : -1;
+  const ah = ak ? a.PubKeyCredential[0] : a.ScriptCredential[0],
+    bh = bk ? b.PubKeyCredential[0] : b.ScriptCredential[0];
+  return ah.localeCompare(bh);
 };
-
-const assetNameHex = (assetName: CML.AssetName): string =>
-  assetName.to_js_value();
-
-const assetMapToValue = (
-  assetMap: AssetMap | undefined,
-  ada: bigint | undefined,
-): ValueData => {
-  const policyEntries: [string, Map<string, bigint>][] = [];
-  if (ada !== undefined && ada !== 0n) {
-    policyEntries.push(["", new Map([["", ada]])]);
+const valueData = (assets: Record<string, bigint>): ValueData => {
+  const result = new Map<string, Map<string, bigint>>();
+  for (const [unit, q] of Object.entries(assets).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    if (q === 0n) continue;
+    const policy = unit === "lovelace" ? "" : unit.slice(0, 56),
+      name = unit === "lovelace" ? "" : unit.slice(56),
+      tokens = result.get(policy) ?? new Map();
+    tokens.set(name, q);
+    result.set(policy, tokens);
   }
-  if (assetMap) {
-    for (const policy of toArray(assetMap.keys())) {
-      const tokenEntries: [string, bigint][] = [];
-      const assets = assetMap.get_assets(policy);
-      if (!assets) continue;
-      for (const assetName of toArray(assets.keys())) {
-        const quantity = assets.get(assetName);
-        if (quantity !== undefined && quantity !== 0n) {
-          tokenEntries.push([assetNameHex(assetName), quantity]);
-        }
-      }
-      if (tokenEntries.length > 0) {
-        policyEntries.push([
-          policy.to_hex(),
-          sortedMap(tokenEntries, compareByteArrayHex),
-        ]);
-      }
-    }
-  }
-  return sortedMap(policyEntries, compareByteArrayHex);
-};
-
-const valueFromCml = (value: CML.Value): ValueData =>
-  assetMapToValue(
-    value.has_multiassets() ? value.multi_asset() : undefined,
-    value.coin(),
+  return sortedMap(
+    [...result].map(
+      ([policy, tokens]) =>
+        [policy, sortedMap([...tokens], (a, b) => a.localeCompare(b))] as const,
+    ),
+    (a, b) => a.localeCompare(b),
   );
-
-const mintValueFromCml = (mint: CML.Mint | undefined): MintValueData =>
-  assetMapToValue(mint, undefined);
-
-const outputDatumFromCml = (
-  datum: CML.DatumOption | undefined,
-): TxOutData["txOutDatum"] => {
-  if (!datum) return "NoOutputDatum" as const;
-  const hash = datum.as_hash();
-  if (hash) return { OutputDatumHash: [hash.to_hex()] };
-  const inline = datum.as_datum();
-  if (inline) return { OutputDatum: [datumFromPlutusData(inline)] };
-  return "NoOutputDatum" as const;
 };
-
-const txOutFromCml = (output: CML.TransactionOutput): TxOutData => {
-  const scriptRef = output.script_ref();
+const output = (o: TxOutput): TxOutData => {
+  const address = getAddressDetails(o.address);
+  if (!address.paymentCredential)
+    throw new Error(
+      "ScriptContext transaction outputs require a payment credential",
+    );
+  if (address.type === "Pointer")
+    throw new Error(
+      "Pointer address ScriptContext translation is not supported",
+    );
   return {
-    txOutAddress: addressFromCml(output.address()),
-    txOutValue: valueFromCml(output.amount()),
-    txOutDatum: outputDatumFromCml(output.datum()),
-    txOutReferenceScript: scriptRef
-      ? validatorToScriptHash(fromScriptRef(scriptRef))
+    txOutAddress: {
+      addressCredential: coreCredential(address.paymentCredential),
+      addressStakingCredential: address.stakeCredential
+        ? { StakingHash: [coreCredential(address.stakeCredential)] }
+        : null,
+    },
+    txOutValue: valueData(o.assets),
+    txOutDatum: o.datumHash
+      ? { OutputDatumHash: [o.datumHash] }
+      : o.datum
+        ? { OutputDatum: [Data.from(o.datum)] }
+        : "NoOutputDatum",
+    txOutReferenceScript: o.scriptRef
+      ? validatorToScriptHash(o.scriptRef)
       : null,
   };
 };
-
-const txInInfoFromUtxo = (utxo: UTxO): TxInInfoData => {
-  return {
-    txInInfoOutRef: {
-      txOutRefId: utxo.txHash,
-      txOutRefIdx: BigInt(utxo.outputIndex),
-    },
-    txInInfoResolved: txOutFromCml(utxoToTransactionOutput(utxo)),
-  };
-};
-
-const dRepFromCml = (dRep: CML.DRep): DRepData => {
-  const key = dRep.as_key();
-  if (key) return { DRep: [{ PubKeyCredential: [key.to_hex()] }] };
-  const script = dRep.as_script();
-  if (script) return { DRep: [{ ScriptCredential: [script.to_hex()] }] };
-  switch (dRep.kind()) {
-    case CML.DRepKind.AlwaysAbstain:
-      return "DRepAlwaysAbstain";
-    case CML.DRepKind.AlwaysNoConfidence:
-      return "DRepAlwaysNoConfidence";
-    default:
-      throw new Error("Unsupported DRep in ScriptContext translation.");
-  }
-};
-
-const delegateStake = (pool: CML.Ed25519KeyHash): DelegateeData => ({
-  DelegStake: [pool.to_hex()],
+const input = (u: UTxO): TxInInfoData => ({
+  txInInfoOutRef: { txOutRefId: u.txHash, txOutRefIdx: BigInt(u.outputIndex) },
+  txInInfoResolved: output(u),
 });
-
-const delegateVote = (dRep: CML.DRep): DelegateeData => ({
-  DelegVote: [dRepFromCml(dRep)],
-});
-
-const delegateStakeVote = (
-  pool: CML.Ed25519KeyHash,
-  dRep: CML.DRep,
-): DelegateeData => ({
-  DelegStakeVote: [pool.to_hex(), dRepFromCml(dRep)],
-});
-
-const txCertFromCml = (certificate: CML.Certificate): TxCertData => {
-  const stakeRegistration = certificate.as_stake_registration();
-  if (stakeRegistration) {
-    return {
-      TxCertRegStaking: [
-        credentialFromCml(stakeRegistration.stake_credential()),
-        null,
-      ],
-    };
-  }
-
-  const stakeDeregistration = certificate.as_stake_deregistration();
-  if (stakeDeregistration) {
-    return {
-      TxCertUnRegStaking: [
-        credentialFromCml(stakeDeregistration.stake_credential()),
-        null,
-      ],
-    };
-  }
-
-  const stakeDelegation = certificate.as_stake_delegation();
-  if (stakeDelegation) {
-    return {
-      TxCertDelegStaking: [
-        credentialFromCml(stakeDelegation.stake_credential()),
-        delegateStake(stakeDelegation.pool()),
-      ],
-    };
-  }
-
-  const regCert = certificate.as_reg_cert();
-  if (regCert) {
-    return {
-      TxCertRegStaking: [credentialFromCml(regCert.stake_credential()), null],
-    };
-  }
-
-  const unregCert = certificate.as_unreg_cert();
-  if (unregCert) {
-    return {
-      TxCertUnRegStaking: [
-        credentialFromCml(unregCert.stake_credential()),
-        null,
-      ],
-    };
-  }
-
-  const voteDelegCert = certificate.as_vote_deleg_cert();
-  if (voteDelegCert) {
-    return {
-      TxCertDelegStaking: [
-        credentialFromCml(voteDelegCert.stake_credential()),
-        delegateVote(voteDelegCert.d_rep()),
-      ],
-    };
-  }
-
-  const stakeVoteDelegCert = certificate.as_stake_vote_deleg_cert();
-  if (stakeVoteDelegCert) {
-    return {
-      TxCertDelegStaking: [
-        credentialFromCml(stakeVoteDelegCert.stake_credential()),
-        delegateStakeVote(
-          stakeVoteDelegCert.pool(),
-          stakeVoteDelegCert.d_rep(),
-        ),
-      ],
-    };
-  }
-
-  const stakeRegDelegCert = certificate.as_stake_reg_deleg_cert();
-  if (stakeRegDelegCert) {
-    return {
-      TxCertRegDeleg: [
-        credentialFromCml(stakeRegDelegCert.stake_credential()),
-        delegateStake(stakeRegDelegCert.pool()),
-        stakeRegDelegCert.deposit(),
-      ],
-    };
-  }
-
-  const voteRegDelegCert = certificate.as_vote_reg_deleg_cert();
-  if (voteRegDelegCert) {
-    return {
-      TxCertRegDeleg: [
-        credentialFromCml(voteRegDelegCert.stake_credential()),
-        delegateVote(voteRegDelegCert.d_rep()),
-        voteRegDelegCert.deposit(),
-      ],
-    };
-  }
-
-  const stakeVoteRegDelegCert = certificate.as_stake_vote_reg_deleg_cert();
-  if (stakeVoteRegDelegCert) {
-    return {
-      TxCertRegDeleg: [
-        credentialFromCml(stakeVoteRegDelegCert.stake_credential()),
-        delegateStakeVote(
-          stakeVoteRegDelegCert.pool(),
-          stakeVoteRegDelegCert.d_rep(),
-        ),
-        stakeVoteRegDelegCert.deposit(),
-      ],
-    };
-  }
-
-  const regDrepCert = certificate.as_reg_drep_cert();
-  if (regDrepCert) {
-    return {
-      TxCertRegDRep: [
-        credentialFromCml(regDrepCert.drep_credential()),
-        regDrepCert.deposit(),
-      ],
-    };
-  }
-
-  const updateDrepCert = certificate.as_update_drep_cert();
-  if (updateDrepCert) {
-    return {
-      TxCertUpdateDRep: [credentialFromCml(updateDrepCert.drep_credential())],
-    };
-  }
-
-  const unregDrepCert = certificate.as_unreg_drep_cert();
-  if (unregDrepCert) {
-    return {
-      TxCertUnRegDRep: [
-        credentialFromCml(unregDrepCert.drep_credential()),
-        unregDrepCert.deposit(),
-      ],
-    };
-  }
-
-  const poolRegistration = certificate.as_pool_registration();
-  if (poolRegistration) {
-    const poolParams = poolRegistration.pool_params();
-    return {
-      TxCertPoolRegister: [
-        poolParams.operator().to_hex(),
-        poolParams.vrf_keyhash().to_hex(),
-      ],
-    };
-  }
-
-  const poolRetirement = certificate.as_pool_retirement();
-  if (poolRetirement) {
-    return {
-      TxCertPoolRetire: [
-        poolRetirement.pool().to_hex(),
-        poolRetirement.epoch(),
-      ],
-    };
-  }
-
-  const authCommitteeHotCert = certificate.as_auth_committee_hot_cert();
-  if (authCommitteeHotCert) {
-    return {
-      TxCertAuthHotCommittee: [
-        credentialFromCml(authCommitteeHotCert.committee_cold_credential()),
-        credentialFromCml(authCommitteeHotCert.committee_hot_credential()),
-      ],
-    };
-  }
-
-  const resignCommitteeColdCert = certificate.as_resign_committee_cold_cert();
-  if (resignCommitteeColdCert) {
-    return {
-      TxCertResignColdCommittee: [
-        credentialFromCml(resignCommitteeColdCert.committee_cold_credential()),
-      ],
-    };
-  }
-
-  throw new Error("Unsupported certificate in ScriptContext translation.");
+const drep = (term: CborValue): DRepData => {
+  const [kind] = array(term);
+  return kind === 2n
+    ? "DRepAlwaysAbstain"
+    : kind === 3n
+      ? "DRepAlwaysNoConfidence"
+      : { DRep: [credential(term)] };
 };
-
-const govActionIdFromCml = (
-  actionId: CML.GovActionId | undefined,
-): GovernanceActionIdData | null =>
-  actionId
-    ? {
-        gaidTxId: actionId.transaction_id().to_hex(),
-        gaidGovActionIx: actionId.gov_action_index(),
-      }
-    : null;
-
-const compareGovActionId = (
-  left: GovernanceActionIdData,
-  right: GovernanceActionIdData,
-): number =>
-  compareByteArrayHex(left.gaidTxId, right.gaidTxId) ||
-  compareBigInt(left.gaidGovActionIx, right.gaidGovActionIx);
-
-const protocolVersionFromCml = (
-  version: CML.ProtocolVersion,
-): ProtocolVersionData => ({
-  pvMajor: version.major(),
-  pvMinor: version.minor(),
-});
-
-const constitutionFromCml = (
-  constitution: CML.Constitution,
-): ConstitutionData => ({
-  constitutionScript: constitution.script_hash()?.to_hex() ?? null,
-});
-
-const rationalFromUnitInterval = (interval: CML.UnitInterval) =>
-  [interval.start(), interval.end()] as [bigint, bigint];
-
-const rationalFromCml = (rational: CML.Rational | CML.SubCoin) =>
-  [rational.numerator(), rational.denominator()] as [bigint, bigint];
-
-const executionUnitsFromCml = (units: CML.ExUnits) =>
-  [units.mem(), units.steps()] as [bigint, bigint];
-
-const executionPricesFromCml = (prices: CML.ExUnitPrices) =>
-  [
-    rationalFromCml(prices.mem_price()),
-    rationalFromCml(prices.step_price()),
-  ] as [ReturnType<typeof rationalFromCml>, ReturnType<typeof rationalFromCml>];
-
-const protocolParamUpdateFromCml = (
-  update: CML.ProtocolParamUpdate,
-): ChangedParametersData => {
-  const entries: [bigint, PlutusDataValue][] = [];
-  const add = (index: number, value: PlutusDataValue | undefined) => {
-    if (value !== undefined) entries.push([BigInt(index), value]);
-  };
-  const addUnitInterval = (
-    index: number,
-    value: CML.UnitInterval | undefined,
-  ) => add(index, value ? rationalFromUnitInterval(value) : undefined);
-
-  add(0, update.minfee_a());
-  add(1, update.minfee_b());
-  add(2, update.max_block_body_size());
-  add(3, update.max_transaction_size());
-  add(4, update.max_block_header_size());
-  add(5, update.key_deposit());
-  add(6, update.pool_deposit());
-  add(7, update.maximum_epoch());
-  add(8, update.n_opt());
-  add(
-    9,
-    update.pool_pledge_influence() &&
-      rationalFromCml(update.pool_pledge_influence()!),
-  );
-  addUnitInterval(10, update.expansion_rate());
-  addUnitInterval(11, update.treasury_growth_rate());
-  add(16, update.min_pool_cost());
-  add(17, update.ada_per_utxo_byte());
-  if (update.cost_models_for_script_languages()) {
-    throw new Error(
-      "Protocol parameter cost model updates are not yet supported in ScriptContext translation.",
-    );
-  }
-  add(
-    19,
-    update.execution_costs() &&
-      executionPricesFromCml(update.execution_costs()!),
-  );
-  add(
-    20,
-    update.max_tx_ex_units() &&
-      executionUnitsFromCml(update.max_tx_ex_units()!),
-  );
-  add(
-    21,
-    update.max_block_ex_units() &&
-      executionUnitsFromCml(update.max_block_ex_units()!),
-  );
-  add(22, update.max_value_size());
-  add(23, update.collateral_percentage());
-  add(24, update.max_collateral_inputs());
-  const poolVotingThresholds = update.pool_voting_thresholds();
-  add(
-    25,
-    poolVotingThresholds && [
-      rationalFromUnitInterval(poolVotingThresholds.motion_no_confidence()),
-      rationalFromUnitInterval(poolVotingThresholds.committee_normal()),
-      rationalFromUnitInterval(poolVotingThresholds.committee_no_confidence()),
-      rationalFromUnitInterval(poolVotingThresholds.hard_fork_initiation()),
-      rationalFromUnitInterval(
-        poolVotingThresholds.security_relevant_parameter_voting_threshold(),
-      ),
-    ],
-  );
-  const dRepVotingThresholds = update.d_rep_voting_thresholds();
-  add(
-    26,
-    dRepVotingThresholds && [
-      rationalFromUnitInterval(dRepVotingThresholds.motion_no_confidence()),
-      rationalFromUnitInterval(dRepVotingThresholds.committee_normal()),
-      rationalFromUnitInterval(dRepVotingThresholds.committee_no_confidence()),
-      rationalFromUnitInterval(dRepVotingThresholds.update_constitution()),
-      rationalFromUnitInterval(dRepVotingThresholds.hard_fork_initiation()),
-      rationalFromUnitInterval(dRepVotingThresholds.pp_network_group()),
-      rationalFromUnitInterval(dRepVotingThresholds.pp_economic_group()),
-      rationalFromUnitInterval(dRepVotingThresholds.pp_technical_group()),
-      rationalFromUnitInterval(dRepVotingThresholds.pp_governance_group()),
-      rationalFromUnitInterval(dRepVotingThresholds.treasury_withdrawal()),
-    ],
-  );
-  add(27, update.min_committee_size());
-  add(28, update.committee_term_limit());
-  add(29, update.governance_action_validity_period());
-  add(30, update.governance_action_deposit());
-  add(31, update.d_rep_deposit());
-  add(32, update.d_rep_inactivity_period());
-  add(
-    33,
-    update.min_fee_ref_script_cost_per_byte() &&
-      rationalFromCml(update.min_fee_ref_script_cost_per_byte()!),
-  );
-
-  return sortedMap(entries, compareBigInt) as ChangedParametersData;
-};
-
-const treasuryWithdrawalsFromCml = (
-  withdrawals: CML.MapRewardAccountToCoin,
-): Map<CredentialData, bigint> => {
-  const entries = toArray(withdrawals.keys()).map(
-    (rewardAddress) =>
-      [
-        credentialFromRewardAddress(rewardAddress),
-        withdrawals.get(rewardAddress)!,
-      ] as const,
-  );
-  return sortedMap(entries, compareCredential);
-};
-
-const committeeCredentialsFromCml = (
-  credentials: CML.CommitteeColdCredentialList,
-): CredentialData[] =>
-  toArray(credentials).map((credential) => credentialFromCml(credential));
-
-const committeeCredentialMapFromCml = (
-  credentials: CML.MapCommitteeColdCredentialToEpoch,
-): Map<CredentialData, bigint> => {
-  const entries = toArray(credentials.keys()).map(
-    (credential) =>
-      [credentialFromCml(credential), credentials.get(credential)!] as const,
-  );
-  return sortedMap(entries, compareCredential);
-};
-
-const governanceActionFromCml = (
-  action: CML.GovAction,
-): GovernanceActionData => {
-  const parameterChange = action.as_parameter_change_action();
-  if (parameterChange) {
-    return {
-      ParameterChange: [
-        govActionIdFromCml(parameterChange.action_id()),
-        protocolParamUpdateFromCml(parameterChange.update()),
-        parameterChange.policy_hash()?.to_hex() ?? null,
-      ],
-    };
-  }
-
-  const hardFork = action.as_hard_fork_initiation_action();
-  if (hardFork) {
-    return {
-      HardForkInitiation: [
-        govActionIdFromCml(hardFork.action_id()),
-        protocolVersionFromCml(hardFork.version()),
-      ],
-    };
-  }
-
-  const treasuryWithdrawals = action.as_treasury_withdrawals_action();
-  if (treasuryWithdrawals) {
-    return {
-      TreasuryWithdrawals: [
-        treasuryWithdrawalsFromCml(treasuryWithdrawals.withdrawal()),
-        treasuryWithdrawals.policy_hash()?.to_hex() ?? null,
-      ],
-    };
-  }
-
-  const noConfidence = action.as_no_confidence();
-  if (noConfidence) {
-    return {
-      NoConfidence: [govActionIdFromCml(noConfidence.action_id())],
-    };
-  }
-
-  const updateCommittee = action.as_update_committee();
-  if (updateCommittee) {
-    return {
-      UpdateCommittee: [
-        govActionIdFromCml(updateCommittee.action_id()),
-        committeeCredentialsFromCml(updateCommittee.cold_credentials()),
-        committeeCredentialMapFromCml(updateCommittee.credentials()),
-        rationalFromUnitInterval(updateCommittee.unit_interval()),
-      ],
-    };
-  }
-
-  const newConstitution = action.as_new_constitution();
-  if (newConstitution) {
-    return {
-      NewConstitution: [
-        govActionIdFromCml(newConstitution.action_id()),
-        constitutionFromCml(newConstitution.constitution()),
-      ],
-    };
-  }
-
-  if (action.kind() === CML.GovActionKind.InfoAction) {
-    return "InfoAction";
-  }
-
-  throw new Error(
-    "Unsupported governance action in ScriptContext translation.",
-  );
-};
-
-const proposalProcedureFromCml = (
-  proposal: CML.ProposalProcedure,
-): ProposalProcedureData => ({
-  ppDeposit: proposal.deposit(),
-  ppReturnAddr: credentialFromRewardAddress(proposal.reward_account()),
-  ppGovernanceAction: governanceActionFromCml(proposal.gov_action()),
-});
-
-const voterFromCml = (voter: CML.Voter): VoterData => {
-  switch (voter.kind()) {
-    case CML.VoterKind.ConstitutionalCommitteeHotKeyHash:
+const certificate = (term: CborValue): TxCertData => {
+  const [kind, c, a, b, d] = array(term);
+  switch (Number(kind)) {
+    case 0:
+      return { TxCertRegStaking: [credential(c), null] };
+    case 7:
+      return { TxCertRegStaking: [credential(c), int(a)] };
+    case 1:
+      return { TxCertUnRegStaking: [credential(c), null] };
+    case 8:
+      return { TxCertUnRegStaking: [credential(c), int(a)] };
+    case 2:
+      return { TxCertDelegStaking: [credential(c), { DelegStake: [hex(a)] }] };
+    case 3:
+      return { TxCertPoolRegister: [hex(c), hex(a)] };
+    case 4:
+      return { TxCertPoolRetire: [hex(c), int(a)] };
+    case 9:
+      return { TxCertDelegStaking: [credential(c), { DelegVote: [drep(a)] }] };
+    case 10:
       return {
-        CommitteeVoter: [
+        TxCertDelegStaking: [
+          credential(c),
+          { DelegStakeVote: [hex(a), drep(b)] },
+        ],
+      };
+    case 11:
+      return {
+        TxCertRegDeleg: [credential(c), { DelegStake: [hex(a)] }, int(b)],
+      };
+    case 12:
+      return {
+        TxCertRegDeleg: [credential(c), { DelegVote: [drep(a)] }, int(b)],
+      };
+    case 13:
+      return {
+        TxCertRegDeleg: [
+          credential(c),
+          { DelegStakeVote: [hex(a), drep(b)] },
+          int(d),
+        ],
+      };
+    case 14:
+      return { TxCertAuthHotCommittee: [credential(c), credential(a)] };
+    case 15:
+      return { TxCertResignColdCommittee: [credential(c)] };
+    case 16:
+      return { TxCertRegDRep: [credential(c), int(a)] };
+    case 17:
+      return { TxCertUnRegDRep: [credential(c), int(a)] };
+    case 18:
+      return { TxCertUpdateDRep: [credential(c)] };
+    default:
+      throw new Error(`Unsupported certificate ${kind} in ScriptContext`);
+  }
+};
+const actionId = (value: CborValue): GovernanceActionIdData | null =>
+  value === null
+    ? null
+    : { gaidTxId: hex(array(value)[0]), gaidGovActionIx: int(array(value)[1]) };
+const compareAction = (a: GovernanceActionIdData, b: GovernanceActionIdData) =>
+  a.gaidTxId.localeCompare(b.gaidTxId) ||
+  compareInteger(a.gaidGovActionIx, b.gaidGovActionIx);
+const rational = (value: CborValue): [bigint, bigint] => {
+  const [a, b] = array(value);
+  return [int(a), int(b)];
+};
+const parameterData = (value: CborValue): PlutusData => {
+  if (value instanceof CborTag) return parameterData(value.value);
+  if (typeof value === "bigint") return value;
+  if (value instanceof Uint8Array) return hex(value);
+  if (Array.isArray(value)) return value.map(parameterData);
+  if (value instanceof Map)
+    return new Map(
+      [...value].map(([k, v]) => [parameterData(k), parameterData(v)]),
+    );
+  throw new Error("Unsupported protocol parameter in ScriptContext");
+};
+const governance = (term: CborValue): GovernanceActionData => {
+  const [kind, a, b, c, d] = array(term);
+  switch (Number(kind)) {
+    case 0: {
+      if (map(b).has(18n))
+        throw new Error(
+          "Protocol parameter cost model updates are not yet supported in ScriptContext translation.",
+        );
+      return {
+        ParameterChange: [
+          actionId(a),
+          parameterData(b),
+          c === null ? null : hex(c),
+        ],
+      };
+    }
+    case 1: {
+      const [major, minor] = array(b);
+      return {
+        HardForkInitiation: [
+          actionId(a),
+          { pvMajor: int(major), pvMinor: int(minor) },
+        ],
+      };
+    }
+    case 2:
+      return {
+        TreasuryWithdrawals: [
+          sortedMap(
+            [...map(a)].map(
+              ([address, amount]) =>
+                [rewardCredential(address), int(amount)] as const,
+            ),
+            compareCredential,
+          ),
+          b === null ? null : hex(b),
+        ],
+      };
+    case 3:
+      return { NoConfidence: [actionId(a)] };
+    case 4:
+      return {
+        UpdateCommittee: [
+          actionId(a),
+          array(b).map(credential).sort(compareCredential),
+          sortedMap(
+            [...map(c)].map(
+              ([cr, epoch]) => [credential(cr), int(epoch)] as const,
+            ),
+            compareCredential,
+          ),
+          rational(d),
+        ],
+      };
+    case 5: {
+      const constitution = array(b);
+      return {
+        NewConstitution: [
+          actionId(a),
           {
-            PubKeyCredential: [
-              voter.as_constitutional_committee_hot_key_hash()!.to_hex(),
-            ],
+            constitutionScript:
+              constitution[1] === null ? null : hex(constitution[1]),
           },
         ],
       };
-    case CML.VoterKind.ConstitutionalCommitteeHotScriptHash:
-      return {
-        CommitteeVoter: [
-          {
-            ScriptCredential: [
-              voter.as_constitutional_committee_hot_script_hash()!.to_hex(),
-            ],
-          },
-        ],
-      };
-    case CML.VoterKind.DRepKeyHash:
-      return {
-        DRepVoter: [
-          { PubKeyCredential: [voter.as_d_rep_key_hash()!.to_hex()] },
-        ],
-      };
-    case CML.VoterKind.DRepScriptHash:
-      return {
-        DRepVoter: [
-          { ScriptCredential: [voter.as_d_rep_script_hash()!.to_hex()] },
-        ],
-      };
-    case CML.VoterKind.StakingPoolKeyHash:
-      return { StakePoolVoter: [voter.as_staking_pool_key_hash()!.to_hex()] };
+    }
+    case 6:
+      return "InfoAction";
     default:
-      throw new Error("Unsupported voter in ScriptContext translation.");
+      throw new Error("Unsupported governance action in ScriptContext");
   }
 };
-
-const voterRank = (voter: VoterData): number =>
-  "CommitteeVoter" in voter ? 0 : "DRepVoter" in voter ? 1 : 2;
-
-const compareVoter = (left: VoterData, right: VoterData): number => {
-  const rank = voterRank(left) - voterRank(right);
-  if (rank !== 0) return rank;
-  if ("StakePoolVoter" in left && "StakePoolVoter" in right) {
-    return compareByteArrayHex(left.StakePoolVoter[0], right.StakePoolVoter[0]);
-  }
-  if ("StakePoolVoter" in left || "StakePoolVoter" in right) return 0;
-  const leftCredential =
-    "CommitteeVoter" in left ? left.CommitteeVoter[0] : left.DRepVoter[0];
-  const rightCredential =
-    "CommitteeVoter" in right ? right.CommitteeVoter[0] : right.DRepVoter[0];
-  return compareCredential(leftCredential, rightCredential);
-};
-
-const voteFromCml = (vote: CML.Vote): VoteData => {
-  switch (vote) {
-    case CML.Vote.No:
-      return "VoteNo";
-    case CML.Vote.Yes:
-      return "VoteYes";
-    case CML.Vote.Abstain:
-      return "Abstain";
-    default:
-      throw new Error("Unsupported vote in ScriptContext translation.");
-  }
-};
-
-const votingProceduresFromCml = (
-  votingProcedures: CML.VotingProcedures | undefined,
-): Map<VoterData, Map<GovernanceActionIdData, VoteData>> => {
-  if (!votingProcedures) return new Map();
-  const voterEntries = toArray(votingProcedures.keys()).map((voter) => {
-    const actionMap = votingProcedures.get(voter)!;
-    const actionEntries = toArray(actionMap.keys()).map(
-      (actionId) =>
-        [
-          govActionIdFromCml(actionId)!,
-          voteFromCml(actionMap.get(actionId)!.vote()),
-        ] as const,
-    );
-    return [
-      voterFromCml(voter),
-      sortedMap(actionEntries, compareGovActionId),
-    ] as const;
-  });
-  return sortedMap(voterEntries, compareVoter);
-};
-
-const validityRangeFromBody = (
-  body: CML.TransactionBody,
-  slotConfig: SlotConfig | undefined,
-): POSIXTimeRangeData => {
-  const lowerSlot = body.validity_interval_start();
-  const upperSlot = body.ttl();
+const proposal = (term: CborValue): ProposalProcedureData => {
+  const [deposit, address, action] = array(term);
   return {
-    ivFrom: {
-      lowerBoundLimit:
-        lowerSlot === undefined
-          ? "NegInf"
-          : {
-              Finite: [slotToPosixTime(lowerSlot, slotConfig)],
-            },
-      lowerBoundClosed: true,
-    },
-    ivTo: {
-      upperBoundLimit:
-        upperSlot === undefined
-          ? "PosInf"
-          : {
-              Finite: [slotToPosixTime(upperSlot, slotConfig)],
-            },
-      upperBoundClosed: upperSlot === undefined,
-    },
+    ppDeposit: int(deposit),
+    ppReturnAddr: rewardCredential(address),
+    ppGovernanceAction: governance(action),
   };
 };
-
-const txCertificatesFromBody = (body: CML.TransactionBody): TxCertData[] =>
-  toArray(body.certs()).map(txCertFromCml);
-
-const withdrawalsFromBody = (
-  body: CML.TransactionBody,
-): Map<CredentialData, bigint> => {
-  const withdrawals = body.withdrawals();
-  if (!withdrawals) return new Map();
-  const entries = toArray(withdrawals.keys()).map(
-    (rewardAddress) =>
-      [
-        credentialFromRewardAddress(rewardAddress),
-        withdrawals.get(rewardAddress)!,
-      ] as const,
+const voter = (term: CborValue): VoterData => {
+  const [kind, hash] = array(term),
+    k = Number(kind);
+  if (k === 4) return { StakePoolVoter: [hex(hash)] };
+  const c = credential([BigInt(k % 2), hash]);
+  return k < 2 ? { CommitteeVoter: [c] } : { DRepVoter: [c] };
+};
+const voterRank = (v: VoterData) =>
+  "CommitteeVoter" in v ? 0 : "DRepVoter" in v ? 1 : 2;
+const compareVoter = (a: VoterData, b: VoterData): number => {
+  const rank = voterRank(a) - voterRank(b);
+  if (rank) return rank;
+  if ("StakePoolVoter" in a && "StakePoolVoter" in b)
+    return a.StakePoolVoter[0].localeCompare(b.StakePoolVoter[0]);
+  if ("StakePoolVoter" in a || "StakePoolVoter" in b) return 0;
+  return compareCredential(
+    "CommitteeVoter" in a ? a.CommitteeVoter[0] : a.DRepVoter[0],
+    "CommitteeVoter" in b ? b.CommitteeVoter[0] : b.DRepVoter[0],
   );
-  return sortedMap(entries, compareCredential);
 };
-
-const signatoriesFromBody = (body: CML.TransactionBody): string[] =>
-  toArray(body.required_signers())
-    .map((signatory) => signatory.to_hex())
-    .sort(compareByteArrayHex);
-
-const datumMapFromWitnessSet = (
-  witnessSet: CML.TransactionWitnessSet,
-): Map<string, PlutusDataValue> => {
-  const datums = witnessSet.plutus_datums();
-  if (!datums) return new Map();
-  const entries = toArray(datums).map(
-    (datum) =>
-      [
-        CML.hash_plutus_data(datum).to_hex(),
-        datumFromPlutusData(datum),
-      ] as const,
-  );
-  return sortedMap(entries, compareByteArrayHex);
-};
-
-const proposalsFromBody = (
-  body: CML.TransactionBody,
-): ProposalProcedureData[] =>
-  toArray(body.proposal_procedures()).map(proposalProcedureFromCml);
-
-const mintPoliciesFromBody = (body: CML.TransactionBody): string[] => {
-  const mint = body.mint();
-  if (!mint) return [];
-  return toArray(mint.keys())
-    .map((policy) => policy.to_hex())
-    .sort(compareByteArrayHex);
-};
-
-const purposeRank = (purpose: ScriptPurposeData): number =>
-  "Spending" in purpose
+const purposeRank = (p: ScriptPurposeData) =>
+  "Spending" in p
     ? 0
-    : "Minting" in purpose
+    : "Minting" in p
       ? 1
-      : "Certifying" in purpose
+      : "Certifying" in p
         ? 2
-        : "Rewarding" in purpose
+        : "Rewarding" in p
           ? 3
-          : "Voting" in purpose
+          : "Voting" in p
             ? 4
             : 5;
-
-const compareScriptPurpose = (
-  left: ScriptPurposeData,
-  right: ScriptPurposeData,
-): number => {
-  const rank = purposeRank(left) - purposeRank(right);
-  if (rank !== 0) return rank;
-  if ("Minting" in left && "Minting" in right) {
-    return compareByteArrayHex(left.Minting[0], right.Minting[0]);
-  }
-  if ("Spending" in left && "Spending" in right) {
-    return compareTxOutRef(left.Spending[0], right.Spending[0]);
-  }
-  if ("Rewarding" in left && "Rewarding" in right) {
-    return compareCredential(left.Rewarding[0], right.Rewarding[0]);
-  }
-  if ("Certifying" in left && "Certifying" in right) {
-    return compareBigInt(left.Certifying[0], right.Certifying[0]);
-  }
-  if ("Voting" in left && "Voting" in right) {
-    return compareVoter(left.Voting[0], right.Voting[0]);
-  }
-  if ("Proposing" in left && "Proposing" in right) {
-    return compareBigInt(left.Proposing[0], right.Proposing[0]);
-  }
+const comparePurpose = (a: ScriptPurposeData, b: ScriptPurposeData): number => {
+  const rank = purposeRank(a) - purposeRank(b);
+  if (rank) return rank;
+  if ("Spending" in a && "Spending" in b)
+    return (
+      a.Spending[0].txOutRefId.localeCompare(b.Spending[0].txOutRefId) ||
+      compareInteger(a.Spending[0].txOutRefIdx, b.Spending[0].txOutRefIdx)
+    );
+  if ("Minting" in a && "Minting" in b)
+    return a.Minting[0].localeCompare(b.Minting[0]);
+  if ("Certifying" in a && "Certifying" in b)
+    return compareInteger(a.Certifying[0], b.Certifying[0]);
+  if ("Rewarding" in a && "Rewarding" in b)
+    return compareCredential(a.Rewarding[0], b.Rewarding[0]);
+  if ("Voting" in a && "Voting" in b)
+    return compareVoter(a.Voting[0], b.Voting[0]);
+  if ("Proposing" in a && "Proposing" in b)
+    return compareInteger(a.Proposing[0], b.Proposing[0]);
   return 0;
 };
-
-const scriptPurposeKey = (purpose: ScriptPurposeData): string =>
-  Data.to(purpose, ScriptPurposeData);
-
-const purposeFromRedeemerEntry = (
-  entry: CanonicalRedeemerEntry,
+const purpose = (
+  r: LedgerRedeemer,
+  tx: TransactionSnapshot,
   info: CanonicalRedeemerInfo,
-  tx: CML.Transaction,
 ): ScriptPurposeData => {
-  const body = tx.body();
-  switch (entry.tag) {
-    case "spend": {
-      const input = info.inputs[Number(entry.index)];
-      if (!input) {
-        throw new Error(`Spend redeemer index ${entry.index} has no input.`);
-      }
+  const index = Number(r.index);
+  switch (r.tag) {
+    case "spend":
       return {
         Spending: [
           {
-            txOutRefId: input.txHash,
-            txOutRefIdx: BigInt(input.outputIndex),
+            txOutRefId: info.inputs[index].txHash,
+            txOutRefIdx: BigInt(info.inputs[index].outputIndex),
           },
         ],
       };
-    }
-    case "mint": {
-      const policy = mintPoliciesFromBody(body)[Number(entry.index)];
-      if (!policy) {
-        throw new Error(`Mint redeemer index ${entry.index} has no policy.`);
-      }
-      return { Minting: [policy] };
-    }
-    case "withdraw": {
-      const withdrawal = toArray(body.withdrawals()?.keys())[
-        Number(entry.index)
-      ];
-      if (!withdrawal) {
-        throw new Error(
-          `Withdraw redeemer index ${entry.index} has no withdrawal.`,
-        );
-      }
-      return { Rewarding: [credentialFromRewardAddress(withdrawal)] };
-    }
-    case "publish": {
-      const certificate = body.certs()?.get(Number(entry.index));
-      if (!certificate) {
-        throw new Error(`Publish redeemer index ${entry.index} has no cert.`);
-      }
+    case "mint":
       return {
-        Certifying: [entry.index, txCertFromCml(certificate)],
+        Minting: [
+          [
+            ...new Set(Object.keys(tx.body.mint).map((u) => u.slice(0, 56))),
+          ].sort()[index],
+        ],
       };
-    }
-    case "vote": {
-      const voter = voterForRedeemerIndex(tx, entry.index);
-      if (!voter) {
-        throw new Error(`Vote redeemer index ${entry.index} has no voter.`);
-      }
-      return { Voting: [voterFromCml(voter)] };
-    }
-    case "propose": {
-      const proposal = proposalProcedureForRedeemerIndex(tx, entry.index);
-      if (!proposal) {
-        throw new Error(
-          `Propose redeemer index ${entry.index} has no proposal.`,
-        );
-      }
+    case "withdraw":
       return {
-        Proposing: [entry.index, proposalProcedureFromCml(proposal)],
+        Rewarding: [rewardCredential(tx.body.withdrawals[index].rewardAddress)],
       };
-    }
+    case "publish":
+      return {
+        Certifying: [r.index, certificate(tx.body.certificates[index])],
+      };
+    case "vote":
+      return { Voting: [voter(orderedVoters(tx)[index])] };
+    case "propose":
+      return { Proposing: [r.index, proposal(tx.body.proposals[index])] };
   }
 };
-
-const redeemersFromWitnessSet = (
-  tx: CML.Transaction,
+const scriptInfo = (
+  p: ScriptPurposeData,
   info: CanonicalRedeemerInfo,
-): {
-  redeemerMap: Map<ScriptPurposeData, PlutusDataValue>;
-  redeemerByPurpose: Map<string, PlutusDataValue>;
-  purposesByKey: Map<string, ScriptPurposeData>;
-} => {
-  const redeemers = withCMLScope((own) => own(tx.witness_set()).redeemers());
-  if (!redeemers) {
-    return {
-      redeemerMap: new Map(),
-      redeemerByPurpose: new Map(),
-      purposesByKey: new Map(),
-    };
-  }
-  const cmlEntries = canonicalRedeemerEntries(redeemers);
-  let entries;
-  try {
-    entries = cmlEntries.map((entry) => {
-      const purpose = purposeFromRedeemerEntry(entry, info, tx);
-      return [purpose, datumFromPlutusData(entry.data)] as const;
-    });
-  } finally {
-    freeCanonicalRedeemerEntries(cmlEntries);
-    redeemers.free();
-  }
-  const sortedEntries = [...entries].sort(([left], [right]) =>
-    compareScriptPurpose(left, right),
-  );
-  const redeemerMap = new Map(sortedEntries);
-  const redeemerByPurpose = new Map<string, PlutusDataValue>();
-  const purposesByKey = new Map<string, ScriptPurposeData>();
-  for (const [purpose, redeemer] of sortedEntries) {
-    const key = scriptPurposeKey(purpose);
-    redeemerByPurpose.set(key, redeemer);
-    purposesByKey.set(key, purpose);
-  }
-  return { redeemerMap, redeemerByPurpose, purposesByKey };
-};
-
-const spendingDatumForPurpose = (
-  purpose: TxOutRefData,
-  info: CanonicalRedeemerInfo,
-  datums: Map<string, PlutusDataValue>,
-): PlutusDataValue | null => {
-  const input = info.inputs.find(
-    (candidate) =>
-      candidate.txHash === purpose.txOutRefId &&
-      BigInt(candidate.outputIndex) === purpose.txOutRefIdx,
-  );
-  if (!input) return null;
-  if (input.datum) return Data.from(input.datum);
-  if (input.datumHash) return datums.get(input.datumHash) ?? null;
-  return null;
-};
-
-const scriptInfoFromPurpose = (
-  purpose: ScriptPurposeData,
-  info: CanonicalRedeemerInfo,
-  datums: Map<string, PlutusDataValue>,
+  datums: Map<string, PlutusData>,
 ): ScriptInfoData => {
-  if ("Minting" in purpose) return { MintingScript: purpose.Minting };
-  if ("Spending" in purpose) {
-    return {
-      SpendingScript: [
-        purpose.Spending[0],
-        spendingDatumForPurpose(purpose.Spending[0], info, datums),
-      ],
-    };
-  }
-  if ("Rewarding" in purpose) return { RewardingScript: purpose.Rewarding };
-  if ("Certifying" in purpose) {
-    return { CertifyingScript: purpose.Certifying };
-  }
-  if ("Voting" in purpose) return { VotingScript: purpose.Voting };
-  return { ProposingScript: purpose.Proposing };
-};
-
-const txInfoFromTransaction = (
-  tx: CML.Transaction,
-  info: CanonicalRedeemerInfo,
-  slotConfig: SlotConfig | undefined,
-  redeemerMap: Map<ScriptPurposeData, PlutusDataValue>,
-  txInfoId: string,
-): TxInfoData => {
-  const body = tx.body();
+  if ("Minting" in p) return { MintingScript: p.Minting };
+  if ("Rewarding" in p) return { RewardingScript: p.Rewarding };
+  if ("Certifying" in p) return { CertifyingScript: p.Certifying };
+  if ("Voting" in p) return { VotingScript: p.Voting };
+  if ("Proposing" in p) return { ProposingScript: p.Proposing };
+  const ref = p.Spending[0],
+    u = info.inputs.find(
+      (u) =>
+        u.txHash === ref.txOutRefId &&
+        BigInt(u.outputIndex) === ref.txOutRefIdx,
+    );
   return {
-    txInfoInputs: info.inputs.map(txInInfoFromUtxo),
-    txInfoReferenceInputs: info.referenceInputs.map(txInInfoFromUtxo),
-    txInfoOutputs: toArray(body.outputs()).map(txOutFromCml),
-    txInfoFee: body.fee(),
-    txInfoMint: mintValueFromCml(body.mint()),
-    txInfoTxCerts: txCertificatesFromBody(body),
-    txInfoWdrl: withdrawalsFromBody(body),
-    txInfoValidRange: validityRangeFromBody(body, slotConfig),
-    txInfoSignatories: signatoriesFromBody(body),
-    txInfoRedeemers: redeemerMap,
-    txInfoData: datumMapFromWitnessSet(tx.witness_set()),
-    txInfoId,
-    txInfoVotes: votingProceduresFromCml(body.voting_procedures()),
-    txInfoProposalProcedures: proposalsFromBody(body),
-    txInfoCurrentTreasuryAmount: body.current_treasury_value() ?? null,
-    txInfoTreasuryDonation: body.donation() ?? null,
+    SpendingScript: [
+      ref,
+      u?.datum
+        ? Data.from(u.datum)
+        : u?.datumHash
+          ? (datums.get(u.datumHash) ?? null)
+          : null,
+    ],
   };
 };
-
-const canonicalInfo = (
-  tx: CML.Transaction,
-  resolvedInputs: ReadonlyArray<UTxO>,
-): CanonicalRedeemerInfo =>
-  Effect.runSync(buildCanonicalRedeemerInfo(tx, resolvedInputs));
-
 export const makeScriptContexts = (
-  tx: CML.Transaction,
+  transaction: TransactionSnapshot | string,
   options: ScriptContextOptions = {},
 ): ScriptContextData[] => {
-  const txInfoId = CML.hash_transaction(tx.body()).to_hex();
-  const canonicalTx = canonicalTransaction(tx);
-  const info = canonicalInfo(canonicalTx, options.resolvedInputs ?? []);
-  const datums = datumMapFromWitnessSet(canonicalTx.witness_set());
-  const { redeemerMap, redeemerByPurpose, purposesByKey } =
-    redeemersFromWitnessSet(canonicalTx, info);
-  const txInfo = txInfoFromTransaction(
-    canonicalTx,
-    info,
-    options.slotConfig,
-    redeemerMap,
-    txInfoId,
+  const tx =
+      typeof transaction === "string"
+        ? inspectTransaction(transaction)
+        : transaction,
+    body = tx.body;
+  const info = Effect.runSync(
+    buildCanonicalRedeemerInfo(tx, options.resolvedInputs ?? []),
   );
-
-  return [...purposesByKey.entries()]
-    .sort(([, left], [, right]) => compareScriptPurpose(left, right))
-    .map(([key, purpose]) => ({
-      scriptContextTxInfo: txInfo,
-      scriptContextRedeemer: redeemerByPurpose.get(key)!,
-      scriptContextScriptInfo: scriptInfoFromPurpose(purpose, info, datums),
-    }));
+  const datums = sortedMap<string, PlutusData>(
+    (
+      tx.datums ??
+      array(tx.witnesses.get(4n)).map((d) => {
+        const cbor = encodeCbor(d);
+        return { hash: datumToHash(cbor), cbor };
+      })
+    ).map((d) => [d.hash, Data.from<PlutusData>(d.cbor)] as const),
+    (a, b) => a.localeCompare(b),
+  );
+  const entries = tx.redeemers
+    .map((r) => [purpose(r, tx, info), Data.from(r.data)] as const)
+    .sort(([a], [b]) => comparePurpose(a, b));
+  const time = (slot: bigint): bigint => {
+    if (!options.slotConfig?.slotLength)
+      throw new Error(
+        "ScriptContext translation requires a valid slotConfig to translate the transaction validity interval.",
+      );
+    return BigInt(slotToBeginUnixTime(Number(slot), options.slotConfig));
+  };
+  const votes = sortedMap(
+    [...map(body.votes)].map(
+      ([v, procedures]) =>
+        [
+          voter(v),
+          sortedMap(
+            [...map(procedures)].map(
+              ([id, procedure]) =>
+                [
+                  actionId(id)!,
+                  ["VoteNo", "VoteYes", "Abstain"][
+                    Number(array(procedure)[0])
+                  ] as VoteData,
+                ] as const,
+            ),
+            compareAction,
+          ),
+        ] as const,
+    ),
+    compareVoter,
+  );
+  const txInfo: TxInfoData = {
+    txInfoInputs: info.inputs.map(input),
+    txInfoReferenceInputs: info.referenceInputs.map(input),
+    txInfoOutputs: body.outputs.map(output),
+    txInfoFee: body.fee,
+    txInfoMint: valueData(body.mint),
+    txInfoTxCerts: body.certificates.map(certificate),
+    txInfoWdrl: sortedMap(
+      body.withdrawals.map(
+        (w) => [rewardCredential(w.rewardAddress), w.amount] as const,
+      ),
+      compareCredential,
+    ),
+    txInfoValidRange: {
+      ivFrom: {
+        lowerBoundLimit:
+          body.validFrom === undefined
+            ? "NegInf"
+            : { Finite: [time(body.validFrom)] },
+        lowerBoundClosed: true,
+      },
+      ivTo: {
+        upperBoundLimit:
+          body.validUntil === undefined
+            ? "PosInf"
+            : { Finite: [time(body.validUntil)] },
+        upperBoundClosed: body.validUntil === undefined,
+      },
+    },
+    txInfoSignatories: [...body.requiredSigners].sort(),
+    txInfoRedeemers: new Map(entries),
+    txInfoData: datums,
+    txInfoId: tx.hash,
+    txInfoVotes: votes,
+    txInfoProposalProcedures: body.proposals.map(proposal),
+    txInfoCurrentTreasuryAmount: body.currentTreasury ?? null,
+    txInfoTreasuryDonation: body.treasuryDonation ?? null,
+  };
+  return entries.map(([p, redeemer]) => ({
+    scriptContextTxInfo: txInfo,
+    scriptContextRedeemer: redeemer,
+    scriptContextScriptInfo: scriptInfo(p, info, datums),
+  }));
 };
-
 export const makeScriptContext = (
-  tx: CML.Transaction,
-  purpose: ScriptPurposeData,
+  transaction: TransactionSnapshot | string,
+  requested: ScriptPurposeData,
   options: ScriptContextOptions = {},
 ): ScriptContextData => {
-  const txInfoId = CML.hash_transaction(tx.body()).to_hex();
-  const canonicalTx = canonicalTransaction(tx);
-  const info = canonicalInfo(canonicalTx, options.resolvedInputs ?? []);
-  const datums = datumMapFromWitnessSet(canonicalTx.witness_set());
-  const { redeemerMap, redeemerByPurpose, purposesByKey } =
-    redeemersFromWitnessSet(canonicalTx, info);
-  const key = scriptPurposeKey(purpose);
-  const canonicalPurpose = purposesByKey.get(key);
-  const redeemer = redeemerByPurpose.get(key);
-  if (!canonicalPurpose || redeemer === undefined) {
-    throw new Error(
-      `No redeemer found for ScriptContext purpose ${JSON.stringify(purpose)}.`,
-    );
-  }
-  return {
-    scriptContextTxInfo: txInfoFromTransaction(
-      canonicalTx,
-      info,
-      options.slotConfig,
-      redeemerMap,
-      txInfoId,
-    ),
-    scriptContextRedeemer: redeemer,
-    scriptContextScriptInfo: scriptInfoFromPurpose(
-      canonicalPurpose,
-      info,
-      datums,
-    ),
-  };
+  const contexts = makeScriptContexts(transaction, options),
+    key = Data.to(requested, ScriptPurposeData);
+  const purposes = contexts[0]
+    ? [...contexts[0].scriptContextTxInfo.txInfoRedeemers.keys()]
+    : [];
+  const index = purposes.findIndex(
+    (p) => Data.to(p, ScriptPurposeData) === key,
+  );
+  if (index < 0) throw new Error("No redeemer found for ScriptContext purpose");
+  return contexts[index];
 };

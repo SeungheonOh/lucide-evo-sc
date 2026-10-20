@@ -13,8 +13,7 @@ import { fromHex, fromText, toHex } from "@lucid-evolution/core-utils";
 export * from "@sinclair/typebox";
 
 import { Constr } from "./constr.js";
-import { decodePlutusData, encodePlutusData } from "./data-cbor.js";
-import { cmlDataFromCbor, cmlDataToCbor } from "./data-cml.js";
+import { dataFromCbor, dataToCbor } from "./data-ledger.js";
 export { Constr } from "./constr.js";
 
 export declare namespace Data {
@@ -292,11 +291,7 @@ function to<T = Data>(
 ): Datum | Redeemer {
   const { canonical = false } = options;
   const d = type ? castTo<T>(data, type) : (data as Data);
-  // The JavaScript encoder declines anything it does not encode exactly as
-  // CML would; CML then produces the result or the error.
-  return (encodePlutusData(d, canonical) ?? cmlDataToCbor(d, canonical)) as
-    | Datum
-    | Redeemer;
+  return dataToCbor(d, canonical) as Datum | Redeemer;
 }
 
 /**
@@ -304,9 +299,7 @@ function to<T = Data>(
  *  Or apply a shape and cast the cbor encoded data to a certain type.
  */
 function from<T = Data>(raw: Datum | Redeemer, type?: T): T {
-  // The JavaScript decoder declines anything it does not decode exactly as
-  // CML would; CML then produces the result or the error.
-  const data = decodePlutusData(raw) ?? cmlDataFromCbor(raw);
+  const data = dataFromCbor(raw);
 
   return type ? castFrom<T>(data, type) : (data as T);
 }

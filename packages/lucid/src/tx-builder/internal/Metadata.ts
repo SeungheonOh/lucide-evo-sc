@@ -1,6 +1,6 @@
 import { Label } from "@lucid-evolution/core-types";
 import * as Effect from "effect/Effect";
-import { CML } from "../../core.js";
+import type { CborValue } from "@lucid-evolution/ledger";
 import * as S from "@effect/schema/Schema";
 import { toHex } from "@lucid-evolution/core-utils";
 import { TxConfig } from "./Service.js";
@@ -8,18 +8,16 @@ import { TxConfig } from "./Service.js";
 export const attachMetadata = (label: Label, metadata: TransactionMetadata) =>
   Effect.gen(function* () {
     const { config } = yield* TxConfig;
-    const auxiliaryData = CML.AuxiliaryData.new();
-    const meta = CML.Metadata.new();
-    meta.set(
-      BigInt(label),
-      CML.TransactionMetadatum.from_json(
-        JSON.stringify(toCardanoMetadata(metadata)),
-      ),
-    );
-    auxiliaryData.add_metadata(meta);
-    config.txBuilder.add_auxiliary_data(auxiliaryData);
-    auxiliaryData.free();
-    meta.free();
+    toCardanoMetadata(metadata);
+    const term = (v: TransactionMetadata): CborValue =>
+      typeof v === "number"
+        ? BigInt(v)
+        : v instanceof Uint8Array || typeof v === "string"
+          ? v
+          : Array.isArray(v)
+            ? v.map(term)
+            : new Map(Object.entries(v).map(([k, x]) => [k, term(x)]));
+    config.metadata.set(BigInt(label), term(metadata));
   });
 
 //CDDL conformance

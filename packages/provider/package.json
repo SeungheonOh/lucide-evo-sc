@@ -29,12 +29,12 @@
   "dependencies": {
     "@effect/platform": "^0.71.3",
     "@effect/schema": "^0.68.26",
-    "@lucid-evolution/cml": "workspace:*",
     "@lucid-evolution/core-types": "workspace:*",
     "@lucid-evolution/core-utils": "workspace:*",
     "@lucid-evolution/utils": "workspace:*",
     "@lucid-evolution/wallet": "workspace:*",
-    "effect": "^3.11.7"
+    "effect": "^3.11.7",
+    "@lucid-evolution/ledger": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.12.8",

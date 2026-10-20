@@ -1,10 +1,20 @@
-import { beforeAll, describe, expect, test, vi } from "vitest";
-import { readFile } from "node:fs/promises";
 import {
-  CML,
+  getLedgerRuntime,
+  encodeCbor,
+  decodeCbor,
+  CborTag,
+  type CborValue,
+} from "@lucid-evolution/ledger";
+import { fromHex, toHex } from "@lucid-evolution/core-utils";
+import {
+  credentialToRewardAddress,
+  validatorToScriptHash,
+  poolIdFromHex,
+} from "@lucid-evolution/utils";
+import { beforeAll, describe, expect, test, vi } from "vitest";
+import {
   Lucid,
   PROTOCOL_PARAMETERS_DEFAULT,
-  createScToolsWasmRuntime,
   type ScToolsRuntime,
   type ScToolsChainContext,
   type Provider,
@@ -12,10 +22,10 @@ import {
   Data,
   validatorToAddress,
   generateSeedPhrase,
+  getAddressDetails,
 } from "../src/index.js";
 import chain from "./fixtures/sc-tools/chain.json";
 
-const wasmPath = process.env.SC_TOOLS_WASM;
 const address =
   "addr_test1qrngfyc452vy4twdrepdjc50d4kvqutgt0hs9w6j2qhcdjfx0gpv7rsrjtxv97rplyz3ymyaqdwqa635zrcdena94ljs0xy950";
 const funds: UTxO[] = [10, 11, 12].map((n) => ({
@@ -57,12 +67,10 @@ const setup = async (runtime: ScToolsRuntime) => {
   return lucid;
 };
 
-describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
+describe("sc-tools actual WASM", () => {
   let runtime: ScToolsRuntime;
   beforeAll(async () => {
-    runtime = await createScToolsWasmRuntime(
-      await WebAssembly.compile(await readFile(wasmPath!)),
-    );
+    runtime = getLedgerRuntime();
   });
   test("balances a payment and chains through the unchanged API", async () => {
     const lucid = await setup(runtime);
@@ -70,36 +78,31 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .newTx()
       .pay.ToAddress(address, { lovelace: 2_000_000n })
       .chain();
-    const body = tx.toTransaction().body();
-    expect(body.fee()).toBeGreaterThan(0n);
-    const consumed = body.inputs().len();
+    const body = tx.toTransaction().body;
+    expect(body.fee).toBeGreaterThan(0n);
+    const consumed = body.inputs.length;
     expect(
-      outputs.reduce((sum, u) => sum + u.assets.lovelace, 0n) + body.fee(),
+      outputs.reduce((sum, u) => sum + u.assets.lovelace, 0n) + body.fee,
     ).toBe(BigInt(consumed) * 100_000_000n);
     expect(outputs[0].assets.lovelace).toBe(2_000_000n);
     expect(wallet.length).toBe(funds.length - consumed + outputs.length);
     expect(lucid.fromTx(tx.toCBOR()).toHash()).toBe(tx.toHash());
   });
-  test("accepts Byron payment destinations like CML", async () => {
-    const key = CML.Bip32PrivateKey.from_bip39_entropy(
-      new Uint8Array(32).fill(1),
-      new Uint8Array(),
-    );
-    const byron = CML.AddressContent.icarus_from_key(
-      key.to_public(),
-      CML.ProtocolMagic.new(1),
-    ).to_address();
+  test("accepts Byron payment destinations in default and explicit runtime modes", async () => {
+    const byron =
+      "FHnt4NL7yPYE12tjbSxG56jGYhzPQUfnCS2GkRhtyBzeVG3CHVJgPUFbdRFWgY2";
     const legacy = await Lucid(provider, "Preprod");
     legacy.selectWallet.fromAddress(address, funds);
     const sc = await setup(runtime);
     for (const lucid of [legacy, sc]) {
       const tx = await lucid
         .newTx()
-        .pay.ToAddress(byron.to_base58(), { lovelace: 2_000_000n })
+        .pay.ToAddress(byron, { lovelace: 2_000_000n })
         .complete();
       expect(
-        tx.toTransaction().body().outputs().get(0).address().to_hex(),
-      ).toBe(byron.to_address().to_hex());
+        getAddressDetails(tx.toTransaction().body.outputs[0].address).address
+          .hex,
+      ).toBe(getAddressDetails(byron).address.hex);
     }
   });
 
@@ -125,17 +128,8 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .validTo(1_900_000_000_000)
       .pay.ToAddress(address, { lovelace: 2_000_000n })
       .complete();
-    expect(tx.toTransaction().body().fee()).toBeGreaterThan(0n);
-    expect(
-      tx
-        .toTransaction()
-        .witness_set()
-        .redeemers()!
-        .to_flat_format()
-        .get(0)
-        .ex_units()
-        .steps(),
-    ).toBeGreaterThan(0n);
+    expect(tx.toTransaction().body.fee).toBeGreaterThan(0n);
+    expect(tx.toTransaction().redeemers[0].exUnits.steps).toBeGreaterThan(0n);
     // switchProvider refreshes the same parameter snapshot used by both backends.
     const changed = {
       ...provider,
@@ -149,7 +143,7 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .newTx()
       .pay.ToAddress(address, { lovelace: 2_000_000n })
       .complete();
-    expect(next.toTransaction().body().fee()).toBeGreaterThan(5_000_000n);
+    expect(next.toTransaction().body.fee).toBeGreaterThan(5_000_000n);
   });
 
   test("keeps millisecond slot mappings when deriving a provider context", async () => {
@@ -180,16 +174,16 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .validFrom(slotConfig.zeroTime)
       .validTo(slotConfig.zeroTime + 5_000)
       .complete();
-    expect(tx.toTransaction().body().validity_interval_start()).toBe(10n);
-    expect(tx.toTransaction().body().ttl()).toBe(20n);
+    expect(tx.toTransaction().body.validFrom).toBe(10n);
+    expect(tx.toTransaction().body.validUntil).toBe(20n);
   });
 
   test("mints native tokens with exact quantities and metadata", async () => {
-    const script = CML.NativeScript.new_script_pubkey(
-      CML.Ed25519KeyHash.from_hex("11".repeat(28)),
-    );
-    const policy = { type: "Native" as const, script: script.to_cbor_hex() };
-    const unit = script.hash().to_hex() + "abcd";
+    const policy = {
+      type: "Native" as const,
+      script: encodeCbor([0n, fromHex("11".repeat(28))]),
+    };
+    const unit = validatorToScriptHash(policy) + "abcd";
     const lucid = await setup(runtime);
     const tx = await lucid
       .newTx()
@@ -226,24 +220,23 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
         .attachMetadata(674, metadata)
         .complete();
     const sc = await make(lucid),
-      cml = await make(legacy);
-    const actual = sc
-      .toTransaction()
-      .auxiliary_data()!
-      .metadata()!
-      .get(674n)!
-      .as_map()!;
-    const expected = cml
-      .toTransaction()
-      .auxiliary_data()!
-      .metadata()!
-      .get(674n)!
-      .as_map()!;
-    expect(actual.len()).toBe(expected.len());
-    for (const name of Object.keys(metadata)) {
-      const key = CML.TransactionMetadatum.new_text(name);
-      expect(actual.get(key)!.to_json()).toBe(expected.get(key)!.to_json());
-    }
+      baseline = await make(legacy);
+    expect(sc.toTransaction().auxiliaryData).toEqual(
+      baseline.toTransaction().auxiliaryData,
+    );
+    const auxiliary = sc.toTransaction().auxiliaryData;
+    const metadataMap =
+      auxiliary instanceof CborTag
+        ? ((auxiliary.value as Map<CborValue, CborValue>).get(0n) as Map<
+            CborValue,
+            CborValue
+          >)
+        : (auxiliary as Map<CborValue, CborValue>);
+    const actual = metadataMap.get(674n) as Map<CborValue, CborValue>;
+    expect(actual.size).toBe(Object.keys(metadata).length);
+    expect(actual.get("bytes")).toEqual(new Uint8Array([0xab, 0xcd]));
+    expect(actual.get("123")).toBe("numeric-looking text key");
+    expect(actual.get("0xabcd")).toBe("hex-looking text key");
   });
   test("evaluates a Plutus spend and sets collateral", async () => {
     const script = {
@@ -263,10 +256,8 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .collectFrom([utxo], Data.void())
       .pay.ToAddress(address, { lovelace: 2_000_000n })
       .complete();
-    expect(
-      tx.toTransaction().body().collateral_inputs()!.len(),
-    ).toBeGreaterThan(0);
-    expect(tx.toTransaction().witness_set().redeemers()).toBeDefined();
+    expect(tx.toTransaction().body.collateralInputs.length).toBeGreaterThan(0);
+    expect(tx.toTransaction().redeemers).toBeDefined();
   });
   test("uses reference scripts without adding their bytes to witnesses", async () => {
     const script = {
@@ -290,9 +281,10 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .readFrom([reference])
       .collectFrom([locked], Data.void())
       .complete();
-    expect(tx.toTransaction().body().reference_inputs()!.len()).toBe(1);
+    expect(tx.toTransaction().body.referenceInputs.length).toBe(1);
     expect(
-      tx.toTransaction().witness_set().plutus_v2_scripts()?.len() ?? 0,
+      (tx.toTransaction().witnesses.get(6n) as CborValue[] | undefined)
+        ?.length ?? 0,
     ).toBe(0);
   });
   test("preserves explicit inputs with coin selection disabled", async () => {
@@ -302,7 +294,7 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .collectFrom([funds[0]])
       .pay.ToAddress(address, { lovelace: 2_000_000n })
       .complete({ coinSelection: false });
-    expect(tx.toTransaction().body().inputs().len()).toBe(1);
+    expect(tx.toTransaction().body.inputs.length).toBe(1);
   });
   test("preserves inline and supplemental datums including large integers", async () => {
     const lucid = await setup(runtime);
@@ -320,43 +312,29 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
         { lovelace: 2_000_000n },
       )
       .complete();
-    const ws = tx.toTransaction().witness_set();
-    expect(ws.plutus_datums()!.get(0).to_cbor_hex()).toBe(datum);
-    expect(
-      tx
-        .toTransaction()
-        .body()
-        .outputs()
-        .get(0)
-        .datum()!
-        .as_datum()!
-        .to_cbor_hex(),
-    ).toBe(datum);
+    expect(tx.toTransaction().datums![0].cbor).toBe(datum);
+    expect(tx.toTransaction().body.outputs[0].datum).toBe(datum);
   });
   test("balances stake registration and withdrawal", async () => {
     const lucid = await setup(runtime);
-    const reward = CML.RewardAddress.new(
-      0,
-      CML.Credential.new_pub_key(CML.Ed25519KeyHash.from_hex("11".repeat(28))),
-    )
-      .to_address()
-      .to_bech32();
+    const reward = credentialToRewardAddress("Preprod", {
+      type: "Key",
+      hash: "11".repeat(28),
+    });
     const tx = await lucid
       .newTx()
       .register.Stake(reward)
       .withdraw(reward, 1_000_000n)
       .complete();
-    expect(tx.toTransaction().body().certs()!.len()).toBe(1);
-    expect(tx.toTransaction().body().withdrawals()!.len()).toBe(1);
+    expect(tx.toTransaction().body.certificates.length).toBe(1);
+    expect(tx.toTransaction().body.withdrawals.length).toBe(1);
   });
   test("preserves votes, proposals, and treasury donation", async () => {
     const lucid = await setup(runtime);
-    const reward = CML.RewardAddress.new(
-      0,
-      CML.Credential.new_pub_key(CML.Ed25519KeyHash.from_hex("11".repeat(28))),
-    )
-      .to_address()
-      .to_bech32();
+    const reward = credentialToRewardAddress("Preprod", {
+      type: "Key",
+      hash: "11".repeat(28),
+    });
     lucid.overrideUTxOs(
       funds.map((u) => ({ ...u, assets: { lovelace: 2_000_000_000n } })),
     );
@@ -375,10 +353,10 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       })
       .donateToTreasury(2_000_000n, 1_000_000_000n)
       .complete();
-    const body = tx.toTransaction().body();
-    expect(body.voting_procedures()!.len()).toBe(1);
-    expect(body.proposal_procedures()!.len()).toBe(1);
-    expect(body.donation()).toBe(2_000_000n);
+    const body = tx.toTransaction().body;
+    expect((body.votes as Map<CborValue, CborValue>).size).toBe(1);
+    expect(body.proposals.length).toBe(1);
+    expect(body.treasuryDonation).toBe(2_000_000n);
   });
 
   test("rejects an incorrect Plutus redeemer without returning a transaction", async () => {
@@ -419,7 +397,7 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
     const first = await builder.complete();
     const second = await builder.complete();
     expect(second.toCBOR()).toBe(first.toCBOR());
-    expect(first.toTransaction().body().outputs().get(1).amount().coin()).toBe(
+    expect(first.toTransaction().body.outputs[1].assets.lovelace).toBe(
       3_000_000n,
     );
   });
@@ -434,12 +412,12 @@ describe.skipIf(!wasmPath)("sc-tools actual WASM", () => {
       .complete();
     const signed = await tx.sign.withWallet().complete();
     expect(signed.toHash()).toBe(tx.toHash());
+    const witnesses = signed.toTransaction().witnesses.get(0n);
     expect(
-      CML.Transaction.from_cbor_hex(signed.toCBOR())
-        .witness_set()
-        .vkeywitnesses()!
-        .len(),
-    ).toBeGreaterThan(0);
+      (witnesses instanceof CborTag
+        ? witnesses.value
+        : witnesses) as CborValue[],
+    ).not.toHaveLength(0);
   });
 });
 

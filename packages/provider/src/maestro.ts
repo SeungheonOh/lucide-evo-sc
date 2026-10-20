@@ -1,4 +1,4 @@
-import { CML } from "./core.js";
+import { hashToBech32, utxoToTransactionOutput } from "@lucid-evolution/utils";
 import {
   Address,
   Assets,
@@ -24,7 +24,6 @@ import packageJson from "../package.json" with { type: "json" };
 import {
   applyDoubleCborEncoding,
   scriptFromNative,
-  utxoToCore,
 } from "@lucid-evolution/utils";
 import { fromHex } from "@lucid-evolution/core-utils";
 
@@ -109,12 +108,8 @@ export class Maestro implements Provider {
       let credentialBech32Query = "/addresses/cred/";
       credentialBech32Query +=
         addressOrCredential.type === "Key"
-          ? CML.Ed25519KeyHash.from_hex(addressOrCredential.hash).to_bech32(
-              "addr_vkh",
-            )
-          : CML.ScriptHash.from_hex(addressOrCredential.hash).to_bech32(
-              "addr_shared_vkh",
-            );
+          ? hashToBech32("addr_vkh", addressOrCredential.hash)
+          : hashToBech32("addr_shared_vkh", addressOrCredential.hash);
       return credentialBech32Query;
     })();
     const qparams = new URLSearchParams({
@@ -401,7 +396,7 @@ export class Maestro implements Provider {
     const additionalMaestroUTxOs = (additionalUTxOs || []).map((utxo) => ({
       tx_hash: utxo.txHash,
       index: utxo.outputIndex,
-      txout_cbor: utxoToCore(utxo).output().to_cbor_hex(),
+      txout_cbor: utxoToTransactionOutput(utxo),
     }));
 
     // Prepare payload

@@ -26,7 +26,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@lucid-evolution/cml": "workspace:*"
+    "@lucid-evolution/ledger": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.12.8",

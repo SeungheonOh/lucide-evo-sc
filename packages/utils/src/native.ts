@@ -1,61 +1,15 @@
-import { Native, Script } from "@lucid-evolution/core-types";
+import type { Native, Script } from "@lucid-evolution/core-types";
 import * as S from "@effect/schema/Schema";
-import { CML } from "./core.js";
+import { ledger } from "@lucid-evolution/ledger";
 
-/**
- * Converts a Native type (cardano-cli JSON script syntax) to CML.NativeScript.
- *
- * Native type follows the standard described in the
- * {@link https://github.com/IntersectMBO/cardano-node/blob/1.26.1-with-cardano-cli/doc/reference/simple-scripts.md#json-script-syntax JSON script syntax documentation}.
- */
-export const toCMLNativeScript = (native: Native): CML.NativeScript => {
-  switch (native.type) {
-    case "sig":
-      return CML.NativeScript.new_script_pubkey(
-        CML.Ed25519KeyHash.from_hex(native.keyHash),
-      );
-    case "before":
-      return CML.NativeScript.new_script_invalid_hereafter(BigInt(native.slot));
-    case "after":
-      return CML.NativeScript.new_script_invalid_before(BigInt(native.slot));
-    case "all": {
-      const nativeList = CML.NativeScriptList.new();
-      native.scripts.map((script) => nativeList.add(toCMLNativeScript(script)));
-      return CML.NativeScript.new_script_all(nativeList);
-    }
-    case "any": {
-      const nativeList = CML.NativeScriptList.new();
-      native.scripts.map((script) => nativeList.add(toCMLNativeScript(script)));
-      return CML.NativeScript.new_script_any(nativeList);
-    }
-    case "atLeast": {
-      const nativeList = CML.NativeScriptList.new();
-      native.scripts.map((script) => nativeList.add(toCMLNativeScript(script)));
-      return CML.NativeScript.new_script_n_of_k(
-        BigInt(native.required),
-        nativeList,
-      );
-    }
-  }
-};
+export const nativeScriptToCbor = (script: Native): string =>
+  ledger("native.encode", { script });
+export const scriptFromNative = (script: Native): Script => ({
+  type: "Native",
+  script: nativeScriptToCbor(script),
+});
 
-/**
- * Builds a Script from Native type (cardano-cli JSON script syntax).
- *
- * Native type follows the standard described in the
- * {@link https://github.com/IntersectMBO/cardano-node/blob/1.26.1-with-cardano-cli/doc/reference/simple-scripts.md#json-script-syntax JSON script syntax documentation}.
- */
-export const scriptFromNative = (native: Native): Script => {
-  return {
-    type: "Native",
-    script: toCMLNativeScript(native).to_cbor_hex(),
-  };
-};
-
-/**
- * Represents a CML JSON script syntax
- */
-export type CMLNative =
+export type NativeScriptJson =
   | {
       ScriptPubkey: {
         ed25519_key_hash: string;
@@ -69,25 +23,25 @@ export type CMLNative =
     }
   | {
       ScriptAll: {
-        native_scripts: ReadonlyArray<CMLNative>;
+        native_scripts: ReadonlyArray<NativeScriptJson>;
       };
     }
   | {
       ScriptAny: {
-        native_scripts: ReadonlyArray<CMLNative>;
+        native_scripts: ReadonlyArray<NativeScriptJson>;
       };
     }
   | {
       ScriptNOfK: {
         n: number;
-        native_scripts: ReadonlyArray<CMLNative>;
+        native_scripts: ReadonlyArray<NativeScriptJson>;
       };
     };
 
 /**
- * Schema definition for CMLNative type using effect schema
+ * Schema definition for NativeScriptJson type using effect schema
  */
-const CMLNativeSchema: S.Schema<CMLNative> = S.Union(
+const NativeScriptJsonSchema: S.Schema<NativeScriptJson> = S.Union(
   S.Struct({
     ScriptPubkey: S.Struct({
       ed25519_key_hash: S.String,
@@ -105,37 +59,55 @@ const CMLNativeSchema: S.Schema<CMLNative> = S.Union(
   }),
   S.Struct({
     ScriptAll: S.Struct({
-      native_scripts: S.Array(S.suspend(() => CMLNativeSchema)),
+      native_scripts: S.Array(S.suspend(() => NativeScriptJsonSchema)),
     }),
   }),
   S.Struct({
     ScriptAny: S.Struct({
-      native_scripts: S.Array(S.suspend(() => CMLNativeSchema)),
+      native_scripts: S.Array(S.suspend(() => NativeScriptJsonSchema)),
     }),
   }),
   S.Struct({
     ScriptNOfK: S.Struct({
       n: S.Number,
-      native_scripts: S.Array(S.suspend(() => CMLNativeSchema)),
+      native_scripts: S.Array(S.suspend(() => NativeScriptJsonSchema)),
     }),
   }),
 );
 
 /**
- * Parses a CMLNative type from an unknown input using effect schema.
- * This function is useful for decoding unknown data to CMLNative from a file or an API.
+ * Parses a NativeScriptJson type from an unknown input using effect schema.
+ * This function is useful for decoding unknown data to NativeScriptJson from a file or an API.
  *
  *  @throws {ParseError} - Throws a ParseError if the input does not conform to the schema.
  */
-export const parseCMLNative = S.decodeUnknownSync(CMLNativeSchema);
+export const parseNativeScriptJson = S.decodeUnknownSync(
+  NativeScriptJsonSchema,
+);
 
-/**
- * Builds a Script from CMLNative script type.
- *
- */
-export const scriptFromCMLNative = (cmlNative: CMLNative): Script => {
-  return {
-    type: "Native",
-    script: CML.NativeScript.from_json(JSON.stringify(cmlNative)).to_cbor_hex(),
-  };
-};
+export function scriptFromNativeJson(script: NativeScriptJson): Script {
+  function convert(value: NativeScriptJson): Native {
+    if ("ScriptPubkey" in value)
+      return { type: "sig", keyHash: value.ScriptPubkey.ed25519_key_hash };
+    if ("ScriptInvalidBefore" in value)
+      return { type: "after", slot: value.ScriptInvalidBefore.before };
+    if ("ScriptInvalidHereafter" in value)
+      return { type: "before", slot: value.ScriptInvalidHereafter.after };
+    if ("ScriptAll" in value)
+      return {
+        type: "all",
+        scripts: value.ScriptAll.native_scripts.map(convert),
+      };
+    if ("ScriptAny" in value)
+      return {
+        type: "any",
+        scripts: value.ScriptAny.native_scripts.map(convert),
+      };
+    return {
+      type: "atLeast",
+      required: value.ScriptNOfK.n,
+      scripts: value.ScriptNOfK.native_scripts.map(convert),
+    };
+  }
+  return scriptFromNative(convert(script));
+}

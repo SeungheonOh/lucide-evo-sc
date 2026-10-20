@@ -1,5 +1,4 @@
-import { CML } from "./core.js";
-import {
+import type {
   Address,
   Assets,
   Credential,
@@ -10,13 +9,10 @@ import {
   Lovelace,
   OutputData,
   OutRef,
-  PoolId,
   ProtocolParameters,
   Provider,
   RewardAddress,
   RewardAccountState,
-  Script,
-  ScriptHash,
   Transaction,
   TransactionStatus,
   TransactionStatusOptions,
@@ -26,24 +22,84 @@ import {
   UTxO,
 } from "@lucid-evolution/core-types";
 import {
-  fromCMLRedeemerTag,
+  coreToTxOutput,
+  credentialToAddress,
+  datumToHash,
+  generatePrivateKey,
   generateSeedPhrase,
   PROTOCOL_PARAMETERS_DEFAULT,
+  utxoToCore,
 } from "@lucid-evolution/utils";
-import {
-  coreToUtxo,
-  getAddressDetails,
-  ScriptCache,
-  valueToAssets,
-} from "@lucid-evolution/utils";
-import { CMLOwn, fromHex, withCMLScope } from "@lucid-evolution/core-utils";
+import { ledger, getLedgerRuntime } from "@lucid-evolution/ledger";
 import { walletFromSeed } from "@lucid-evolution/wallet";
-import { verifyEd25519 } from "./internal/ed25519.js";
 import {
   EmulatorLedger,
-  FlatOutRef,
-  LedgerEntry,
+  type FlatOutRef,
+  type LedgerEntry,
 } from "./internal/emulator-ledger.js";
+
+export type EmulatorChainContext = {
+  network: "mainnet" | "preprod" | "preview" | "custom";
+  networkMagic?: number;
+  stakePools?: string[];
+  stakeDeposits?: Array<{
+    type: "Key" | "Script";
+    hash: string;
+    deposit: string;
+  }>;
+  drepDeposits?: Array<{
+    type: "Key" | "Script";
+    hash: string;
+    deposit: string;
+  }>;
+  systemStart: string;
+  protocolParameters: Record<string, unknown>;
+  eraSummaries: Array<{
+    start: { time: number; slot: number; epoch: number };
+    end: { time: number; slot: number; epoch: number };
+    parameters: {
+      epoch_length: number;
+      slot_length: number;
+      safe_zone?: number;
+    };
+  }>;
+};
+
+export interface EmulatorRuntime {
+  run(payload: Record<string, unknown>): Promise<unknown>;
+}
+export type EmulatorBalancer = {
+  type: "sc-tools";
+  runtime: EmulatorRuntime;
+  chainContext: () => Promise<EmulatorChainContext>;
+};
+function protocolOverrides(p: ProtocolParameters): Record<string, unknown> {
+  return {
+    protocolVersion: {
+      // Preserve the original Emulator ledger rules when the version is omitted.
+      major: p.protocolMajorVersion ?? 11,
+      minor: p.protocolMinorVersion ?? 0,
+    },
+    txFeePerByte: p.minFeeA,
+    txFeeFixed: p.minFeeB,
+    maxTxSize: p.maxTxSize,
+    maxValueSize: p.maxValSize,
+    stakeAddressDeposit: String(p.keyDeposit),
+    stakePoolDeposit: String(p.poolDeposit),
+    dRepDeposit: String(p.drepDeposit),
+    govActionDeposit: String(p.govActionDeposit),
+    executionUnitPrices: { priceMemory: p.priceMem, priceSteps: p.priceStep },
+    maxTxExecutionUnits: {
+      memory: String(p.maxTxExMem),
+      steps: String(p.maxTxExSteps),
+    },
+    utxoCostPerByte: String(p.coinsPerUtxoByte),
+    collateralPercentage: p.collateralPercentage,
+    maxCollateralInputs: p.maxCollateralInputs,
+    minFeeRefScriptCostPerByte: p.minFeeRefScriptCostPerByte,
+    costModels: p.costModels,
+  };
+}
 
 type TransactionHistory = Record<
   TxHash,
@@ -76,15 +132,11 @@ export type EmulatorAccount = {
 export function generateEmulatorAccountFromPrivateKey(
   assets: Assets,
 ): EmulatorAccount {
-  const privateKey = CML.PrivateKey.generate_ed25519().to_bech32();
-  const priv = CML.PrivateKey.from_bech32(privateKey);
-  const pubKeyHash = priv.to_public().hash();
-  const address = CML.EnterpriseAddress.new(
-    0,
-    CML.Credential.new_pub_key(pubKeyHash),
-  )
-    .to_address()
-    .to_bech32(undefined);
+  const privateKey = generatePrivateKey();
+  const { keyHash } = ledger<{ keyHash: string }>("key.fromPrivate", {
+    privateKey,
+  });
+  const address = credentialToAddress("Custom", { type: "Key", hash: keyHash });
   return {
     seedPhrase: "",
     address: address,
@@ -107,13 +159,7 @@ export function generateEmulatorAccount(assets: Assets): EmulatorAccount {
   };
 }
 
-/**
- * Protocol major version assumed when the protocol parameters carry none.
- * Matches current mainnet (Conway, PlutusV3 script contexts).
- */
-const DEFAULT_PROTOCOL_MAJOR_VERSION = 11;
-
-export class Emulator implements Provider {
+class EmulatorFixtures {
   readonly [EMULATOR_PROVIDER_BRAND] = true;
   #confirmed = new EmulatorLedger();
   /**
@@ -131,10 +177,7 @@ export class Emulator implements Provider {
       this.#confirmed.replace(entries),
   });
   mempool: Record<FlatOutRef, LedgerEntry> = {};
-  /**
-   * Only stake key registrations/delegations and rewards are tracked.
-   * Other certificates are not tracked.
-   */
+  /** Public stake-account projection of the ledger state. */
   chain: Record<
     RewardAddress,
     { registeredStake: boolean; delegation: Delegation }
@@ -167,13 +210,6 @@ export class Emulator implements Provider {
    * `transactionHistory`, these are its only pending entries.
    */
   #pendingTxHashes: TxHash[] = [];
-  /**
-   * Script hashes of reference scripts, keyed by type and CBOR. A plain Map
-   * keyed by long script text puts every script of the same length in one
-   * hash bucket; `ScriptCache` keys a fingerprint and is bounded.
-   */
-  #scriptRefHashes = new ScriptCache<ScriptHash>(4096, 64 * 1024 * 1024);
-
   constructor(
     accounts: EmulatorAccount[],
     protocolParameters: ProtocolParameters = PROTOCOL_PARAMETERS_DEFAULT,
@@ -201,9 +237,7 @@ export class Emulator implements Provider {
           address,
           assets,
           datumHash: outputData?.asHash
-            ? CML.hash_plutus_data(
-                CML.PlutusData.from_cbor_hex(outputData.asHash),
-              ).to_hex()
+            ? datumToHash(outputData.asHash)
             : outputData?.hash,
           datum: outputData?.inline,
           scriptRef: outputData?.scriptRef,
@@ -390,1067 +424,6 @@ export class Emulator implements Provider {
     this.awaitBlock();
   }
 
-  submitTx(tx: Transaction): Promise<TxHash> {
-    /*
-        Checks that are already handled by the transaction builder:
-          - Fee calculation
-          - Phase 2 evaluation
-          - Input value == Output value (including mint value)
-          - Min ada requirement
-          - Stake key registration deposit amount
-
-        Checks that need to be done:
-          - Verify witnesses
-          - Correct count of scripts and vkeys
-          - Stake key registration
-          - Withdrawals
-          - Validity interval
-          - Collateral
-     */
-    return withCMLScope((own) => Promise.resolve(this.applyTx(tx, own)));
-  }
-
-  /** Validates `tx` and applies it to the mempool; returns its hash. */
-  private applyTx(tx: Transaction, own: CMLOwn): TxHash {
-    const desTx = own(CML.Transaction.from_cbor_hex(tx));
-
-    const body = own(desTx.body());
-    const witnesses = own(desTx.witness_set());
-    const datums = own(witnesses.plutus_datums());
-
-    const txHash = CML.hash_transaction(body).to_hex();
-
-    // Validity interval
-    // Lower bound is inclusive?
-    // Upper bound is inclusive?
-    const lowerBound = body.validity_interval_start()
-      ? parseInt(body.validity_interval_start()!.toString())
-      : null;
-    const upperBound = body.ttl() ? parseInt(body.ttl()!.toString()) : null;
-
-    if (Number.isInteger(lowerBound) && this.slot < lowerBound!) {
-      throw new Error(
-        `Lower bound (${lowerBound}) not in slot range (${this.slot}).`,
-      );
-    }
-
-    if (Number.isInteger(upperBound) && this.slot > upperBound!) {
-      throw new Error(
-        `Upper bound (${upperBound}) not in slot range (${this.slot}).`,
-      );
-    }
-
-    const currentTreasuryValue = body.current_treasury_value();
-    const treasuryDonation = body.donation();
-    if (
-      (currentTreasuryValue === undefined && treasuryDonation !== undefined) ||
-      (currentTreasuryValue !== undefined && treasuryDonation === undefined)
-    ) {
-      throw new Error(
-        "Treasury donation transactions must include both current treasury value and donation.",
-      );
-    }
-    if (treasuryDonation !== undefined) {
-      if (treasuryDonation <= 0n) {
-        throw new Error("Treasury donation must be greater than 0 lovelace.");
-      }
-      if (currentTreasuryValue !== this.treasury) {
-        throw new Error(
-          `Current treasury value (${currentTreasuryValue}) does not match emulator treasury (${this.treasury}).`,
-        );
-      }
-    }
-
-    // Datums in witness set
-    const datumTable = (() => {
-      const table: Record<DatumHash, Datum> = {};
-      for (let i = 0; i < (datums?.len() || 0); i++) {
-        withCMLScope((own) => {
-          const datum = own(datums!.get(i));
-          const datumHash = own(CML.hash_plutus_data(datum)).to_hex();
-          table[datumHash] = datum.to_cbor_hex();
-        });
-      }
-      return table;
-    })();
-
-    const consumedHashes = new Set();
-
-    // Witness keys
-    const keyHashList = withCMLScope((own) => {
-      const keyHashes: string[] = [];
-      const vkeyWitnesses = own(witnesses.vkeywitnesses());
-      for (let i = 0; i < (vkeyWitnesses?.len() || 0); i++) {
-        withCMLScope((own) => {
-          const witness = own(vkeyWitnesses!.get(i));
-          const publicKey = own(witness.vkey());
-          const keyHash = own(publicKey.hash()).to_hex();
-
-          if (
-            !verifyEd25519(
-              publicKey,
-              fromHex(txHash),
-              own(witness.ed25519_signature()),
-            )
-          ) {
-            throw new Error(`Invalid vkey witness. Key hash: ${keyHash}`);
-          }
-          keyHashes.push(keyHash);
-        });
-      }
-      return keyHashes;
-    });
-    const keyHashes = new Set(keyHashList);
-
-    // We only need this to verify native scripts. The check happens in the CML.
-    const edKeyHashes = own(CML.Ed25519KeyHashList.new());
-    keyHashList.forEach((keyHash) =>
-      withCMLScope((own) =>
-        edKeyHashes.add(own(CML.Ed25519KeyHash.from_hex(keyHash))),
-      ),
-    );
-
-    const nativeHashList = withCMLScope((own) => {
-      const scriptHashes: string[] = [];
-      const nativeScripts = own(witnesses.native_scripts());
-
-      for (let i = 0; i < (nativeScripts?.len() || 0); i++) {
-        withCMLScope((own) => {
-          const witness = own(nativeScripts!.get(i));
-          const scriptHash = own(witness.hash()).to_hex();
-          // TODO:  Fix verify
-
-          if (
-            !witness.verify(
-              Number.isInteger(lowerBound) ? BigInt(lowerBound!) : undefined,
-              Number.isInteger(upperBound) ? BigInt(upperBound!) : undefined,
-              edKeyHashes,
-            )
-          ) {
-            throw new Error(
-              `Invalid native script witness. Script hash: ${scriptHash}`,
-            );
-          }
-          const requiredSigners = own(witness.get_required_signers());
-          for (let j = 0; j < requiredSigners.len(); j++) {
-            const keyHash = own(requiredSigners.get(j)).to_hex();
-            consumedHashes.add(keyHash);
-          }
-          scriptHashes.push(scriptHash);
-        });
-      }
-      return scriptHashes;
-    });
-    const nativeHashes = new Set(nativeHashList);
-
-    // Native scripts from script references, as CBOR hex by script hash.
-    const nativeHashesOptional: Record<ScriptHash, string> = {};
-    const plutusHashesOptional = new Set<ScriptHash>();
-    // Every PlutusV3 script the transaction carries (witness set or script
-    // reference); the ledger's reference-input disjointness rule depends on
-    // whether one of them runs.
-    const plutusV3Hashes = new Set<ScriptHash>();
-
-    const plutusHashList = withCMLScope((own) => {
-      const scriptHashes: ScriptHash[] = [];
-      const collectHashes = (
-        scripts:
-          | CML.PlutusV1ScriptList
-          | CML.PlutusV2ScriptList
-          | CML.PlutusV3ScriptList
-          | undefined,
-        isPlutusV3 = false,
-      ) => {
-        own(scripts);
-        for (let i = 0; i < (scripts?.len() || 0); i++) {
-          withCMLScope((own) => {
-            const script = own(scripts!.get(i));
-            const scriptHash = own(script.hash()).to_hex();
-            scriptHashes.push(scriptHash);
-            if (isPlutusV3) plutusV3Hashes.add(scriptHash);
-          });
-        }
-      };
-      collectHashes(witnesses.plutus_v1_scripts());
-      collectHashes(witnesses.plutus_v2_scripts());
-      collectHashes(witnesses.plutus_v3_scripts(), true);
-      return scriptHashes;
-    });
-    const plutusHashes = new Set(plutusHashList);
-
-    const collectScriptRef = (scriptRef: Script) => {
-      const scriptHash = this.scriptRefHash(scriptRef);
-      if (scriptRef.type === "Native") {
-        nativeHashesOptional[scriptHash] = scriptRef.script;
-        return;
-      }
-      plutusHashesOptional.add(scriptHash);
-      if (scriptRef.type === "PlutusV3") plutusV3Hashes.add(scriptHash);
-    };
-
-    const inputs = own(body.inputs());
-    // inputs.sort();
-
-    type ResolvedInput = {
-      entry: { utxo: UTxO; spent: boolean };
-      type: "Ledger" | "Mempool";
-    };
-
-    const resolvedInputs: ResolvedInput[] = [];
-    const inputOutRefs = new Set<string>();
-
-    // Check existence of inputs and look for script refs.
-    for (let i = 0; i < inputs.len(); i++) {
-      const outRef = withCMLScope((own) => {
-        const input = own(inputs.get(i));
-        return own(input.transaction_id()).to_hex() + input.index().toString();
-      });
-      inputOutRefs.add(outRef);
-
-      const entryLedger = this.#confirmed.get(outRef);
-
-      const { entry, type }: ResolvedInput = !entryLedger
-        ? { entry: this.mempool[outRef]!, type: "Mempool" }
-        : { entry: entryLedger, type: "Ledger" };
-
-      if (!entry || entry.spent) {
-        throw new Error(
-          `Could not spend UTxO: ${JSON.stringify({
-            txHash: entry?.utxo.txHash,
-            outputIndex: entry?.utxo.outputIndex,
-          })}\nIt does not exist or was already spent.`,
-        );
-      }
-
-      const scriptRef = entry.utxo.scriptRef;
-      if (scriptRef) collectScriptRef(scriptRef);
-
-      if (entry.utxo.datumHash) consumedHashes.add(entry.utxo.datumHash);
-
-      resolvedInputs.push({ entry, type });
-    }
-
-    // Check existence of reference inputs and look for script refs.
-    const referenceInputs = own(body.reference_inputs());
-    const nonDisjointRefInputs: string[] = [];
-    for (let i = 0; i < (referenceInputs?.len() || 0); i++) {
-      const outRef = withCMLScope((own) => {
-        const input = own(referenceInputs!.get(i));
-        return own(input.transaction_id()).to_hex() + input.index().toString();
-      });
-
-      const entry = this.#confirmed.get(outRef) || this.mempool[outRef];
-
-      if (!entry || entry.spent) {
-        throw new Error(
-          `Could not read UTxO: ${JSON.stringify({
-            txHash: entry?.utxo.txHash,
-            outputIndex: entry?.utxo.outputIndex,
-          })}\nIt does not exist or was already spent.`,
-        );
-      }
-
-      if (inputOutRefs.has(outRef)) {
-        nonDisjointRefInputs.push(
-          `${entry.utxo.txHash}#${entry.utxo.outputIndex}`,
-        );
-      }
-
-      const scriptRef = entry.utxo.scriptRef;
-      if (scriptRef) collectScriptRef(scriptRef);
-
-      if (entry.utxo.datumHash) consumedHashes.add(entry.utxo.datumHash);
-    }
-
-    type Tag = "Spend" | "Mint" | "Cert" | "Reward" | "Proposing" | "Voting";
-
-    const redeemerKey = (tag: Tag | null, index: number | null) =>
-      `${tag}:${index}`;
-
-    // Tag and index of every redeemer, as `redeemerKey` strings.
-    const redeemers = withCMLScope((own) => {
-      const tagMap: Record<number, Tag> = {
-        0: "Spend",
-        1: "Mint",
-        2: "Cert",
-        3: "Reward",
-        4: "Proposing",
-        5: "Voting",
-      };
-      const collected = new Set<string>();
-      const redeemers = own(witnesses.redeemers());
-      const arrLegacyRedeemer = own(redeemers?.as_arr_legacy_redeemer());
-      if (arrLegacyRedeemer) {
-        for (let i = 0; i < (arrLegacyRedeemer.len() || 0); i++) {
-          const redeemer = own(arrLegacyRedeemer.get(i));
-          collected.add(
-            redeemerKey(tagMap[redeemer.tag()], Number(redeemer.index())),
-          );
-        }
-      }
-      const mapRedeemerKeyToRedeemerVal = own(
-        redeemers?.as_map_redeemer_key_to_redeemer_val(),
-      );
-      if (mapRedeemerKeyToRedeemerVal) {
-        const keys = own(mapRedeemerKeyToRedeemerVal.keys());
-        for (let i = 0; i < (keys.len() || 0); i++) {
-          const key = own(keys.get(i));
-          collected.add(redeemerKey(tagMap[key.tag()], Number(key.index())));
-        }
-      }
-      return collected;
-    });
-
-    function checkAndConsumeHash(
-      credential: Credential,
-      tag: Tag | null,
-      index: number | null,
-    ) {
-      switch (credential.type) {
-        case "Key": {
-          if (!keyHashes.has(credential.hash)) {
-            throw new Error(
-              `Missing vkey witness. Key hash: ${credential.hash}`,
-            );
-          }
-          consumedHashes.add(credential.hash);
-          break;
-        }
-        case "Script": {
-          if (nativeHashes.has(credential.hash)) {
-            consumedHashes.add(credential.hash);
-            break;
-          } else if (nativeHashesOptional[credential.hash]) {
-            const valid = withCMLScope((own) =>
-              own(
-                CML.NativeScript.from_cbor_hex(
-                  nativeHashesOptional[credential.hash],
-                ),
-              ).verify(
-                Number.isInteger(lowerBound) ? BigInt(lowerBound!) : undefined,
-                Number.isInteger(upperBound) ? BigInt(upperBound!) : undefined,
-                edKeyHashes,
-              ),
-            );
-            if (!valid) {
-              throw new Error(
-                `Invalid native script witness. Script hash: ${credential.hash}`,
-              );
-            }
-            break;
-          } else if (
-            plutusHashes.has(credential.hash) ||
-            plutusHashesOptional.has(credential.hash)
-          ) {
-            if (redeemers.has(redeemerKey(tag, index))) {
-              consumedHashes.add(credential.hash);
-              break;
-            }
-          }
-          throw new Error(
-            `Missing script witness. Script hash: ${credential.hash}`,
-          );
-        }
-      }
-    }
-
-    // Check collateral inputs
-
-    const collateralInputs = own(body.collateral_inputs());
-    const collateralBalance: Assets = {};
-    for (let i = 0; i < (collateralInputs?.len() || 0); i++) {
-      const outRef = withCMLScope((own) => {
-        const input = own(collateralInputs!.get(i));
-        return own(input.transaction_id()).to_hex() + input.index().toString();
-      });
-
-      const entry = this.#confirmed.get(outRef) || this.mempool[outRef];
-
-      if (!entry || entry.spent) {
-        throw new Error(
-          `Could not read UTxO: ${JSON.stringify({
-            txHash: entry?.utxo.txHash,
-            outputIndex: entry?.utxo.outputIndex,
-          })}\nIt does not exist or was already spent.`,
-        );
-      }
-
-      const { paymentCredential } = getAddressDetails(entry.utxo.address);
-      if (paymentCredential?.type === "Script") {
-        throw new Error("Collateral inputs can only contain vkeys.");
-      }
-      checkAndConsumeHash(paymentCredential!, null, null);
-      for (const [unit, amount] of Object.entries(entry.utxo.assets)) {
-        collateralBalance[unit] = (collateralBalance[unit] ?? 0n) + amount;
-      }
-    }
-
-    // A transaction that runs scripts must carry enough collateral, as the
-    // ledger's feesOK rule requires.
-    if (redeemers.size > 0) {
-      this.checkCollateral(body, collateralBalance, own);
-    }
-
-    // Check required signers
-
-    const requiredSigners = own(body.required_signers());
-    for (let i = 0; i < (requiredSigners?.len() || 0); i++) {
-      const signer = own(requiredSigners!.get(i));
-      checkAndConsumeHash({ type: "Key", hash: signer.to_hex() }, null, null);
-    }
-
-    // Check mint witnesses
-
-    const mint = own(body.mint());
-    const policyIds = own(mint?.keys());
-    for (let index = 0; index < (policyIds?.len() || 0); index++) {
-      const policyId = own(policyIds!.get(index)).to_hex();
-      checkAndConsumeHash({ type: "Script", hash: policyId }, "Mint", index);
-    }
-
-    // Check withdrawal witnesses
-
-    const withdrawalRequests: {
-      rewardAddress: RewardAddress;
-      withdrawal: Lovelace;
-    }[] = [];
-
-    for (
-      let index = 0;
-      index < (body.withdrawals()?.keys().len() || 0);
-      index++
-    ) {
-      const rawAddress = body.withdrawals()!.keys().get(index);
-      const withdrawal: Lovelace = BigInt(
-        body.withdrawals()!.get(rawAddress)!.toString(),
-      );
-      const rewardAddress = rawAddress.to_address().to_bech32(undefined);
-      const { stakeCredential } = getAddressDetails(rewardAddress);
-      checkAndConsumeHash(stakeCredential!, "Reward", index);
-      if (this.chain[rewardAddress]?.delegation.rewards !== withdrawal) {
-        throw new Error(
-          "Withdrawal amount doesn't match actual reward balance.",
-        );
-      }
-      withdrawalRequests.push({ rewardAddress, withdrawal });
-    }
-
-    // Check cert witnesses
-
-    const certRequests: {
-      type: "Registration" | "Deregistration" | "Delegation";
-      rewardAddress: RewardAddress;
-      poolId?: PoolId;
-    }[] = [];
-
-    const credentialToCore = (credential: CML.Credential): Credential =>
-      credential.kind() === 0
-        ? { type: "Key", hash: credential.as_pub_key()!.to_hex() }
-        : { type: "Script", hash: credential.as_script()!.to_hex() };
-
-    const checkCertCredential = (
-      credential: CML.Credential | undefined,
-      index: number,
-    ) => {
-      if (!credential) return;
-      checkAndConsumeHash(credentialToCore(credential), "Cert", index);
-    };
-
-    const rewardAddressFromCredential = (credential: CML.Credential) =>
-      CML.RewardAddress.new(CML.NetworkInfo.testnet().network_id(), credential)
-        .to_address()
-        .to_bech32(undefined);
-
-    for (let index = 0; index < (body.certs()?.len() || 0); index++) {
-      /*
-        Checking state transitions for:
-        1. Witnessless stake registration
-        2. Stake deregistration
-        3. Stake delegation
-        4. Witnessed stake registration
-
-        Other certificate types consume their witnesses and are considered valid.
-      */
-      const cert = body.certs()!.get(index);
-      switch (cert.kind()) {
-        case 0: {
-          const registration = cert.as_stake_registration()!;
-          const rewardAddress = CML.RewardAddress.new(
-            CML.NetworkInfo.testnet().network_id(),
-            registration.stake_credential(),
-          )
-            .to_address()
-            .to_bech32(undefined);
-          if (this.chain[rewardAddress]?.registeredStake) {
-            throw new Error(
-              `Stake key is already registered. Reward address: ${rewardAddress}`,
-            );
-          }
-          certRequests.push({ type: "Registration", rewardAddress });
-          break;
-        }
-        case CML.CertificateKind.RegCert: {
-          const registration = cert.as_reg_cert()!;
-          const rewardAddress = CML.RewardAddress.new(
-            CML.NetworkInfo.testnet().network_id(),
-            registration.stake_credential(),
-          )
-            .to_address()
-            .to_bech32(undefined);
-          const { stakeCredential } = getAddressDetails(rewardAddress);
-          checkAndConsumeHash(stakeCredential!, "Cert", index);
-          if (this.chain[rewardAddress]?.registeredStake) {
-            throw new Error(
-              `Stake key is already registered. Reward address: ${rewardAddress}`,
-            );
-          }
-          certRequests.push({ type: "Registration", rewardAddress });
-          break;
-        }
-        case 1: {
-          const deregistration = cert.as_stake_deregistration()!;
-          const rewardAddress = CML.RewardAddress.new(
-            CML.NetworkInfo.testnet().network_id(),
-            deregistration.stake_credential(),
-          )
-            .to_address()
-            .to_bech32(undefined);
-
-          const { stakeCredential } = getAddressDetails(rewardAddress);
-          checkAndConsumeHash(stakeCredential!, "Cert", index);
-
-          if (!this.chain[rewardAddress]?.registeredStake) {
-            throw new Error(
-              `Stake key is already deregistered. Reward address: ${rewardAddress}`,
-            );
-          }
-          certRequests.push({ type: "Deregistration", rewardAddress });
-          break;
-        }
-        case 2: {
-          const delegation = cert.as_stake_delegation()!;
-          const rewardAddress = CML.RewardAddress.new(
-            CML.NetworkInfo.testnet().network_id(),
-            delegation.stake_credential(),
-          )
-            .to_address()
-            .to_bech32(undefined);
-          const poolId = delegation.pool().to_bech32("pool");
-
-          const { stakeCredential } = getAddressDetails(rewardAddress);
-          checkAndConsumeHash(stakeCredential!, "Cert", index);
-
-          if (
-            !this.chain[rewardAddress]?.registeredStake &&
-            !certRequests.find(
-              (request) =>
-                request.type === "Registration" &&
-                request.rewardAddress === rewardAddress,
-            )
-          ) {
-            throw new Error(
-              `Stake key is not registered. Reward address: ${rewardAddress}`,
-            );
-          }
-          certRequests.push({ type: "Delegation", rewardAddress, poolId });
-          break;
-        }
-        case CML.CertificateKind.PoolRegistration: {
-          const poolParams = cert.as_pool_registration()?.pool_params();
-          if (!poolParams) break;
-          checkAndConsumeHash(
-            { type: "Key", hash: poolParams.operator().to_hex() },
-            "Cert",
-            index,
-          );
-          const owners = poolParams.pool_owners();
-          for (let ownerIndex = 0; ownerIndex < owners.len(); ownerIndex++) {
-            checkAndConsumeHash(
-              { type: "Key", hash: owners.get(ownerIndex).to_hex() },
-              "Cert",
-              index,
-            );
-          }
-          break;
-        }
-        case CML.CertificateKind.PoolRetirement: {
-          const pool = cert.as_pool_retirement()?.pool();
-          if (pool) {
-            checkAndConsumeHash(
-              { type: "Key", hash: pool.to_hex() },
-              "Cert",
-              index,
-            );
-          }
-          break;
-        }
-        case CML.CertificateKind.UnregCert: {
-          const deregistration = cert.as_unreg_cert()?.stake_credential();
-          checkCertCredential(deregistration, index);
-          if (deregistration) {
-            const rewardAddress = rewardAddressFromCredential(deregistration);
-            if (!this.chain[rewardAddress]?.registeredStake) {
-              throw new Error(
-                `Stake key is already deregistered. Reward address: ${rewardAddress}`,
-              );
-            }
-            certRequests.push({ type: "Deregistration", rewardAddress });
-          }
-          break;
-        }
-        case CML.CertificateKind.VoteDelegCert: {
-          const credential = cert.as_vote_deleg_cert()?.stake_credential();
-          checkCertCredential(credential, index);
-          if (credential) {
-            const rewardAddress = rewardAddressFromCredential(credential);
-            if (
-              !this.chain[rewardAddress]?.registeredStake &&
-              !certRequests.find(
-                (request) =>
-                  request.type === "Registration" &&
-                  request.rewardAddress === rewardAddress,
-              )
-            ) {
-              throw new Error(
-                `Stake key is not registered. Reward address: ${rewardAddress}`,
-              );
-            }
-          }
-          break;
-        }
-        case CML.CertificateKind.StakeVoteDelegCert: {
-          const delegation = cert.as_stake_vote_deleg_cert();
-          const credential = delegation?.stake_credential();
-          checkCertCredential(credential, index);
-          if (delegation && credential) {
-            const rewardAddress = rewardAddressFromCredential(credential);
-            const poolId = delegation.pool().to_bech32("pool");
-            if (
-              !this.chain[rewardAddress]?.registeredStake &&
-              !certRequests.find(
-                (request) =>
-                  request.type === "Registration" &&
-                  request.rewardAddress === rewardAddress,
-              )
-            ) {
-              throw new Error(
-                `Stake key is not registered. Reward address: ${rewardAddress}`,
-              );
-            }
-            certRequests.push({ type: "Delegation", rewardAddress, poolId });
-          }
-          break;
-        }
-        case CML.CertificateKind.StakeRegDelegCert: {
-          const registration = cert.as_stake_reg_deleg_cert();
-          const credential = registration?.stake_credential();
-          checkCertCredential(credential, index);
-          if (registration && credential) {
-            const rewardAddress = rewardAddressFromCredential(credential);
-            const poolId = registration.pool().to_bech32("pool");
-            if (this.chain[rewardAddress]?.registeredStake) {
-              throw new Error(
-                `Stake key is already registered. Reward address: ${rewardAddress}`,
-              );
-            }
-            certRequests.push({ type: "Registration", rewardAddress });
-            certRequests.push({ type: "Delegation", rewardAddress, poolId });
-          }
-          break;
-        }
-        case CML.CertificateKind.VoteRegDelegCert: {
-          const registration = cert.as_vote_reg_deleg_cert();
-          const credential = registration?.stake_credential();
-          checkCertCredential(credential, index);
-          if (credential) {
-            const rewardAddress = rewardAddressFromCredential(credential);
-            if (this.chain[rewardAddress]?.registeredStake) {
-              throw new Error(
-                `Stake key is already registered. Reward address: ${rewardAddress}`,
-              );
-            }
-            certRequests.push({ type: "Registration", rewardAddress });
-          }
-          break;
-        }
-        case CML.CertificateKind.StakeVoteRegDelegCert: {
-          const registration = cert.as_stake_vote_reg_deleg_cert();
-          const credential = registration?.stake_credential();
-          checkCertCredential(credential, index);
-          if (registration && credential) {
-            const rewardAddress = rewardAddressFromCredential(credential);
-            const poolId = registration.pool().to_bech32("pool");
-            if (this.chain[rewardAddress]?.registeredStake) {
-              throw new Error(
-                `Stake key is already registered. Reward address: ${rewardAddress}`,
-              );
-            }
-            certRequests.push({ type: "Registration", rewardAddress });
-            certRequests.push({ type: "Delegation", rewardAddress, poolId });
-          }
-          break;
-        }
-        case CML.CertificateKind.AuthCommitteeHotCert: {
-          checkCertCredential(
-            cert.as_auth_committee_hot_cert()?.committee_cold_credential(),
-            index,
-          );
-          break;
-        }
-        case CML.CertificateKind.ResignCommitteeColdCert: {
-          checkCertCredential(
-            cert.as_resign_committee_cold_cert()?.committee_cold_credential(),
-            index,
-          );
-          break;
-        }
-        case CML.CertificateKind.RegDrepCert: {
-          checkCertCredential(
-            cert.as_reg_drep_cert()?.drep_credential(),
-            index,
-          );
-          break;
-        }
-        case CML.CertificateKind.UnregDrepCert: {
-          checkCertCredential(
-            cert.as_unreg_drep_cert()?.drep_credential(),
-            index,
-          );
-          break;
-        }
-        case CML.CertificateKind.UpdateDrepCert: {
-          checkCertCredential(
-            cert.as_update_drep_cert()?.drep_credential(),
-            index,
-          );
-          break;
-        }
-      }
-    }
-
-    // Check input witnesses
-
-    resolvedInputs.forEach(({ entry: { utxo } }, index) => {
-      const { paymentCredential } = getAddressDetails(utxo.address);
-      checkAndConsumeHash(paymentCredential!, "Spend", index);
-    });
-
-    // Create outputs and consume datum hashes
-    const outputs = withCMLScope((own) => {
-      const collected = [];
-      const bodyOutputs = own(body.outputs());
-      for (let i = 0; i < bodyOutputs.len(); i++) {
-        const output = own(bodyOutputs.get(i));
-        const unspentOutput = own(
-          CML.TransactionUnspentOutput.new(
-            own(
-              CML.TransactionInput.new(
-                own(CML.TransactionHash.from_hex(txHash)),
-                BigInt(i),
-              ),
-            ),
-            output,
-          ),
-        );
-
-        const utxo = coreToUtxo(unspentOutput);
-
-        if (utxo.datumHash) consumedHashes.add(utxo.datumHash);
-
-        collected.push({
-          utxo,
-          spent: false,
-        });
-      }
-      return collected;
-    });
-
-    // Check consumed witnesses
-
-    const [extraKeyHash] = keyHashList.filter(
-      (keyHash) => !consumedHashes.has(keyHash),
-    );
-    if (extraKeyHash) {
-      throw new Error(`Extraneous vkey witness. Key hash: ${extraKeyHash}`);
-    }
-
-    const [extraNativeHash] = nativeHashList.filter(
-      (scriptHash) => !consumedHashes.has(scriptHash),
-    );
-    if (extraNativeHash) {
-      throw new Error(
-        `Extraneous native script. Script hash: ${extraNativeHash}`,
-      );
-    }
-
-    const [extraPlutusHash] = plutusHashList.filter(
-      (scriptHash) => !consumedHashes.has(scriptHash),
-    );
-    if (extraPlutusHash) {
-      throw new Error(
-        `Extraneous plutus script. Script hash: ${extraPlutusHash}`,
-      );
-    }
-
-    const [extraDatumHash] = Object.keys(datumTable).filter(
-      (datumHash) => !consumedHashes.has(datumHash),
-    );
-    if (extraDatumHash) {
-      throw new Error(`Extraneous plutus data. Datum hash: ${extraDatumHash}`);
-    }
-
-    // Reference inputs must be disjoint from inputs, as the ledger requires.
-    // Protocol versions 9 and 10 reject any overlap in the UTXO rule
-    // (BabbageNonDisjointRefInputs). From protocol version 11 the check is
-    // part of building a PlutusV3 script context
-    // (ReferenceInputsNotDisjointFromInputs), so only a transaction that
-    // runs a PlutusV3 script is rejected; PlutusV1 and PlutusV2 contexts
-    // tolerate the overlap, as did protocol versions 8 and below.
-
-    if (nonDisjointRefInputs.length > 0) {
-      const protocolMajorVersion =
-        this.protocolParameters.protocolMajorVersion ??
-        DEFAULT_PROTOCOL_MAJOR_VERSION;
-      const overlap = nonDisjointRefInputs.join(", ");
-      if (protocolMajorVersion === 9 || protocolMajorVersion === 10) {
-        throw new Error(
-          `BabbageNonDisjointRefInputs: reference inputs must be disjoint from inputs at protocol version ${protocolMajorVersion}. Overlapping: ${overlap}`,
-        );
-      }
-      const runsPlutusV3 = [...consumedHashes].some((hash) =>
-        plutusV3Hashes.has(hash as ScriptHash),
-      );
-      if (protocolMajorVersion >= 11 && runsPlutusV3) {
-        throw new Error(
-          `ReferenceInputsNotDisjointFromInputs: a PlutusV3 script context cannot be built while reference inputs overlap inputs. Overlapping: ${overlap}`,
-        );
-      }
-    }
-
-    // Apply transitions
-
-    resolvedInputs.forEach(({ entry }) => {
-      entry.spent = true;
-    });
-
-    withdrawalRequests.forEach(({ rewardAddress, withdrawal }) => {
-      this.chain[rewardAddress].delegation.rewards -= withdrawal;
-    });
-
-    if (treasuryDonation !== undefined) {
-      this.treasury += treasuryDonation;
-    }
-
-    certRequests.forEach(({ type, rewardAddress, poolId }) => {
-      switch (type) {
-        case "Registration": {
-          if (this.chain[rewardAddress]) {
-            this.chain[rewardAddress].registeredStake = true;
-          } else {
-            this.chain[rewardAddress] = {
-              registeredStake: true,
-              delegation: { poolId: null, rewards: 0n },
-            };
-          }
-          break;
-        }
-        case "Deregistration": {
-          this.chain[rewardAddress].registeredStake = false;
-          this.chain[rewardAddress].delegation.poolId = null;
-          break;
-        }
-        case "Delegation": {
-          this.chain[rewardAddress].delegation.poolId = poolId!;
-        }
-      }
-    });
-
-    outputs.forEach(({ utxo, spent }) => {
-      this.mempool[utxo.txHash + utxo.outputIndex] = {
-        utxo,
-        spent,
-      };
-    });
-
-    for (const [datumHash, datum] of Object.entries(datumTable)) {
-      this.datumTable[datumHash] = datum;
-    }
-
-    this.#history[txHash] = { status: "pending" };
-    this.#pendingTxHashes.push(txHash);
-
-    return txHash;
-  }
-
-  /**
-   * The ledger's collateral rules for a transaction with redeemers: at least
-   * one and at most `maxCollateralInputs` collateral inputs, a balance (inputs
-   * minus the collateral return) of ADA only that covers
-   * `collateralPercentage` of the fee, a `total_collateral` field, when
-   * present, equal to that balance, and a collateral return holding at least
-   * its minimum ADA.
-   */
-  private checkCollateral(
-    body: CML.TransactionBody,
-    collateralBalance: Assets,
-    own: CMLOwn,
-  ): void {
-    const inputCount = own(body.collateral_inputs())?.len() ?? 0;
-    if (inputCount === 0) {
-      throw new Error(
-        "NoCollateralInputs: a transaction that runs scripts needs collateral inputs.",
-      );
-    }
-    const { maxCollateralInputs, collateralPercentage } =
-      this.protocolParameters;
-    if (inputCount > maxCollateralInputs) {
-      throw new Error(
-        `TooManyCollateralInputs: ${inputCount} collateral inputs, but at most ${maxCollateralInputs} are allowed.`,
-      );
-    }
-    const balance: Assets = { ...collateralBalance };
-    const collateralReturn = own(body.collateral_return());
-    if (collateralReturn) {
-      const minLovelace = CML.min_ada_required(
-        collateralReturn,
-        this.protocolParameters.coinsPerUtxoByte,
-      );
-      const returnedLovelace = own(collateralReturn.amount()).coin();
-      if (returnedLovelace < minLovelace) {
-        throw new Error(
-          `BabbageOutputTooSmallUTxO: collateral return holds ${returnedLovelace} Lovelace, but needs at least ${minLovelace} Lovelace.`,
-        );
-      }
-      const returned = valueToAssets(own(collateralReturn.amount()));
-      for (const [unit, amount] of Object.entries(returned)) {
-        balance[unit] = (balance[unit] ?? 0n) - amount;
-      }
-    }
-    const nonAda = Object.entries(balance).filter(
-      ([unit, amount]) => unit !== "lovelace" && amount !== 0n,
-    );
-    if (nonAda.length > 0) {
-      throw new Error(
-        `CollateralContainsNonADA: collateral balance holds ${nonAda
-          .map(([unit, amount]) => `${amount} ${unit}`)
-          .join(", ")}.`,
-      );
-    }
-    const collateral = balance.lovelace ?? 0n;
-    const fee = body.fee();
-    if (collateral * 100n < fee * BigInt(collateralPercentage)) {
-      const required = (fee * BigInt(collateralPercentage) + 99n) / 100n;
-      throw new Error(
-        `InsufficientCollateral: collateral balance is ${collateral} Lovelace, but the fee of ${fee} requires ${required} Lovelace (${collateralPercentage}%).`,
-      );
-    }
-    const totalCollateral = body.total_collateral();
-    if (totalCollateral !== undefined && totalCollateral !== collateral) {
-      throw new Error(
-        `IncorrectTotalCollateralField: total collateral is ${totalCollateral} Lovelace, but the collateral balance is ${collateral} Lovelace.`,
-      );
-    }
-  }
-
-  /** Hash of a reference script, computed once per distinct script. */
-  private scriptRefHash(scriptRef: Script): ScriptHash {
-    let scriptHash = this.#scriptRefHashes.get(
-      scriptRef.type,
-      scriptRef.script,
-    );
-    if (scriptHash === undefined) {
-      scriptHash = withCMLScope((own) => {
-        const bytes = fromHex(scriptRef.script);
-        switch (scriptRef.type) {
-          case "Native":
-            return own(
-              own(CML.NativeScript.from_cbor_bytes(bytes)).hash(),
-            ).to_hex();
-          case "PlutusV1":
-            return own(
-              own(
-                CML.PlutusScript.from_v1(
-                  own(CML.PlutusV1Script.from_cbor_bytes(bytes)),
-                ),
-              ).hash(),
-            ).to_hex();
-          case "PlutusV2":
-            return own(
-              own(
-                CML.PlutusScript.from_v2(
-                  own(CML.PlutusV2Script.from_cbor_bytes(bytes)),
-                ),
-              ).hash(),
-            ).to_hex();
-          case "PlutusV3":
-            return own(
-              own(
-                CML.PlutusScript.from_v3(
-                  own(CML.PlutusV3Script.from_cbor_bytes(bytes)),
-                ),
-              ).hash(),
-            ).to_hex();
-        }
-      });
-      this.#scriptRefHashes.set(scriptRef.type, scriptRef.script, scriptHash);
-    }
-    return scriptHash;
-  }
-
-  async evaluateTx(
-    tx: Transaction,
-    additionalUTxOs?: UTxO[],
-  ): Promise<EvalRedeemer[]> {
-    return withCMLScope((own) => {
-      const desTx = own(CML.Transaction.from_cbor_hex(tx));
-      const redeemers = own(own(desTx.witness_set()).redeemers());
-      if (!redeemers) {
-        return [];
-      }
-      const evalRedeemers: EvalRedeemer[] = [];
-      const arrLegacyRedeemer = own(redeemers.as_arr_legacy_redeemer());
-      if (arrLegacyRedeemer) {
-        for (let i = 0; i < arrLegacyRedeemer.len(); i++) {
-          const legacyRedeemer = own(arrLegacyRedeemer.get(i));
-          const exUnits = own(legacyRedeemer.ex_units());
-          evalRedeemers.push({
-            ex_units: {
-              mem: Number(exUnits.mem()),
-              steps: Number(exUnits.steps()),
-            },
-            redeemer_index: Number(legacyRedeemer.index()),
-            redeemer_tag: fromCMLRedeemerTag(legacyRedeemer.tag()),
-          });
-        }
-        return evalRedeemers;
-      }
-      const mapRedeemerKeyToRedeemerVal = own(
-        redeemers.as_map_redeemer_key_to_redeemer_val(),
-      );
-      if (mapRedeemerKeyToRedeemerVal) {
-        const keys = own(mapRedeemerKeyToRedeemerVal.keys());
-
-        for (let i = 0; i < keys.len(); i++) {
-          const key = own(keys.get(i));
-          const redeemerVal = own(mapRedeemerKeyToRedeemerVal.get(key));
-          if (redeemerVal) {
-            const exUnits = own(redeemerVal.ex_units());
-            evalRedeemers.push({
-              ex_units: {
-                mem: Number(exUnits.mem()),
-                steps: Number(exUnits.steps()),
-              },
-              redeemer_index: Number(key.index()),
-              redeemer_tag: fromCMLRedeemerTag(key.tag()),
-            });
-          }
-        }
-        return evalRedeemers;
-      }
-      return evalRedeemers;
-    });
-  }
-
   log() {
     function getRandomColor(unit: Unit) {
       const seed = unit === "lovelace" ? "1" : unit;
@@ -1522,5 +495,402 @@ export class Emulator implements Provider {
       }
       console.log(`\n${"\u2581".repeat(60)}\n`);
     }
+  }
+}
+
+type Snapshot = {
+  ok: true;
+  state: Record<string, unknown>;
+  chain: EmulatorChainContext;
+  utxos: Array<{ input: string; cbor: string }>;
+  datums: Array<{ hash: string; cbor: string }>;
+  accounts: Array<{ address: string; rewards: string; poolId: string | null }>;
+  treasury: string;
+  txHash?: string;
+  registered?: boolean;
+  rewards?: string;
+  poolId?: string | null;
+};
+
+export type EmulatorOptions = {
+  /** Pools present at genesis, with zero deposit and default mockchain pool data. */
+  stakePools?: string[];
+};
+
+const encodeUtxo = utxoToCore;
+
+/**
+ * Emulator's clock, accounts, queries, and pending/confirmed transaction API,
+ * backed by the actual convex-mockchain Conway ledger in WASM.
+ * The first three constructor arguments are identical to Emulator's.
+ */
+export class Emulator extends EmulatorFixtures implements Provider {
+  readonly balancer: EmulatorBalancer;
+  private readonly runtime: EmulatorRuntime;
+  private readonly ready: Promise<void>;
+  private pending: Promise<void> = Promise.resolve();
+  private snapshot!: Snapshot;
+  private deferredError?: unknown;
+  private pendingRewards = 0;
+  private fixtureFingerprint: string;
+
+  constructor(
+    accounts: EmulatorAccount[],
+    protocolParameters: ProtocolParameters = PROTOCOL_PARAMETERS_DEFAULT,
+    treasury: Lovelace = 0n,
+    runtime: EmulatorRuntime = getLedgerRuntime(),
+    options: EmulatorOptions = {},
+  ) {
+    super(accounts, protocolParameters, treasury);
+    this.runtime = runtime;
+    this.fixtureFingerprint = JSON.stringify(this.fixtures());
+    this.balancer = {
+      type: "sc-tools",
+      runtime,
+      chainContext: async () => this.getChainContext(),
+    };
+    const genesis = Object.values(this.ledger).map(({ utxo }) =>
+      encodeUtxo(utxo),
+    );
+    const datums = accounts.flatMap(({ outputData }) =>
+      [outputData?.asHash, outputData?.inline].filter(
+        (d): d is string => d !== undefined,
+      ),
+    );
+    this.ready = this.request({
+      operation: "init",
+      stakePools: options.stakePools ?? [],
+      utxos: genesis,
+      datums,
+      protocolParameters: protocolOverrides(protocolParameters),
+      systemStart: String(this.time / 1000),
+      treasury: String(treasury),
+      slot: 0,
+    }).then((snapshot) => {
+      if (JSON.stringify(this.fixtures()) === this.fixtureFingerprint) {
+        this.applySnapshot(snapshot, true);
+      } else {
+        // Preserve fixture edits made immediately after construction.
+        this.snapshot = snapshot;
+      }
+    });
+    // Initialization errors are reported by every asynchronous provider method.
+    void this.ready.catch(() => {});
+  }
+
+  private async request(payload: Record<string, unknown>): Promise<Snapshot> {
+    const response = await this.runtime.run({
+      action: "mockchain",
+      ...payload,
+    });
+    if (
+      !response ||
+      typeof response !== "object" ||
+      !("ok" in response) ||
+      response.ok !== true
+    ) {
+      throw new Error(
+        `convex-mockchain: ${String((response as { error?: unknown } | null)?.error ?? "invalid response")}`,
+      );
+    }
+    return response as Snapshot;
+  }
+
+  private async settled(): Promise<void> {
+    await this.ready;
+    await this.pending;
+    if (this.deferredError) {
+      const error = this.deferredError;
+      this.deferredError = undefined;
+      throw error;
+    }
+  }
+
+  private enqueue<T>(
+    operation: () => Promise<T>,
+    synchronize = true,
+  ): Promise<T> {
+    const result = this.pending.then(async () => {
+      await this.ready;
+      if (synchronize) await this.syncFixtures();
+      return operation();
+    });
+    this.pending = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  private fixtures() {
+    return {
+      utxos: Object.values({ ...this.ledger, ...this.mempool })
+        .filter(({ spent }) => !spent)
+        .map(({ utxo }) => encodeUtxo(utxo))
+        .sort(),
+      accounts:
+        this.pendingRewards > 0 && this.snapshot
+          ? this.snapshot.accounts
+          : Object.entries(this.chain)
+              .filter(([, a]) => a.registeredStake)
+              .map(([address, a]) => ({
+                address,
+                rewards: String(a.delegation.rewards),
+                poolId: a.delegation.poolId,
+              })),
+      treasury: String(this.treasury),
+      datums: Object.values(this.datumTable).sort(),
+      protocolParameters: protocolOverrides(this.protocolParameters),
+    };
+  }
+
+  private async syncFixtures(edits?: {
+    updated: Snapshot["accounts"];
+    removed: Set<string>;
+  }): Promise<void> {
+    const fixtures = this.fixtures();
+    if (edits) {
+      const accounts = new Map(
+        this.snapshot.accounts.map((a) => [a.address, a]),
+      );
+      for (const address of edits.removed) accounts.delete(address);
+      for (const account of edits.updated)
+        accounts.set(account.address, account);
+      fixtures.accounts = [...accounts.values()];
+    }
+    const fingerprint = JSON.stringify(fixtures);
+    if (fingerprint === this.fixtureFingerprint) return;
+    const chain = {
+      ...this.snapshot.chain,
+      protocolParameters: {
+        ...this.snapshot.chain.protocolParameters,
+        ...fixtures.protocolParameters,
+      },
+    };
+    const snapshot = await this.request({
+      operation: "setFixtures",
+      state: this.snapshot.state,
+      chain,
+      slot: this.slot,
+      ...fixtures,
+    });
+    // These are explicit public fixture edits. Keep their confirmed/pending
+    // placement, but make the actual ledger authoritative for validation too.
+    this.snapshot = snapshot;
+    this.fixtureFingerprint = fingerprint;
+  }
+
+  private applySnapshot(snapshot: Snapshot, initial = false): void {
+    const available = new Map(
+      snapshot.utxos.map(({ input, cbor }) => {
+        const [txHash, index] = input.split("#");
+        const utxo: UTxO = {
+          txHash,
+          outputIndex: Number(index),
+          ...coreToTxOutput(cbor),
+        };
+        return [txHash + index, utxo] as const;
+      }),
+    );
+    for (const entries of [this.ledger, this.mempool]) {
+      for (const [key, entry] of Object.entries(entries))
+        entry.spent = !available.has(key);
+    }
+    for (const [key, utxo] of available) {
+      if (!this.ledger[key] && !this.mempool[key])
+        (initial ? this.ledger : this.mempool)[key] = { utxo, spent: false };
+    }
+    for (const { hash, cbor } of snapshot.datums) this.datumTable[hash] = cbor;
+    for (const account of Object.values(this.chain)) {
+      account.registeredStake = false;
+      account.delegation = { poolId: null, rewards: 0n };
+    }
+    Object.assign(
+      this.chain,
+      Object.fromEntries(
+        snapshot.accounts.map(({ address, rewards, poolId }) => [
+          address,
+          {
+            registeredStake: true,
+            delegation: { rewards: BigInt(rewards), poolId },
+          },
+        ]),
+      ),
+    );
+    this.treasury = BigInt(snapshot.treasury);
+    this.snapshot = snapshot;
+    this.fixtureFingerprint = JSON.stringify(this.fixtures());
+  }
+
+  async getChainContext(): Promise<EmulatorChainContext> {
+    await this.settled();
+    await this.enqueue(async () => {});
+    return structuredClone(this.snapshot.chain);
+  }
+
+  override async getProtocolParameters() {
+    await this.settled();
+    return super.getProtocolParameters();
+  }
+  override async getTreasury() {
+    await this.settled();
+    return super.getTreasury();
+  }
+  override async getDatum(hash: DatumHash) {
+    await this.settled();
+    return super.getDatum(hash);
+  }
+  override async getUtxos(address: Address | Credential) {
+    await this.settled();
+    return super.getUtxos(address);
+  }
+  override async getUtxosWithUnit(address: Address | Credential, unit: Unit) {
+    await this.settled();
+    return super.getUtxosWithUnit(address, unit);
+  }
+  override getUtxoByUnit(unit: Unit): Promise<UTxO> {
+    // Emulator throws synchronously when more than one UTxO holds the unit.
+    // Preserve that observable API, then re-query after queued ledger updates.
+    super.getUtxoByUnit(unit);
+    return this.settled().then(() => super.getUtxoByUnit(unit));
+  }
+  override async getUtxosByOutRef(refs: OutRef[]) {
+    await this.settled();
+    return super.getUtxosByOutRef(refs);
+  }
+  async getUtxosWithPolicy(address: Address | Credential, policyId: string) {
+    return (await this.getUtxos(address)).filter((u) =>
+      Object.keys(u.assets).some(
+        (unit) =>
+          unit !== "lovelace" &&
+          unit.startsWith(policyId) &&
+          u.assets[unit] > 0n,
+      ),
+    );
+  }
+  override async getRewardAccount(
+    address: RewardAddress,
+  ): Promise<RewardAccountState> {
+    await this.settled();
+    return super.getRewardAccount(address);
+  }
+  override async getDelegation(address: RewardAddress) {
+    await this.settled();
+    return super.getDelegation(address);
+  }
+  override async getTransactionStatus(
+    hash: TxHash,
+    options: TransactionStatusOptions = {},
+  ) {
+    await this.settled();
+    return super.getTransactionStatus(hash, options);
+  }
+  override async awaitTx(hash: TxHash) {
+    await this.settled();
+    return super.awaitTx(hash);
+  }
+
+  override distributeRewards(rewards: Lovelace): void {
+    if (rewards < 0n) throw new Error("Negative reward");
+    const slot = this.slot;
+    // Capture explicit account edits before the synchronous reward projection.
+    // Apply only changed accounts after earlier queued submissions have settled.
+    const before = this.fixtures().accounts;
+    const previous = new Map(
+      (this.snapshot?.accounts ?? []).map((a) => [a.address, a]),
+    );
+    const current = new Set(before.map((a) => a.address));
+    const edits =
+      this.pendingRewards === 0
+        ? {
+            updated: before.filter(
+              (a) =>
+                JSON.stringify(a) !== JSON.stringify(previous.get(a.address)),
+            ),
+            removed: new Set(
+              [...previous.keys()].filter((a) => !current.has(a)),
+            ),
+          }
+        : undefined;
+    this.pendingRewards++;
+    void this.enqueue(async () => {
+      await this.syncFixtures(edits);
+      const next = await this.request({
+        operation: "reward",
+        state: this.snapshot.state,
+        chain: this.snapshot.chain,
+        slot,
+        amount: String(rewards),
+      });
+      this.applySnapshot(next);
+    }, false)
+      .catch((error) => {
+        this.applySnapshot(this.snapshot);
+        this.deferredError = error;
+      })
+      .finally(() => {
+        this.pendingRewards--;
+      });
+    super.distributeRewards(rewards);
+  }
+
+  submitTx(tx: Transaction): Promise<TxHash> {
+    const slot = this.slot;
+    return this.enqueue(async () => {
+      const next = await this.request({
+        operation: "submit",
+        state: this.snapshot.state,
+        chain: this.snapshot.chain,
+        slot,
+        cbor: tx,
+      });
+      if (!next.txHash)
+        throw new Error("convex-mockchain did not return a transaction hash");
+      this.applySnapshot(next);
+      this.transactionHistory[next.txHash] = { status: "pending" };
+      return next.txHash;
+    });
+  }
+
+  async evaluateTx(
+    tx: Transaction,
+    additionalUTxOs: UTxO[] = [],
+  ): Promise<EvalRedeemer[]> {
+    const chain = await this.getChainContext();
+    const known = new Map<string, UTxO>();
+    for (const { utxo, spent } of [
+      ...Object.values(this.ledger),
+      ...Object.values(this.mempool),
+    ])
+      if (!spent) known.set(utxo.txHash + utxo.outputIndex, utxo);
+    for (const utxo of additionalUTxOs)
+      known.set(utxo.txHash + utxo.outputIndex, utxo);
+    const changeAddress = credentialToAddress("Custom", {
+      type: "Key",
+      hash: "00".repeat(28),
+    });
+    const response = (await this.runtime.run({
+      action: "evaluateV2",
+      chain,
+      blocks: [],
+      wallet: { changeAddress, utxos: [] },
+      resolvedInputs: [...known.values()].map(encodeUtxo),
+      cbor: tx,
+    })) as {
+      ok?: boolean;
+      error?: unknown;
+      exUnits?: Array<{
+        purpose: { tag: EvalRedeemer["redeemer_tag"]; index: number };
+        mem: number;
+        steps: number;
+      }>;
+    };
+    if (!response?.ok || !response.exUnits)
+      throw new Error(`sc-tools evaluation failed: ${String(response?.error)}`);
+    return response.exUnits.map(({ purpose, mem, steps }) => ({
+      redeemer_tag: purpose.tag,
+      redeemer_index: purpose.index,
+      ex_units: { mem, steps },
+    }));
   }
 }

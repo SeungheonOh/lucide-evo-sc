@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { CML, Lucid } from "../src/index.js";
+import { Lucid } from "../src/index.js";
 import { Emulator, generateEmulatorAccount } from "../../provider/src/index.js";
 
 describe("Treasury donation", () => {
@@ -15,12 +15,12 @@ describe("Treasury donation", () => {
       .newTx()
       .donateToTreasury(donation)
       .complete();
-    const body = signBuilder.toTransaction().body();
+    const body = signBuilder.toTransaction().body;
 
-    expect(body.current_treasury_value()).toBe(initialTreasury);
-    expect(body.donation()).toBe(donation);
-    expect(body.fee()).toBeGreaterThan(0n);
-    expect(CML.hash_transaction(body).to_hex()).toHaveLength(64);
+    expect(body.currentTreasury).toBe(initialTreasury);
+    expect(body.treasuryDonation).toBe(donation);
+    expect(body.fee).toBeGreaterThan(0n);
+    expect(signBuilder.toHash()).toHaveLength(64);
 
     const signed = await signBuilder.sign.withWallet().complete();
     await signed.submit();

@@ -32,8 +32,5 @@ export const verifyAddSignerKey = Effect.gen(function* () {
   const pubKeyHash = "c98a2f16a5800847a3c027fafc3f63a8442b92836773533d74cbf208";
   const txBuilder = user.newTx().addSignerKey(pubKeyHash);
   const balancedTx = yield* txBuilder.completeProgram({ localUPLCEval: false });
-  return (
-    pubKeyHash ==
-    balancedTx.toTransaction().body().required_signers()?.get(0).to_hex()
-  );
+  return pubKeyHash == balancedTx.toTransaction().body.requiredSigners[0];
 });

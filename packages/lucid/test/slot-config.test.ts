@@ -1,3 +1,5 @@
+import { scChainContext } from "../src/sc-tools/context.js";
+import type { LucidConfig } from "../src/lucid-evolution/LucidEvolution.js";
 import { afterEach, describe, expect, test } from "vitest";
 import {
   Emulator,
@@ -14,6 +16,31 @@ afterEach(() => {
 });
 
 describe("per-instance slot configuration", () => {
+  test("automatic emulator context preserves state while honoring pinned parameters and slots", async () => {
+    const emulator = new Emulator([], PROTOCOL_PARAMETERS_DEFAULT);
+    const slotConfig = { zeroTime: 12_345, zeroSlot: 5, slotLength: 250 };
+    const parameters = {
+      ...PROTOCOL_PARAMETERS_DEFAULT,
+      minFeeA: 77,
+      minFeeB: 200_000,
+    };
+    const lucid = await Lucid(emulator, "Custom", {
+      presetProtocolParameters: parameters,
+      slotConfig,
+    });
+    const current = await emulator.getChainContext();
+    const context = await scChainContext(lucid.config() as LucidConfig);
+    expect(context.protocolParameters.txFeePerByte).toBe(77);
+    expect(context.protocolParameters.txFeeFixed).toBe(200_000);
+    expect(context.protocolParameters.protocolVersion).toEqual(
+      current.protocolParameters.protocolVersion,
+    );
+    expect(context.stakePools).toEqual(current.stakePools);
+    expect(context.stakeDeposits).toEqual(current.stakeDeposits);
+    expect(Number(context.systemStart) * 1_000).toBe(12_345 - 5 * 250);
+    expect(context.eraSummaries[0].parameters.slot_length).toBe(0.25);
+  });
+
   test("keeps simultaneous Custom instances isolated and immutable", async () => {
     const account = generateEmulatorAccount({ lovelace: 100_000_000n });
     const emulator = new Emulator([account], PROTOCOL_PARAMETERS_DEFAULT);
@@ -123,9 +150,9 @@ describe("per-instance slot configuration", () => {
       .validFrom(11_000)
       .validTo(12_000)
       .complete();
-    const body = signBuilder.toTransaction().body();
+    const body = signBuilder.toTransaction().body;
 
-    expect(body.validity_interval_start()?.toString()).toBe("105");
-    expect(body.ttl()?.toString()).toBe("110");
+    expect(body.validFrom?.toString()).toBe("105");
+    expect(body.validUntil?.toString()).toBe("110");
   });
 });

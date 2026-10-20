@@ -1,6 +1,9 @@
 import * as Effect from "effect/Effect";
 
-export * as CML from "@lucid-evolution/cml";
+export type {
+  TransactionSnapshot,
+  TransactionBodySnapshot,
+} from "@lucid-evolution/ledger";
 
 export const makeReturn = <A, E>(program: Effect.Effect<A, E>) => {
   return {

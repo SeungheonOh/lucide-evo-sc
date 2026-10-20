@@ -1,40 +1,19 @@
-import { CML } from "./core.js";
-import { RedeemerTag } from "@lucid-evolution/core-types";
-
-export const toCMLRedeemerTag = (tag: string): CML.RedeemerTag => {
-  switch (tag) {
-    case "spend":
-      return CML.RedeemerTag.Spend;
-    case "mint":
-      return CML.RedeemerTag.Mint;
-    case "publish":
-      return CML.RedeemerTag.Cert;
-    case "withdraw":
-      return CML.RedeemerTag.Reward;
-    case "vote":
-      return CML.RedeemerTag.Voting;
-    case "propose":
-      return CML.RedeemerTag.Proposing;
-    default:
-      throw new Error(`Exhaustive check failed: Unhandled case ${tag}`);
-  }
-};
-
-export const fromCMLRedeemerTag = (tag: CML.RedeemerTag): RedeemerTag => {
-  switch (tag) {
-    case CML.RedeemerTag.Spend:
-      return "spend" as const;
-    case CML.RedeemerTag.Mint:
-      return "mint" as const;
-    case CML.RedeemerTag.Cert:
-      return "publish" as const;
-    case CML.RedeemerTag.Reward:
-      return "withdraw" as const;
-    case CML.RedeemerTag.Voting:
-      return "vote" as const;
-    case CML.RedeemerTag.Proposing:
-      return "propose" as const;
-    default:
-      throw new Error(`Exhaustive check failed: Unhandled case ${tag}`);
-  }
-};
+import type { RedeemerTag } from "@lucid-evolution/core-types";
+const tags: readonly RedeemerTag[] = [
+  "spend",
+  "mint",
+  "publish",
+  "withdraw",
+  "vote",
+  "propose",
+];
+export function toRedeemerTagIndex(tag: string): number {
+  const index = tags.indexOf(tag as RedeemerTag);
+  if (index < 0) throw new Error(`Unknown redeemer tag: ${tag}`);
+  return index;
+}
+export function fromRedeemerTagIndex(index: number): RedeemerTag {
+  const tag = tags[index];
+  if (!tag) throw new Error(`Unknown redeemer tag index: ${index}`);
+  return tag;
+}

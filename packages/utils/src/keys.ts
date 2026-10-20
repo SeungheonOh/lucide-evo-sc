@@ -1,15 +1,16 @@
-import { PrivateKey, PublicKey } from "@lucid-evolution/core-types";
-import { generateMnemonic } from "bip39";
-import { CML } from "./core.js";
+import type { PrivateKey, PublicKey } from "@lucid-evolution/core-types";
+import { ledger } from "@lucid-evolution/ledger";
+import { generateMnemonic } from "@scure/bip39";
+
+import { wordlist } from "@scure/bip39/wordlists/english";
 
 export function generatePrivateKey(): PrivateKey {
-  return CML.PrivateKey.generate_ed25519().to_bech32();
+  return ledger("key.generate", {});
 }
-
 export function generateSeedPhrase(): string {
-  return generateMnemonic(256);
+  return generateMnemonic(wordlist, 256);
 }
-
 export function toPublicKey(privateKey: PrivateKey): PublicKey {
-  return CML.PrivateKey.from_bech32(privateKey).to_public().to_bech32();
+  return ledger<{ publicKey: string }>("key.fromPrivate", { privateKey })
+    .publicKey;
 }

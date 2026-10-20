@@ -1,172 +1,44 @@
-import { recordScInput } from "../../sc-tools/intent.js";
 import * as Effect from "effect/Effect";
-import { pipe } from "effect/Function";
-import { Data } from "@lucid-evolution/plutus";
-import { utxoToCore } from "@lucid-evolution/utils";
-import { withCMLScope } from "@lucid-evolution/core-utils";
-import type { TxBuilderConfig } from "../TxBuilder.js";
-import { Redeemer, RedeemerBuilder, UTxO } from "@lucid-evolution/core-types";
+import type {
+  Redeemer,
+  RedeemerBuilder,
+  UTxO,
+} from "@lucid-evolution/core-types";
 import { ERROR_MESSAGE, TxBuilderError } from "../../Errors.js";
-import * as CML from "@lucid-evolution/cml";
-import { resolveDatum, toPartial, toV1, toV2, toV3 } from "./TxUtils.js";
-import { paymentCredentialOf } from "@lucid-evolution/utils";
-import { datumOf } from "../../lucid-evolution/utils.js";
+import { recordScInput } from "../../sc-tools/intent.js";
+import { resolveDatum } from "./TxUtils.js";
 import { TxConfig } from "./Service.js";
-
 export const collectError = (cause: unknown) =>
   new TxBuilderError({ cause: `{ Collect: ${cause} }` });
-
 export const collectFromUTxO =
-  (utxos: UTxO[], collectInputs: Boolean = true) =>
+  (utxos: UTxO[], collectInputs = true) =>
   (redeemer?: Redeemer) =>
     Effect.gen(function* () {
       const { config } = yield* TxConfig;
-      if (utxos.length === 0) yield* collectError(ERROR_MESSAGE.EMPTY_UTXO);
+      if (!utxos.length)
+        return yield* Effect.fail(collectError(ERROR_MESSAGE.EMPTY_UTXO));
       for (const utxo of utxos) {
-        // fetch the datum when the datumHash is present
-        const resolvedDatum = yield* resolveDatum(
+        utxo.datum = yield* resolveDatum(
           utxo.datumHash,
           utxo.datum,
           config.lucidConfig.provider,
         );
-        utxo.datum = resolvedDatum;
-        // Skip adding UTxO to collectedInputs when building redeemers to prevent duplicate inputs
-        // Store inputs for later use in the txBuilder
         if (collectInputs) config.collectedInputs.push(utxo);
-        recordScInput(config, utxo, redeemer);
-        //TODO: Add config.collectedAssets
-        const input = withCMLScope((own) =>
-          CML.SingleInputBuilder.from_transaction_unspent_output(
-            own(utxoToCore({ ...utxo, datum: resolvedDatum })),
-          ),
-        );
-        yield* addCollectedInput(config, input, utxo, redeemer).pipe(
-          Effect.ensuring(Effect.sync(() => input.free())),
-        );
+        yield* Effect.try({
+          try: () => recordScInput(config, utxo, redeemer),
+          catch: collectError,
+        });
       }
     });
-
-const missingRedeemer = (redeemer?: Redeemer) =>
-  pipe(
-    Effect.fromNullable(redeemer),
-    Effect.orElseFail(() => collectError(ERROR_MESSAGE.MISSING_REDEEMER)),
-  );
-
-const addPlutusInput = (
-  config: TxBuilderConfig,
-  input: CML.SingleInputBuilder,
-  utxo: UTxO,
-  script: CML.PlutusScript,
-  redeemer: Redeemer,
-): void =>
-  withCMLScope((own) => {
-    own(script);
-    const partial = own(toPartial(script, redeemer));
-    const requiredSigners = own(CML.Ed25519KeyHashList.new());
-    config.txBuilder.add_input(
-      own(
-        utxo.datum && utxo.datumHash
-          ? input.plutus_script(
-              partial,
-              requiredSigners,
-              own(CML.PlutusData.from_cbor_hex(utxo.datum)),
-            )
-          : input.plutus_script_inline_datum(partial, requiredSigners),
-      ),
-    );
-  });
-
-const addCollectedInput = (
-  config: TxBuilderConfig,
-  input: CML.SingleInputBuilder,
-  utxo: UTxO,
-  redeemer?: Redeemer,
-): Effect.Effect<void, TxBuilderError> =>
-  Effect.gen(function* () {
-    const credential = paymentCredentialOf(utxo.address);
-    if (credential.type != "Script") {
-      withCMLScope((own) =>
-        config.txBuilder.add_input(own(input.payment_key())),
-      );
-      return;
-    }
-    const script = yield* pipe(
-      Effect.fromNullable(config.scripts.get(credential.hash)),
-      Effect.orElseFail(() =>
-        collectError(
-          collectError(ERROR_MESSAGE.MISSING_SCRIPT(credential.hash)),
-        ),
-      ),
-    );
-    switch (script.type) {
-      case "Native":
-        withCMLScope((own) =>
-          config.txBuilder.add_input(
-            own(
-              input.native_script(
-                own(CML.NativeScript.from_cbor_hex(script.script)),
-                own(CML.NativeScriptWitnessInfo.assume_signature_count()),
-              ),
-            ),
-          ),
-        );
-        break;
-      case "PlutusV1": {
-        const red = yield* missingRedeemer(redeemer);
-        withCMLScope((own) => {
-          const partial = own(toPartial(own(toV1(script.script)), red));
-          config.txBuilder.add_input(
-            own(
-              input.plutus_script(
-                partial,
-                own(CML.Ed25519KeyHashList.new()),
-                own(CML.PlutusData.from_cbor_hex(utxo.datum!)),
-              ),
-            ),
-          );
-        });
-        break;
-      }
-      case "PlutusV2": {
-        const red = yield* missingRedeemer(redeemer);
-        addPlutusInput(config, input, utxo, toV2(script.script), red);
-        break;
-      }
-      case "PlutusV3": {
-        const red = yield* missingRedeemer(redeemer);
-        addPlutusInput(config, input, utxo, toV3(script.script), red);
-        break;
-      }
-    }
-  });
-
-/* "collectFrom" for RedeemerBuilder needs similar utxo validations as done for Redeemer.
-  These should happen before coin selection; so the effect this function returns is added
-  to the "programs".
-*/
 export const collectFromUTxOPartial = (
   utxos: UTxO[],
-  redeemerBuilder: RedeemerBuilder,
+  redeemer: RedeemerBuilder,
 ) =>
   Effect.gen(function* () {
     const { config } = yield* TxConfig;
-    if (utxos.length === 0) yield* collectError(ERROR_MESSAGE.EMPTY_UTXO);
-    if (redeemerBuilder.kind === "self") redeemerBuilder.inputs = utxos;
-    for (const utxo of utxos) {
-      if (utxo.datumHash && !utxo.datum) {
-        const data = yield* Effect.tryPromise({
-          try: () => datumOf(config.lucidConfig.provider, utxo),
-          catch: (cause) => collectError({ cause }),
-        });
-        utxo.datum = Data.to(data);
-      }
-      // An array of unspent transaction outputs to be used as inputs when running uplc eval.
-      config.collectedInputs.push(utxo);
-      //TODO: Add config.collectedAssets
-    }
-    // NOTE: If RedeemerBuilder is of kind "self" the partial program will be incorrect
-    // however it won't matter as it won't be used if that's the case. But we still need
-    // that RedeemerBuilder in partialPrograms to construct it later during "complete"
-    const partialProgram = collectFromUTxO(utxos, false);
-    config.partialPrograms.set(redeemerBuilder, partialProgram);
+    if (!utxos.length)
+      return yield* Effect.fail(collectError(ERROR_MESSAGE.EMPTY_UTXO));
+    if (redeemer.kind === "self") redeemer.inputs = utxos;
+    config.collectedInputs.push(...utxos);
+    config.partialPrograms.set(redeemer, collectFromUTxO(utxos, false));
   });

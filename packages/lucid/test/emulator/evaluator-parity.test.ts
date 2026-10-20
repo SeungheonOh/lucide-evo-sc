@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
-import { Effect, Layer, pipe } from "effect";
-import { createScalusEvaluator } from "@lucid-evolution/scalus-uplc";
+import { Cause, Effect, Layer, pipe } from "effect";
+import { makeHaskellEvaluator } from "../../src/index.js";
 import { EvaluationInput, EvaluatorAdapter, Lucid } from "../../src/index.js";
 import { HelloContract } from "../specs/services.js";
 import { User } from "./service/EmulatorUser.js";
@@ -14,30 +14,30 @@ import * as HelloFailsExecutor from "./executor/HelloFailsExecutor.js";
 import * as GovExecutor from "./executor/GovExecutor.js";
 import * as SignExecutor from "./executor/SignExecutor.js";
 
-const AikenEnvironment = pipe(
+const DefaultEnvironment = pipe(
   Layer.provide(User.layer, EmulatorInstance.layer),
   Layer.merge(EmulatorInstance.layer),
 );
 
-const makeCountingScalusEvaluator = (
+const makeCountingExplicitEvaluator = (
   evaluated: EvaluationInput[],
 ): EvaluatorAdapter => {
-  const scalus = createScalusEvaluator();
+  const explicit = makeHaskellEvaluator();
   return {
-    name: scalus.name,
+    name: explicit.name,
     evaluate: async (input) => {
       evaluated.push(input);
-      return scalus.evaluate(input);
+      return explicit.evaluate(input);
     },
   };
 };
 
-const makeScalusEnvironment = (evaluated: EvaluationInput[]) => {
-  const makeScalusSeedUser = Effect.gen(function* () {
+const makeExplicitEnvironment = (evaluated: EvaluationInput[]) => {
+  const makeExplicitSeedUser = Effect.gen(function* () {
     const { emulator, ACCOUNTS } = yield* EmulatorInstance;
     const user = yield* Effect.promise(() =>
       Lucid(emulator, "Custom", {
-        evaluator: makeCountingScalusEvaluator(evaluated),
+        evaluator: makeCountingExplicitEvaluator(evaluated),
       }),
     );
     user.selectWallet.fromSeed(ACCOUNTS.SEED_ACCOUNTS[0].seedPhrase);
@@ -53,34 +53,45 @@ const makeScalusEnvironment = (evaluated: EvaluationInput[]) => {
     };
   });
 
-  const ScalusUserLayer = Layer.effect(User, makeScalusSeedUser);
+  const ExplicitUserLayer = Layer.effect(User, makeExplicitSeedUser);
 
   return pipe(
-    Layer.provide(ScalusUserLayer, EmulatorInstance.layer),
+    Layer.provide(ExplicitUserLayer, EmulatorInstance.layer),
     Layer.merge(EmulatorInstance.layer),
   );
 };
 
 type ParityCase = {
   name: string;
-  program: Effect.Effect<unknown, unknown, User | EmulatorInstance>;
-  withHelloContract?: boolean;
-  requiresScalusEvaluation?: boolean;
+  requiresExplicitEvaluation?: boolean;
   expectedOutcome?: "Success" | "Failure";
-};
+  expectedError?: string;
+} & (
+  | {
+      program: Effect.Effect<unknown, unknown, User | EmulatorInstance>;
+      withHelloContract?: false;
+    }
+  | {
+      program: Effect.Effect<
+        unknown,
+        unknown,
+        User | EmulatorInstance | HelloContract
+      >;
+      withHelloContract: true;
+    }
+);
 
 const runCase = (
-  program: ParityCase["program"],
-  environment: Layer.Layer<User | EmulatorInstance>,
-  withHelloContract = false,
+  scenario: ParityCase,
+  environment: Layer.Layer<User | EmulatorInstance, unknown>,
 ) =>
   Effect.runPromiseExit(
-    withHelloContract
-      ? program.pipe(
+    scenario.withHelloContract
+      ? scenario.program.pipe(
           Effect.provide(environment),
           Effect.provide(HelloContract.layer),
         )
-      : program.pipe(Effect.provide(environment)),
+      : scenario.program.pipe(Effect.provide(environment)),
   );
 
 const cases: ParityCase[] = [
@@ -114,7 +125,7 @@ const cases: ParityCase[] = [
   {
     name: "register script stake address with redeemer",
     program: StakeExecutor.registerScriptStakeWithRedeemer,
-    requiresScalusEvaluation: true,
+    requiresExplicitEvaluation: true,
   },
   {
     name: "deposit funds to Hello contract and collect using readFrom",
@@ -123,13 +134,13 @@ const cases: ParityCase[] = [
       yield* HelloExecutor.collectFromReadFrom;
     }),
     withHelloContract: true,
-    requiresScalusEvaluation: true,
+    requiresExplicitEvaluation: true,
   },
   {
     name: "Hello contract collect fails with an incorrect redeemer",
     program: HelloFailsExecutor.collectWithWrongRedeemer,
     withHelloContract: true,
-    requiresScalusEvaluation: true,
+    requiresExplicitEvaluation: true,
     expectedOutcome: "Failure",
   },
   {
@@ -162,13 +173,20 @@ const cases: ParityCase[] = [
     }),
   },
   {
-    name: "register, delegate, receive rewards, and withdraw 0 rewards",
+    name: "withdraw zero from a registered account with zero rewards",
+    program: Effect.gen(function* () {
+      yield* StakeExecutor.registerStake;
+      yield* StakeExecutor.withdrawRewardAmount({ rewardAmount: 0n });
+    }),
+  },
+  {
+    name: "reject zero withdrawal while rewards remain",
+    expectedOutcome: "Failure",
+    expectedError: "WithdrawalsNotInRewardsCERTS",
     program: Effect.gen(function* () {
       yield* StakeExecutor.registerStake;
       yield* StakeExecutor.delegateStake;
-      yield* StakeExecutor.withdrawRewardAmount({
-        rewardAmount: 0n,
-      });
+      yield* StakeExecutor.withdrawRewardAmount({ rewardAmount: 0n });
     }),
   },
   {
@@ -183,7 +201,7 @@ const cases: ParityCase[] = [
   {
     name: "compose mint and pay transactions",
     program: PayExecutor.mintAndPayTxCompose,
-    requiresScalusEvaluation: true,
+    requiresExplicitEvaluation: true,
   },
   {
     name: "verify message",
@@ -197,27 +215,34 @@ const cases: ParityCase[] = [
 
 describe("emulator evaluator parity", () => {
   test.each(cases)(
-    "$name has the same outcome with Aiken and Scalus evaluators",
-    async ({
-      program,
-      expectedOutcome,
-      requiresScalusEvaluation,
-      withHelloContract,
-    }) => {
-      const scalusEvaluations: EvaluationInput[] = [];
-      const aiken = await runCase(program, AikenEnvironment, withHelloContract);
-      const scalus = await runCase(
-        program,
-        makeScalusEnvironment(scalusEvaluations),
-        withHelloContract,
+    "$name has the same outcome with default and explicit Haskell evaluators",
+    async (scenario) => {
+      const { expectedOutcome, expectedError, requiresExplicitEvaluation } =
+        scenario;
+      const explicitEvaluations: EvaluationInput[] = [];
+      const defaultResult = await runCase(scenario, DefaultEnvironment);
+      const explicit = await runCase(
+        scenario,
+        makeExplicitEnvironment(explicitEvaluations),
       );
 
-      expect(scalus._tag).toBe(aiken._tag);
-      if (expectedOutcome) {
-        expect(aiken._tag).toBe(expectedOutcome);
+      expect(explicit._tag).toBe(defaultResult._tag);
+      expect(
+        defaultResult._tag,
+        defaultResult._tag === "Failure"
+          ? Cause.pretty(defaultResult.cause)
+          : undefined,
+      ).toBe(expectedOutcome ?? "Success");
+      if (expectedError) {
+        expect(
+          defaultResult._tag === "Failure" && Cause.pretty(defaultResult.cause),
+        ).toContain(expectedError);
+        expect(
+          explicit._tag === "Failure" && Cause.pretty(explicit.cause),
+        ).toContain(expectedError);
       }
-      if (requiresScalusEvaluation) {
-        expect(scalusEvaluations.length).toBeGreaterThan(0);
+      if (requiresExplicitEvaluation) {
+        expect(explicitEvaluations.length).toBeGreaterThan(0);
       }
     },
   );

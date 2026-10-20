@@ -13,11 +13,16 @@ import {
   UTxO,
   applyDoubleCborEncoding,
   fromText,
-  toScriptRef,
-  valueToAssets,
+  utxoToCore,
+  utxoToTransactionOutput,
   validatorToAddress,
 } from "../src/index.js";
-import { CML } from "../src/core.js";
+import {
+  inspectTransaction,
+  ledger,
+  type TransactionBodySnapshot,
+} from "@lucid-evolution/ledger";
+import { scChainContext } from "../src/sc-tools/context.js";
 import { Effect } from "effect";
 import { Assets } from "@lucid-evolution/core-types";
 import { alwaysSucceedV3Script } from "./fixtures/scripts.js";
@@ -31,10 +36,8 @@ const sumAssets = (left: Assets, right: Assets): Assets => {
   return result;
 };
 
-const outputHexes = (body: CML.TransactionBody): string[] =>
-  Array.from({ length: body.outputs().len() }, (_, index) =>
-    body.outputs().get(index).to_cbor_hex(),
-  );
+const outputHexes = (body: TransactionBodySnapshot): string[] =>
+  body.outputs.map(utxoToTransactionOutput);
 
 const submitTx = async (
   lucid: LucidEvolution,
@@ -75,25 +78,19 @@ test("setMinFee keeps change for token-bearing selected inputs", async () => {
   );
   const tx = signBuilder.toTransaction();
   let outputAssets: Assets = {};
-  const outputs = tx.body().outputs();
-  for (let index = 0; index < outputs.len(); index++) {
-    outputAssets = sumAssets(
-      outputAssets,
-      valueToAssets(outputs.get(index).amount()),
-    );
+  for (const output of tx.body.outputs) {
+    outputAssets = sumAssets(outputAssets, output.assets);
   }
 
   expect(outputAssets[unit]).toBe(2n);
-  expect(outputAssets.lovelace + tx.body().fee()).toBe(
-    tokenUtxo.assets.lovelace,
-  );
+  expect(outputAssets.lovelace + tx.body.fee).toBe(tokenUtxo.assets.lovelace);
 });
 
 const feeWithMinFee = async (
   lucid: LucidEvolution,
   walletInput: UTxO,
   minFee: bigint | undefined,
-): Promise<CML.TransactionBody> => {
+): Promise<TransactionBodySnapshot> => {
   const address = await lucid.wallet().address();
   const tx = lucid.newTx().pay.ToAddress(address, { lovelace: 10_000_000n });
   const signBuilder = await Effect.runPromise(
@@ -101,21 +98,20 @@ const feeWithMinFee = async (
       presetWalletInputs: [walletInput],
     }),
   );
-  return signBuilder.toTransaction().body();
+  return signBuilder.toTransaction().body;
 };
 
-const totalOutputAssets = (body: CML.TransactionBody): Assets => {
+const totalOutputAssets = (body: TransactionBodySnapshot): Assets => {
   let total: Assets = {};
-  const outputs = body.outputs();
-  for (let index = 0; index < outputs.len(); index++) {
-    total = sumAssets(total, valueToAssets(outputs.get(index).amount()));
+  for (const output of body.outputs) {
+    total = sumAssets(total, output.assets);
   }
   return total;
 };
 
 describe("setMinFee with a change output", () => {
   const unit = "0".repeat(56) + fromText("Change");
-  const walletInputs = {
+  const walletInputs: Record<string, Assets> = {
     "ADA-only change": { lovelace: 50_000_000n },
     "token-bearing change": { lovelace: 50_000_000n, [unit]: 7n },
   };
@@ -134,9 +130,8 @@ describe("setMinFee with a change output", () => {
         assets,
       };
 
-      const ledgerFee = (
-        await feeWithMinFee(lucid, walletInput, undefined)
-      ).fee();
+      const ledgerFee = (await feeWithMinFee(lucid, walletInput, undefined))
+        .fee;
       for (const minFee of [
         1n,
         ledgerFee - 1n,
@@ -148,9 +143,9 @@ describe("setMinFee with a change output", () => {
         const body = await feeWithMinFee(lucid, walletInput, minFee);
         const outputAssets = totalOutputAssets(body);
 
-        expect(body.fee()).toBe(minFee > ledgerFee ? minFee : ledgerFee);
-        expect(body.outputs().len()).toBe(2);
-        expect(outputAssets.lovelace + body.fee()).toBe(assets.lovelace);
+        expect(body.fee).toBe(minFee > ledgerFee ? minFee : ledgerFee);
+        expect(body.outputs.length).toBe(2);
+        expect(outputAssets.lovelace + body.fee).toBe(assets.lovelace);
         expect(outputAssets[unit]).toBe(assets[unit]);
       }
     },
@@ -175,7 +170,7 @@ describe("setMinFee with a change output", () => {
     const evaluator: EvaluatorAdapter = {
       name: "fee-recorder",
       evaluate: async ({ tx }) => {
-        evaluatedFees.push(CML.Transaction.from_cbor_hex(tx).body().fee());
+        evaluatedFees.push(inspectTransaction(tx).body.fee);
         return [
           {
             redeemer_tag: "spend",
@@ -191,10 +186,10 @@ describe("setMinFee with a change output", () => {
       .collectFrom([scriptUtxo], Data.void())
       .setMinFee(2_000_000n)
       .complete({ evaluator });
-    const body = signBuilder.toTransaction().body();
+    const body = signBuilder.toTransaction().body;
 
-    expect(body.fee()).toBe(2_000_000n);
-    expect(body.outputs().len()).toBe(1);
+    expect(body.fee).toBe(2_000_000n);
+    expect(body.outputs.length).toBe(1);
     expect(evaluatedFees.at(-1)).toBe(2_000_000n);
     await signBuilder.sign
       .withWallet()
@@ -234,28 +229,18 @@ test("selected reference-script inputs include the Conway reference-script fee",
   );
   const signedTx = await signBuilder.sign.withWallet().complete();
   const tx = signedTx.toTransaction();
-  const protocolParameters = lucid.config().protocolParameters;
-  const minimumFee = CML.min_fee(
-    tx,
-    CML.LinearFee.new(
-      BigInt(protocolParameters.minFeeA),
-      BigInt(protocolParameters.minFeeB),
-      BigInt(protocolParameters.minFeeRefScriptCostPerByte),
-    ),
-    CML.ExUnitPrices.new(
-      CML.SubCoin.new(
-        BigInt(protocolParameters.priceMem * 100_000_000),
-        100_000_000n,
-      ),
-      CML.SubCoin.new(
-        BigInt(protocolParameters.priceStep * 100_000_000),
-        100_000_000n,
-      ),
-    ),
-    BigInt(toScriptRef(scriptRef).to_cbor_bytes().length),
+  const chain = await scChainContext(
+    lucid.config() as import("../src/lucid-evolution/LucidEvolution.js").LucidConfig,
+  );
+  const minimumFee = BigInt(
+    ledger<string>("tx.minFee", {
+      cbor: tx.cbor,
+      protocolParameters: chain.protocolParameters,
+      utxos: [utxoToCore(scriptRefUtxo)],
+    }),
   );
 
-  expect(tx.body().fee()).toBeGreaterThanOrEqual(minimumFee);
+  expect(tx.body.fee).toBeGreaterThanOrEqual(minimumFee);
 });
 
 test("setMinFee is visible to phase-two script evaluation", async () => {
@@ -316,9 +301,9 @@ test("phase-two evaluation reruns when script fees change without new inputs", a
   const evaluator: EvaluatorAdapter = {
     name: "fee-recorder",
     evaluate: async ({ tx }) => {
-      const body = CML.Transaction.from_cbor_hex(tx).body();
+      const body = inspectTransaction(tx).body;
       evaluatedBodies.push({
-        fee: body.fee(),
+        fee: body.fee,
         outputs: outputHexes(body),
       });
       return [
@@ -337,10 +322,10 @@ test("phase-two evaluation reruns when script fees change without new inputs", a
     .collectFrom([scriptUtxos[0]], Data.void())
     .complete({ evaluator });
 
-  const finalBody = signBuilder.toTransaction().body();
+  const finalBody = signBuilder.toTransaction().body;
   const lastEvaluated = evaluatedBodies.at(-1)!;
   expect(evaluatedBodies.length).toBeGreaterThanOrEqual(2);
   expect(lastEvaluated.fee).toBeGreaterThan(evaluatedBodies[0].fee);
-  expect(finalBody.fee()).toBe(lastEvaluated.fee);
+  expect(finalBody.fee).toBe(lastEvaluated.fee);
   expect(outputHexes(finalBody)).toEqual(lastEvaluated.outputs);
 });

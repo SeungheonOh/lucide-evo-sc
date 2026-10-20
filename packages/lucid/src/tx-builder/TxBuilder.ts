@@ -1,4 +1,4 @@
-import { CML, makeReturn } from "../core.js";
+import { makeReturn } from "../core.js";
 import { LucidConfig } from "../lucid-evolution/LucidEvolution.js";
 import { OutputDatum } from "./types.js";
 import {
@@ -84,7 +84,16 @@ type GovernanceRedeemer = Redeemer | BuildTxWithRedeemer;
 
 export type TxBuilderConfig = {
   readonly lucidConfig: LucidConfig & { readonly slotConfig: SlotConfig };
-  readonly txBuilder: CML.TransactionBuilder;
+  blocks: Record<string, unknown>[];
+  metadata: Map<bigint, unknown>;
+  votes: Map<
+    string,
+    {
+      voter: unknown;
+      procedures: Map<string, unknown>;
+      witness?: Record<string, unknown>;
+    }
+  >;
   walletInputs: UTxO[];
   collectedInputs: UTxO[];
   readInputs: UTxO[];
@@ -102,10 +111,6 @@ export type TxBuilderConfig = {
   nextActionId: number;
   pendingRedeemers: PendingRedeemer[];
   witnessRegistry: Set<string>;
-  /** Accumulates one result because CML replaces voter maps across results. */
-  governanceVoteBuilder?: CML.VoteBuilder;
-  governanceVoteWitnessKeys: string[];
-  governanceProposalWitnessIndices: bigint[];
   governanceProposalCount: bigint;
   certificateIndex: bigint;
   treasuryDonation: Treasury.TreasuryDonation | undefined;
@@ -176,7 +181,9 @@ export const makeTxBuilderConfig = (
       ...(lucidConfig.slotConfig ?? SLOT_CONFIG_NETWORK[lucidConfig.network]),
     }),
   },
-  txBuilder: CML.TransactionBuilder.new(lucidConfig.txbuilderconfig),
+  blocks: [],
+  metadata: new Map(),
+  votes: new Map(),
   walletInputs: [],
   collectedInputs: [],
   readInputs: [],
@@ -191,9 +198,6 @@ export const makeTxBuilderConfig = (
   nextActionId: source?.nextActionId ?? 0,
   pendingRedeemers: [],
   witnessRegistry: new Set(),
-  governanceVoteBuilder: undefined,
-  governanceVoteWitnessKeys: [],
-  governanceProposalWitnessIndices: [],
   governanceProposalCount: 0n,
   certificateIndex: 0n,
   treasuryDonation: undefined,
@@ -613,11 +617,7 @@ const replayProposalWithDelayedRedeemer = (
 ) =>
   Effect.gen(function* () {
     const { config } = yield* TxConfig;
-    const govAction = yield* GovernanceAction.toCMLGovernanceAction(
-      proposal.action,
-      config,
-    );
-    const scriptHash = govAction.script_hash()?.to_hex();
+    const scriptHash = GovernanceAction.governancePolicyHash(proposal.action);
     if (!scriptHash) {
       yield* txActionError(
         "Delayed proposal redeemer requires a Plutus proposal witness",

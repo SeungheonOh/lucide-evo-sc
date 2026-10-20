@@ -208,7 +208,7 @@ describe("Emulator", () => {
   //NOTE: This test is failing because the ledger is not allowing withdrawing 0 rewards
   //TxSubmitError: Error: Withdrawal amount doesn't match actual reward balance.
   it.effect.fails(
-    "should successfully register, delegate, receive rewards, and withdraw 0 rewards",
+    "rejects a zero withdrawal while registered account rewards remain",
     () =>
       Effect.gen(function* () {
         yield* StakeExecutor.registerStake;

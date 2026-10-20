@@ -8,11 +8,9 @@ import {
 import * as TxBuilder from "../TxBuilder.js";
 import * as Effect from "effect/Effect";
 import { pipe } from "effect/Function";
-import * as CML from "@lucid-evolution/cml";
 import { ERROR_MESSAGE, TxBuilderError } from "../../Errors.js";
 import { validateAddressDetails } from "./TxUtils.js";
 import { TxConfig } from "./Service.js";
-import { withCMLScope } from "@lucid-evolution/core-utils";
 
 export const addSignerError = (cause: unknown) =>
   new TxBuilderError({ cause: `{ Signer: ${cause} }` });
@@ -51,9 +49,4 @@ export const addSignerKey = (keyHash: PaymentKeyHash | StakeKeyHash) =>
   Effect.gen(function* () {
     const { config } = yield* TxConfig;
     recordScBlock(config, { type: "signer", keyHash });
-    withCMLScope((own) =>
-      config.txBuilder.add_required_signer(
-        own(CML.Ed25519KeyHash.from_hex(keyHash)),
-      ),
-    );
   });

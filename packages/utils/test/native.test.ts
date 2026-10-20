@@ -1,7 +1,7 @@
-import { parseCMLNative } from "../src/native.js";
+import { parseNativeScriptJson } from "../src/native.js";
 import { test } from "vitest";
 
-test("test CML Native parsing", () => {
+test("parses native script JSON", () => {
   const script: unknown = {
     ScriptAny: {
       native_scripts: [
@@ -32,5 +32,5 @@ test("test CML Native parsing", () => {
       ],
     },
   };
-  const value = parseCMLNative(script);
+  const value = parseNativeScriptJson(script);
 });

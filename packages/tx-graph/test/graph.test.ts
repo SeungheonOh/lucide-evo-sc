@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
 import type { Provider, UTxO } from "@lucid-evolution/core-types";
-import { CML } from "../src/core.js";
+import { type TransactionSnapshot } from "@lucid-evolution/ledger";
+import {
+  transaction as makeTx,
+  inputList as makeInputList,
+} from "./ledger-fixtures.js";
 import { createTxGraph } from "../src/graph.js";
 import { tagByAddress, tagByUnit } from "../src/labels.js";
 import type { TraceOutRef } from "../src/model.js";
@@ -14,48 +18,7 @@ const ref = (byte: string, outputIndex: number): TraceOutRef => ({
   outputIndex,
 });
 
-const txHash = (tx: CML.Transaction): string =>
-  CML.hash_transaction(tx.body()).to_hex();
-
-const makeInput = (outRef: TraceOutRef): CML.TransactionInput =>
-  CML.TransactionInput.new(
-    CML.TransactionHash.from_hex(outRef.txHash),
-    BigInt(outRef.outputIndex),
-  );
-
-const makeInputList = (
-  outRefs: ReadonlyArray<TraceOutRef>,
-): CML.TransactionInputList => {
-  const inputs = CML.TransactionInputList.new();
-  for (const outRef of outRefs) {
-    inputs.add(makeInput(outRef));
-  }
-  return inputs;
-};
-
-const makeOutput = (lovelace: bigint): CML.TransactionOutput =>
-  CML.TransactionOutput.new(
-    CML.Address.from_bech32(address),
-    CML.Value.from_coin(lovelace),
-  );
-
-const makeTx = (
-  inputs: ReadonlyArray<TraceOutRef>,
-  outputs: ReadonlyArray<bigint>,
-  configure?: (body: CML.TransactionBody) => void,
-): CML.Transaction => {
-  const cmlOutputs = CML.TransactionOutputList.new();
-  for (const output of outputs) {
-    cmlOutputs.add(makeOutput(output));
-  }
-  const body = CML.TransactionBody.new(
-    makeInputList(inputs),
-    cmlOutputs,
-    170_000n,
-  );
-  configure?.(body);
-  return CML.Transaction.new(body, CML.TransactionWitnessSet.new(), true);
-};
+const txHash = (tx: TransactionSnapshot): string => tx.hash;
 
 const utxo = (outRef: TraceOutRef, lovelace: bigint): UTxO => ({
   ...outRef,
@@ -141,8 +104,8 @@ describe("createTxGraph", () => {
     const referenceRef = ref("33", 1);
     const collateralRef = ref("44", 2);
     const tx = makeTx([spendRef], [2_000_000n], (body) => {
-      body.set_reference_inputs(makeInputList([referenceRef]));
-      body.set_collateral_inputs(makeInputList([collateralRef]));
+      body.set(18n, makeInputList([referenceRef]));
+      body.set(13n, makeInputList([collateralRef]));
     });
     const graph = createTxGraph();
 
@@ -326,7 +289,7 @@ describe("createTxGraph", () => {
     const graph = createTxGraph();
     graph.resolveWith(async (outRefs) => [utxo(outRefs[0], 4_000_000n)]);
 
-    await graph.recordCbor(tx.to_cbor_hex(), {
+    await graph.recordCbor(tx.cbor, {
       status: "failed",
       failureMessage: "submit rejected",
     });

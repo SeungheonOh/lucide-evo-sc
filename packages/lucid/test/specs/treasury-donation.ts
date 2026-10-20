@@ -12,10 +12,10 @@ export const donateToTreasury = Effect.gen(function* () {
     .donateToTreasury(DONATION)
     .completeProgram();
 
-  const body = signBuilder.toTransaction().body();
-  const currentTreasuryValue = body.current_treasury_value();
+  const body = signBuilder.toTransaction().body;
+  const currentTreasuryValue = body.currentTreasury;
 
-  if (body.donation() !== DONATION) {
+  if (body.treasuryDonation !== DONATION) {
     return yield* Effect.fail(new Error("Unexpected treasury donation value"));
   }
 

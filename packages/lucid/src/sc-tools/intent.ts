@@ -1,48 +1,47 @@
-import type { Assets, Script, UTxO } from "@lucid-evolution/core-types";
-import { withCMLScope } from "@lucid-evolution/core-utils";
+import type {
+  Assets,
+  Credential,
+  Script,
+  UTxO,
+  TxOutput,
+} from "@lucid-evolution/core-types";
 import {
-  coreToTxOutput,
   paymentCredentialOf,
   applyDoubleCborEncoding,
   validatorToScriptHash,
 } from "@lucid-evolution/utils";
-import { CML } from "../core.js";
+import { encodeCbor, type CborValue } from "@lucid-evolution/ledger";
+import { fromHex } from "@lucid-evolution/core-utils";
 import { ERROR_MESSAGE } from "../Errors.js";
 import type { TxBuilderConfig } from "../tx-builder/TxBuilder.js";
 
 type Block = Record<string, unknown>;
 const witnessHashes = new WeakMap<Block, string>();
-const intents = new WeakMap<TxBuilderConfig, Block[]>();
-export const scBlocks = (config: TxBuilderConfig): Block[] =>
-  intents.get(config) ?? [];
-export function recordScBlock(config: TxBuilderConfig, block: Block): void {
-  if (!config.lucidConfig.balancer) return;
-  if (!intents.has(config)) intents.set(config, []);
-  intents.get(config)!.push(block);
-}
-export const scOutRef = (utxo: UTxO): string =>
+export const scBlocks = (config: TxBuilderConfig): Block[] => config.blocks;
+export const recordScBlock = (config: TxBuilderConfig, block: Block): void => {
+  config.blocks.push(block);
+};
+export const scOutRef = (utxo: Pick<UTxO, "txHash" | "outputIndex">): string =>
   `${utxo.txHash}#${utxo.outputIndex}`;
 export function recordScValidity(
   config: TxBuilderConfig,
   bound: "from" | "until",
   slot: number,
 ): void {
-  if (!config.lucidConfig.balancer) return;
-  let block = scBlocks(config).find((block) => block.type === "validity");
+  let block = config.blocks.find((b) => b.type === "validity");
   if (!block) {
     block = { type: "validity" };
-    recordScBlock(config, block);
+    config.blocks.push(block);
   }
   block[bound] = String(slot);
 }
-export function scScript(script: Script): Block {
-  return script.type === "Native"
+export const scScript = (script: Script): Block =>
+  script.type === "Native"
     ? { language: "Native", nativeScriptCbor: script.script }
     : {
         language: script.type,
         scriptCbor: applyDoubleCborEncoding(script.script),
       };
-}
 export function scWitness(
   config: TxBuilderConfig,
   hash: string,
@@ -64,7 +63,6 @@ export function recordScInput(
   utxo: UTxO,
   redeemer?: string,
 ): void {
-  if (!config.lucidConfig.balancer) return;
   const credential = paymentCredentialOf(utxo.address);
   recordScBlock(config, {
     type: "input",
@@ -77,29 +75,26 @@ export function recordScInput(
 }
 export function recordScOutput(
   config: TxBuilderConfig,
-  output: CML.TransactionOutput,
-  result: CML.SingleOutputBuilderResult,
+  output: TxOutput,
+  embedded?: string,
 ): void {
-  if (!config.lucidConfig.balancer) return;
-  withCMLScope((own) => {
-    const out = coreToTxOutput(output);
-    const communication = own(result.communication_datum());
-    recordScBlock(config, {
-      type: "output",
-      output: {
-        address: own(output.address()).to_hex(),
-        lovelace: String(out.assets.lovelace ?? 0n),
-        assets: scAssets(out.assets),
-        ...(communication
-          ? { datumMode: "embedded", datumCbor: communication.to_cbor_hex() }
-          : out.datumHash
-            ? { datumMode: "hash", datumHash: out.datumHash }
-            : out.datum
-              ? { datumMode: "inline", datumCbor: out.datum }
-              : {}),
-        ...(out.scriptRef ? { referenceScript: scScript(out.scriptRef) } : {}),
-      },
-    });
+  recordScBlock(config, {
+    type: "output",
+    output: {
+      address: output.address,
+      lovelace: String(output.assets.lovelace ?? 0n),
+      assets: scAssets(output.assets),
+      ...(embedded
+        ? { datumMode: "embedded", datumCbor: embedded }
+        : output.datumHash
+          ? { datumMode: "hash", datumHash: output.datumHash }
+          : output.datum
+            ? { datumMode: "inline", datumCbor: output.datum }
+            : {}),
+      ...(output.scriptRef
+        ? { referenceScript: scScript(output.scriptRef) }
+        : {}),
+    },
   });
 }
 export const scAssets = (assets: Assets) =>
@@ -115,9 +110,8 @@ export function recordScMint(
   assets: Assets,
   redeemer?: string,
 ): void {
-  if (!config.lucidConfig.balancer) return;
-  const tokens = scAssets(assets);
-  const policyId = tokens[0].policyId;
+  const tokens = scAssets(assets),
+    policyId = tokens[0].policyId;
   recordScBlock(config, {
     type: "mint",
     policyId,
@@ -125,107 +119,45 @@ export function recordScMint(
     witness: scWitness(config, policyId, redeemer),
   });
 }
-
-/** Record ledger certificate CBOR before handing the same value to CML. */
-export function scCertificateBuilder(
+export const credentialCbor = (credential: Credential): CborValue => [
+  credential.type === "Key" ? 0n : 1n,
+  fromHex(credential.hash),
+];
+export function recordCertificate(
   config: TxBuilderConfig,
-  redeemer: string | undefined,
-  certificate: CML.Certificate,
-): CML.SingleCertificateBuilder {
-  if (config.lucidConfig.balancer) {
-    // JSON is used only for credential hashes; amounts remain in the original CBOR.
-    const decoded = JSON.parse(certificate.to_json()) as Record<
-      string,
-      Record<string, { PubKey?: { hash: string }; Script?: { hash: string } }>
-    >;
-    const kind = Object.keys(decoded)[0];
-    const fields = decoded[kind];
-    const credential =
-      fields.stake_credential ??
-      fields.drep_credential ??
-      fields.committee_cold_credential;
-    const needsWitness = kind !== "StakeRegistration";
-    recordScBlock(config, {
-      type: "certificate",
-      kind: "raw",
-      cbor: certificate.to_cbor_hex(),
-      ...(credential && needsWitness
-        ? {
-            credential: credential.PubKey?.hash ?? credential.Script?.hash,
-            ...(credential.Script
-              ? { witness: scWitness(config, credential.Script.hash, redeemer) }
-              : {}),
-          }
-        : {}),
-    });
-  }
-  return CML.SingleCertificateBuilder.new(certificate);
-}
-
-const votes = new WeakMap<
-  TxBuilderConfig,
-  Map<string, { procedures: Map<string, string>; witness?: Block }>
->();
-const mapHeader = (size: number): string =>
-  size < 24
-    ? (0xa0 + size).toString(16)
-    : size < 256
-      ? "b8" + size.toString(16).padStart(2, "0")
-      : "b9" + size.toString(16).padStart(4, "0");
-export function recordScVote(
-  config: TxBuilderConfig,
-  voter: CML.Voter,
-  action: CML.GovActionId,
-  procedure: CML.VotingProcedure,
-  credential?: import("@lucid-evolution/core-types").Credential,
+  certificate: CborValue,
+  credential?: Credential,
   redeemer?: string,
+  needsWitness = true,
 ): void {
-  if (!config.lucidConfig.balancer) return;
-  if (!votes.has(config)) votes.set(config, new Map());
-  const entries = votes.get(config)!;
-  const key = voter.to_cbor_hex();
-  const entry = entries.get(key) ?? { procedures: new Map<string, string>() };
-  entry.procedures.set(action.to_cbor_hex(), procedure.to_cbor_hex());
-  if (credential?.type === "Script")
-    entry.witness = scWitness(config, credential.hash, redeemer);
-  entries.set(key, entry);
-  let block = scBlocks(config).find((b) => b.type === "vote");
-  if (!block) {
-    block = { type: "vote" };
-    recordScBlock(config, block);
-  }
-  block.cbor =
-    mapHeader(entries.size) +
-    [...entries]
-      .map(
-        ([voter, entry]) =>
-          voter +
-          mapHeader(entry.procedures.size) +
-          [...entry.procedures]
-            .map(([action, procedure]) => action + procedure)
-            .join(""),
-      )
-      .join("");
-  block.witnesses = [...entries]
-    .filter(([, e]) => e.witness)
-    .map(([voterCbor, e]) => ({ voterCbor, witness: e.witness }));
+  recordScBlock(config, {
+    type: "certificate",
+    kind: "raw",
+    cbor: encodeCbor(certificate),
+    ...(credential && needsWitness
+      ? {
+          credential: credential.hash,
+          ...(credential.type === "Script"
+            ? { witness: scWitness(config, credential.hash, redeemer) }
+            : {}),
+        }
+      : {}),
+  });
 }
-
 export function resolveScReferences(
   config: TxBuilderConfig,
   blocks: Block[],
 ): void {
   const refs = new Map(
-    config.readInputs
+    [...config.collectedInputs, ...config.readInputs]
       .filter((u) => u.scriptRef)
       .map((u) => [validatorToScriptHash(u.scriptRef!), scOutRef(u)]),
   );
   const resolve = (value: unknown): unknown => {
     if (!value || typeof value !== "object") return value;
-    const witness = value as Block;
-    const hash = witnessHashes.get(witness);
-    const reference = hash && refs.get(hash);
-    return reference ? { ...witness, reference } : value;
+    const hash = witnessHashes.get(value as Block),
+      reference = hash && refs.get(hash);
+    return reference ? { ...(value as Block), reference } : value;
   };
   for (const block of blocks) {
     if (block.witness) block.witness = resolve(block.witness);

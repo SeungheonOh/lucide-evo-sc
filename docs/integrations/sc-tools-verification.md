@@ -1,96 +1,126 @@
-# Verification of the sc-tools integration
+# Verification of the Haskell-only integration
 
-Verified locally on 2026-10-15. Both source checkouts remain separate:
+Verified locally on 2026-10-20. The source projects remain separate:
 
-- Lucid: `~/fun/lucid-revolution`, incorporating Lucid Evolution 0.8.1 at upstream
+- Lucid: `~/fun/lucid-revolution`, based on Lucid Evolution 0.8.1 at upstream
   commit `5394f993c22e12d090b06bbb1af3ad8d005c2b6f`.
-- WASM bridge: `~/fun/lucid-sctools-wasm`, commit
-  `bc65fb1b7a17d39810ecce1600c7c80fc0cbb60c`, published on the
+- Bridge: `~/fun/lucid-sctools-wasm`, commit
+  `d0cdc6bcd5a6981abb9f48678611dd34bbecad6f`, on the remote
   [`sc-tools-wasm` branch](https://github.com/SeungheonOh/lucide-evo-sc/tree/sc-tools-wasm).
-- Original `~/fun/sc-tools-wasm`: unchanged, clean working tree.
+- Original `~/fun/sc-tools-wasm`: unchanged, with a clean working tree.
+
+CML, its bundled Rust sources/binaries, and the Aiken/Scalus evaluator packages
+are removed. The package dependency graph and browser bundle contain no CML or
+alternative Cardano ledger engine. The only shipped WASM is the Haskell reactor.
 
 ## Results
 
-| Check                                                                 | Result                        |
-| --------------------------------------------------------------------- | ----------------------------- |
-| Upstream offline Lucid regressions, CML backend                       | 204 passed, 10 existing skips |
-| Upstream offline Lucid regressions, sc-tools and convex-mockchain     | 192 passed, 10 existing skips |
-| Dedicated bridge and actual-ledger simulator tests                    | 43 passed                     |
-| Unchanged upstream mutable-ledger fixture tests with convex-mockchain | 14 passed                     |
-| Provider capability regressions, including retained Maestro           | 13 passed                     |
-| UTxO conversion regressions, including hash-only datums               | 4 passed                      |
-| TypeScript source and new integration tests                           | Passed                        |
-| Lucid ESM, CommonJS, and declaration builds                           | Passed                        |
-| Built ESM package payment, signing, and ledger submission             | Passed                        |
-| Built CommonJS package WASM runtime                                   | Passed                        |
-| Existing browser workflow                                             | 24 checks passed              |
-| Browser v2 worker, offline after loading                              | 9 checks passed               |
-| Haskell/WASM dependency and executable build                          | Passed                        |
+| Check                                                                                      | Result                                                                          |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| Complete offline Lucid suite                                                               | 248 passed; 5 existing skips                                                    |
+| Ledger, Plutus, utilities, wallets, providers, message signing, transaction graphs         | 237 passed; 54 existing network-dependent skips                                 |
+| Recorded Plutus data corpus                                                                | 3,000 values in both encoding formats and 15,000 decoding outcomes passed       |
+| Generated canonical transaction cases                                                      | 3,000 passed                                                                    |
+| Consensus regressions for signing, native scripts, reference scripts and canonical exports | Passed through actual convex-mockchain submission                               |
+| Haskell reactor primitive/ledger checks                                                    | 139 passed                                                                      |
+| Haskell reactor in real Chromium main thread                                               | 61 passed                                                                       |
+| Built package, Node 18 and Node 24, ESM and CommonJS                                       | Passed payment, signing and actual ledger submission                            |
+| Built public package in real Chromium                                                      | Passed data, wallet, payment, signing, ledger submission and CIP-8 verification |
+| Source TypeScript, changed test types, formatting and frozen dependency install            | Passed                                                                          |
+| Package ESM/CommonJS/declarations and documentation builds                                 | Passed                                                                          |
 
-The SC suite excludes 12 tests in `completion-evaluation.test.ts` that instrument
-Aiken calls and CML draft/replay counts; they remain enabled in the CML suite.
-Dedicated SC tests verify the corresponding behavior using the actual ledger:
-fee-dependent final evaluation, delayed redeemers, explicit Aiken adapters, and
-byte evaluators. No failing test was changed into a skip.
+The documentation build retains a pre-existing ESLint/AJV dependency diagnostic;
+MDX compilation and all 33 static pages complete successfully. The workspace
+TypeScript lint command passes separately.
 
-The parity setup changes backend selection and emulator construction. Legacy
-reward fixtures use Conway protocol version 9 and seed their assumed pool.
-Dedicated tests check explicit protocol versions 9, 10, and 11, plus the omitted
-version fallback of 10, matching upstream Aiken. Withdrawals outside bootstrap
-Conway use explicit DRep delegation.
+The full suites ran on reactor `911f868149f119f750da233a40796e311c319a0eef7939664b1dbc11f6b9fb94`.
+The final reactor changes only independent signed-transaction minimum-fee
+inspection to avoid adding estimated witnesses twice. All `tx.minFee` consumers,
+custom-fee regressions, package smoke tests and artifact checks were rerun on the
+final artifact below. Transaction balancing's fee calculation is unchanged by
+that last correction.
 
-The tests cover payments and chaining, Byron destinations, native mint/burn,
-Plutus V1 hash datums, Plutus V2/V3, reference scripts, exact asset/data integers,
-metadata key types, validity intervals, ordinary providers without extra callbacks,
-provider switching, fractional slot mappings, wallet collateral, exact fees,
-dust, disabled coin selection, composition, canonical Plutus-data preservation,
-both delayed redeemer interfaces, staking deposits/refunds, DReps, proposals/votes,
-treasury donations, pool relays/metadata/margins, queued rewards and withdrawals,
-large change bundles, rejected scripts, failed submissions, and double spends.
+## Coverage
 
-Mutable-fixture tests cover ledger replacement, nested edits, shared records,
-query-returned object edits, property definitions, mempool/history, and churn.
-The actual ledger is synchronized before balancing, evaluation, rewards, or
-submission, while read-only queries preserve the original Emulator's behavior.
+Financial flows include payments, chaining, Byron destinations, native mint/burn,
+Plutus V1/V2/V3, reference scripts, inline/hash/supplemental datums, metadata,
+validity intervals, exact integers, multi-asset change, collateral, fee overrides,
+disabled coin selection, both delayed redeemer APIs, and external/provider
+evaluation. Staking and governance cases cover deposits/refunds, pools and relays,
+reward withdrawals, DReps, proposals, votes, committee certificates and treasury
+donations. The emulator validates signatures, rejects double spends and invalid
+scripts, preserves state after rejected submissions, and synchronizes mutable
+JavaScript fixtures with the actual Haskell ledger.
 
-Shared Lucid fixes cover ledger voter ordering, governance datum handling, vote
-signing keys, signed redeemer encoding, pool margins/relays/metadata, and datum
-hashes on UTxOs whose datum has not been fetched. Both CML and SC transactions
-spending Plutus V1 hash-datum outputs were accepted by convex-mockchain.
+The recorded data/address/script/DRep/wallet/message vectors come from the prior
+implementation and fixed expected results. Tests do not regenerate expected
+values using the implementation under test. The data corpus includes malformed
+CBOR, large integers, ordered maps, duplicate keys, chunked bytes, constructor
+tags and trailing bytes. Legacy `Data.from` tolerances are isolated from strict
+transaction/ledger decoding.
 
-The browser v2 test verifies capabilities, genesis creation, automatic Lucid
-context, public fixtures, balancing, signing, ledger submission, duplicate-spend
-rejection, and persisted state. Both browser suites run offline after loading;
-the legacy suite fetches public protocol parameters before going offline. No
-test submits to a public chain.
+Canonical export and witness merging preserve bytes already committed by script,
+metadata and integrity hashes. Native reference scripts keep their original
+bytes through output encoding, balancing, fee calculation, simulation and
+queries. Tests submit both witness and reference-script transactions to the real
+ledger and check that native minimum ADA charges the actual serialized size.
 
-## Rebuilt artifact
+The default emulator retains its original implicit protocol version 11.
+Generic providers that omit a version use 10. Explicit versions and provider
+chain state are honored, including when using an explicit Haskell evaluator.
+Legacy bootstrap reward scenarios explicitly use version 9 and seed their pool.
 
-- WASM: `~/.cache/lucid-sctools-wasm/output/sc-tools.wasm`
-- Browser assets: `~/.cache/lucid-sctools-wasm/output/browser/`
+Tests tied solely to deleted CML/Aiken internals were replaced with Haskell or
+actual-ledger assertions; obsolete private cache/placeholder tests were removed.
+No failing financial test was converted into a skip. Network-dependent suites
+are excluded from the offline Lucid command or retain their existing skips.
+
+## Reproduction
+
+```sh
+pnpm install --frozen-lockfile
+pnpm --filter '@lucid-evolution/lucid...' build
+pnpm check:haskell
+pnpm test:offline
+pnpm --filter @lucid-evolution/ledger --filter @lucid-evolution/plutus \
+  --filter @lucid-evolution/utils --filter @lucid-evolution/wallet \
+  --filter @lucid-evolution/provider --filter @lucid-evolution/sign_data \
+  --filter @lucid-evolution/tx-graph -r --workspace-concurrency=1 \
+  exec vitest run --minWorkers 1 --maxWorkers 1
+pnpm test:package
+pnpm exec playwright-core install chromium
+pnpm test:browser
+pnpm lint
+pnpm format-check
+```
+
+The package includes the reactor and third-party notices. Its exact compiler,
+source revision and checksum are recorded in
+[`packages/ledger/artifact.json`](../../packages/ledger/artifact.json):
+
 - Compiler: `wasm32-wasi-ghc 9.12.4.20260731`
-- sc-tools source: `4546122230491db4839a4a42fc2bc601f7900909`
-- Bridge version: 2
-- WASM bytes: 64,099,882
-- Compressed bytes: 10,421,135
-- WASM SHA-256: `ef51162b41bc18a6a91fa8796a543f3bfa276baa429a68a45d350340253fde3a`
-- Gzip SHA-256: `eb5a8d029a706299ba10259434b736296ff2a2cffed19faab20a8ad2105e0e99`
+- sc-tools revision: `4546122230491db4839a4a42fc2bc601f7900909`
+- Reactor ABI version: 1
+- WASM size: 63,668,118 bytes
+- SHA-256: `a25796a197fcc9419d8e12b50fc0f427dce617e2d2520a3a90edcad204608c72`
 
-The browser directory includes its runtime manifest and collected third-party
-notices. Generated dependencies and binaries stay outside the source repositories.
-See [setup and reproduction commands](sc-tools.md) and the bridge project's
-`wasm/LUCID-BRIDGE.md` for the request schema and browser test commands.
+See [the runtime and migration guide](sc-tools.md) for browser asset deployment,
+bridge rebuilding and artifact vendoring. The bridge's `wasm/LUCID-BRIDGE.md`
+documents its JSON operations and standalone regression commands.
 
-## Scope
+## Limits
 
-These results verify the covered public contracts against the merged upstream
-baseline; they do not establish exhaustive parity for every transaction or error.
-Coin choices and conservative fees can differ between balancers. The simulator
-uses real Conway transaction validation, which rejects invalid transactions the
-JavaScript Emulator may accept. Neither simulator implements node epoch processing,
-automatic epoch rewards, or governance ratification.
+These checks establish the covered contracts, not exhaustive equivalence for
+every transaction, byte representation or error message. Coin choices and
+conservative fees can differ from the former balancer. Direct CML object APIs
+are replaced by CBOR or plain snapshots; the migration guide lists those changes.
 
-Ordinary providers work through the unchanged Provider interface using Lucid's
-protocol parameters and slot mapping. Applications can supply a full node context
-when they need historical pool/deposit state. Live-network submission, node epoch
-processing, and external provider credentials were not exercised.
+Real Conway validation rejects invalid fixtures that the former JavaScript
+emulator accepted. Pool registration, reward registration, full-balance
+withdrawals and post-bootstrap vote delegation must satisfy ledger rules.
+Neither simulator implements node epoch processing, automatic epoch rewards or
+governance ratification. Applications need a full chain context for historical
+deposits that differ from current protocol parameters.
+
+No verification transaction was submitted to a public chain. Live credentials,
+wallet browser extensions and public-network submission were not exercised.

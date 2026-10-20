@@ -137,10 +137,8 @@ lucid.overrideUTxOs(newWalletUTxOs2);
     // Update wallet state
     lucid.overrideUTxOs(newWalletUTxOs);
     
-    // Free resources to manage memory
-    txBuilder.rawConfig().txBuilder.free();
-    txSignBuilder.toTransaction().free();
-    signedTx.toTransaction().free();
+    // Snapshots and builders are ordinary JavaScript values. The Haskell
+    // runtime releases request buffers automatically.
     ```
   </Tabs.Tab>
 </Tabs>
@@ -153,10 +151,4 @@ lucid.overrideUTxOs(newWalletUTxOs2);
 
 3. If one transaction fails to confirm on-chain, all subsequent transactions that depend on its outputs will also fail.
 
-4. In memory-intensive applications, free resources after use:
-
-   ```typescript
-   txBuilder.rawConfig().txBuilder.free();
-   txSignBuilder.toTransaction().free();
-   signedTx.toTransaction().free();
-   ```
+4. Builders and transaction snapshots do not require manual freeing. Drop references when they are no longer needed; the Haskell runtime owns and releases its request buffers.

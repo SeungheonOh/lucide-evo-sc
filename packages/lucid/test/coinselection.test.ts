@@ -1,192 +1,117 @@
-import { Assets, UTxO } from "@lucid-evolution/core-types";
-import { assert, describe, expect, it, test } from "vitest";
-import { recursive } from "../src/tx-builder/internal/CompleteTxBuilder.js";
-import { sortUTxOs } from "@lucid-evolution/utils";
-import { createHash } from "node:crypto";
-import { Effect } from "effect";
+import { describe, expect, test } from "vitest";
+import {
+  Emulator,
+  generateEmulatorAccount,
+  Lucid,
+  type Assets,
+} from "../src/index.js";
 
-const sha256 = (input: string) =>
-  createHash("sha256").update(input).digest("hex");
-
-const createDummyUTxO = (
-  index: number,
-  lovelaceAmount: bigint,
-  numAssets: number,
-): UTxO => ({
-  txHash: sha256(index.toString()),
-  outputIndex: index,
-  assets: createDummyAssets(lovelaceAmount, numAssets),
-  datumHash: undefined,
-  datum: undefined,
-  scriptRef: undefined,
-  address: `addr_test${sha256(index.toString())}`,
+const assets = (lovelace: bigint, count: number): Assets => ({
+  lovelace,
+  ...Object.fromEntries(
+    Array.from({ length: count }, (_, i) => [
+      "ab".repeat(28) + i.toString(16).padStart(64, "0"),
+      BigInt(i + 1),
+    ]),
+  ),
 });
+const sum = (values: Assets[]): Assets =>
+  values.reduce<Assets>((total, value) => {
+    for (const [unit, amount] of Object.entries(value))
+      total[unit] = (total[unit] ?? 0n) + amount;
+    return total;
+  }, {});
 
-const createDummyAssets = (lovelaceAmount: bigint, numAssets: number) => {
-  const assets: Assets = {
-    lovelace: lovelaceAmount,
-  };
-  for (let i = 0; i < numAssets; i++) {
-    const assetId = sha256(i.toString());
-    const amount = BigInt(i);
-    assets[assetId] = amount;
-  }
-  return assets;
-};
+// Exercise the public balancer with the upstream wallet shapes. Input order is
+// an implementation choice; funds, token change, fees and ledger acceptance are
+// the contract. Genesis fixtures may contain outputs below minimum ADA.
+describe("Haskell coin selection", () => {
+  test.each([
+    {
+      name: "one adequately funded input",
+      inputs: [
+        assets(5_000_000n, 0),
+        assets(9_798_383n, 0),
+        assets(3_662_726n, 7),
+      ],
+      payment: 5_000_000n,
+    },
+    {
+      name: "multiple inputs with token change",
+      inputs: [
+        assets(798_383n, 0),
+        assets(5_000_000n, 1),
+        assets(3_662_726n, 7),
+      ],
+      payment: 5_900_000n,
+    },
+    {
+      name: "small inputs needed for minimum change",
+      inputs: [assets(798_383n, 0), assets(5_000_000n, 0), assets(466_272n, 0)],
+      payment: 4_800_000n,
+    },
+    {
+      name: "token-rich wallet needs extra ADA",
+      inputs: [
+        assets(798_383n, 5),
+        assets(5_000_000n, 40),
+        assets(466_272n, 7),
+        ...Array.from({ length: 6 }, () => assets(1_000_000n, 0)),
+        assets(905_327n, 0),
+        assets(781_143n, 0),
+      ],
+      payment: 5_200_000n,
+    },
+    {
+      name: "fee-only consolidation",
+      inputs: [assets(798_383n, 0), assets(100_000n, 0), assets(466_272n, 0)],
+      payment: 0n,
+    },
+  ])("preserves every asset: $name", async ({ inputs, payment }) => {
+    const account = generateEmulatorAccount({ lovelace: 0n });
+    const recipient = generateEmulatorAccount({ lovelace: 0n });
+    const emulator = new Emulator(
+      inputs.map((assets) => ({ ...account, assets })),
+    );
+    const lucid = await Lucid(emulator, "Custom");
+    lucid.selectWallet.fromSeed(account.seedPhrase);
+    const builder = lucid.newTx();
+    if (payment)
+      builder.pay.ToAddress(recipient.address, { lovelace: payment });
+    const unsigned = await builder.complete();
+    const signed = await unsigned.sign.withWallet().complete();
+    expect(await signed.submit()).toBe(signed.toHash());
+    emulator.awaitBlock();
+    const receiver = await emulator.getUtxos(recipient.address);
+    expect(sum(receiver.map((utxo) => utxo.assets)).lovelace ?? 0n).toBe(
+      payment,
+    );
+    const after = sum(
+      [...(await emulator.getUtxos(account.address)), ...receiver].map(
+        (utxo) => utxo.assets,
+      ),
+    );
+    after.lovelace += unsigned.toTransaction().body.fee;
+    expect(after).toEqual(sum(inputs));
+  });
 
-describe("coinSelection", () => {
-  it("should select largest first , input index_1(9_798_383n) ", async () => {
-    const inputs: UTxO[] = [
-      createDummyUTxO(0, 5_000_000n, 0),
-      createDummyUTxO(1, 9_798_383n, 0),
-      createDummyUTxO(2, 3_662_726n, 7),
+  test("rejects insufficient ADA for payment, fees and token change", async () => {
+    const account = generateEmulatorAccount({ lovelace: 0n });
+    const inputs = [
+      assets(798_383n, 5),
+      assets(5_000_000n, 40),
+      assets(466_272n, 7),
     ];
-    const program = recursive(
-      sortUTxOs(inputs),
-      { lovelace: 5_000_000n },
-      4310n,
+    const emulator = new Emulator(
+      inputs.map((assets) => ({ ...account, assets })),
     );
-    const exit = await Effect.runPromiseExit(program);
-    // TODO: try using only one exepect
-    expect(exit._tag).toBe("Success");
-    if (exit._tag == "Success")
-      expect(exit.value).toStrictEqual({
-        selected: [inputs[1]],
-        burnable: { lovelace: 0n },
-      });
-  });
-  it("should select largest first, and input index_1(5_000_000n), index_2(3_662_726n)", async () => {
-    // console.log(selected);
-    const inputs: UTxO[] = [
-      createDummyUTxO(0, 798_383n, 0),
-      createDummyUTxO(1, 5_000_000n, 1),
-      createDummyUTxO(2, 3_662_726n, 7),
-    ];
-    const program = recursive(
-      sortUTxOs(inputs),
-      { lovelace: 5_900_000n },
-      4310n,
-    );
-    const exit = await Effect.runPromiseExit(program);
-    // TODO: try using only one expect
-    expect(exit._tag).toBe("Success");
-    if (exit._tag == "Success")
-      expect(exit.value).toStrictEqual({
-        selected: [inputs[1], inputs[2]],
-        burnable: { lovelace: 0n },
-      });
-  });
-
-  it("should select largest first, and input index 1, 0, 2", async () => {
-    const inputs: UTxO[] = [
-      createDummyUTxO(0, 798_383n, 0),
-      createDummyUTxO(1, 5_000_000n, 0),
-      createDummyUTxO(2, 466_272n, 0),
-    ];
-    const program = recursive(
-      sortUTxOs(inputs),
-      { lovelace: 5_200_000n },
-      4310n,
-    );
-    const exit = await Effect.runPromiseExit(program);
-    // TODO: try using only one expect
-    expect(exit._tag).toStrictEqual("Success");
-    if (exit._tag == "Success")
-      expect(exit.value).toStrictEqual({
-        selected: [inputs[1], inputs[0], inputs[2]],
-        burnable: { lovelace: 0n },
-      });
-  });
-  it("should select none", async () => {
-    const inputs: UTxO[] = [
-      createDummyUTxO(0, 798_383n, 5),
-      createDummyUTxO(1, 5_000_000n, 40),
-      createDummyUTxO(2, 466_272n, 7),
-    ];
-    const program = recursive(
-      sortUTxOs(inputs),
-      { lovelace: 5_200_000n },
-      4310n,
-    );
-    const exit = await Effect.runPromiseExit(program);
-    expect(exit._tag).toStrictEqual("Failure");
-  });
-  it("should select all", async () => {
-    const inputs: UTxO[] = [
-      createDummyUTxO(0, 798_383n, 5),
-      createDummyUTxO(1, 5_000_000n, 40),
-      createDummyUTxO(2, 466_272n, 7),
-      createDummyUTxO(3, 1_000_000n, 0),
-      createDummyUTxO(4, 1_000_000n, 0),
-      createDummyUTxO(5, 1_000_000n, 0),
-      createDummyUTxO(6, 1_000_000n, 0),
-      createDummyUTxO(7, 1_000_000n, 0),
-      createDummyUTxO(8, 1_000_000n, 0),
-      createDummyUTxO(9, 905327n, 0),
-      createDummyUTxO(10, 781143n, 0),
-    ];
-    const program = recursive(
-      sortUTxOs(inputs),
-      { lovelace: 5_200_000n },
-      4310n,
-    );
-    const expectedSelection = [
-      inputs[1],
-      inputs[3],
-      inputs[4],
-      inputs[5],
-      inputs[6],
-      inputs[7],
-      inputs[8],
-      inputs[9],
-      inputs[0],
-    ];
-
-    const exit = await Effect.runPromiseExit(program);
-    // TODO: try using only one exepect
-    expect(exit._tag).toBe("Success");
-    if (exit._tag == "Success")
-      expect(exit.value).toStrictEqual({
-        selected: expectedSelection,
-        burnable: { lovelace: 0n },
-      });
-  });
-  it("should select largest first, and input index 0, 2", async () => {
-    const inputs: UTxO[] = [
-      createDummyUTxO(0, 798_383n, 0),
-      createDummyUTxO(1, 100_000n, 0),
-      createDummyUTxO(2, 466_272n, 0),
-    ];
-    const program = recursive(sortUTxOs(inputs), {}, 4310n, {
-      lovelace: 5_000n,
-    });
-    const exit = await Effect.runPromiseExit(program);
-    // TODO: try using only one expect
-    expect(exit._tag).toStrictEqual("Success");
-    if (exit._tag == "Success")
-      expect(exit.value).toStrictEqual({
-        selected: [inputs[0], inputs[2]],
-        burnable: { lovelace: 0n },
-      });
+    const lucid = await Lucid(emulator, "Custom");
+    lucid.selectWallet.fromSeed(account.seedPhrase);
+    await expect(
+      lucid
+        .newTx()
+        .pay.ToAddress(account.address, { lovelace: 5_200_000n })
+        .complete(),
+    ).rejects.toThrow();
   });
 });
-
-// const inputs: UTxO[] = [
-//   createDummyUTxO(0, 798383n, 5),
-//   createDummyUTxO(1, 5000000n, 40),
-//   createDummyUTxO(2, 466272n, 7),
-// ];
-// const selected = recursive(
-//   sortUTxOs(inputs),
-//   { lovelace: 5_200_000n },
-//   { lovelace: 100_000n },
-//   [],
-//   4310n
-// );
-
-// const inputs: UTxO[] = [
-//   createDummyUTxO(0, 798383n, 0),
-//   createDummyUTxO(1, 5000000n, 1),
-//   createDummyUTxO(2, 466272n, 7),
-// ];
-// const selected = recursive(sortUTxOs(inputs), { lovelace: 5_200_000n }, 4310n);

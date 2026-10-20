@@ -1,7 +1,8 @@
 import { describe, expect, test } from "vitest";
 import type { TxGraphTrace } from "../src/model.js";
 import { createTxGraph } from "../src/graph.js";
-import { CML } from "../src/core.js";
+import { ledger } from "@lucid-evolution/ledger";
+import { transaction } from "./ledger-fixtures.js";
 import {
   buildSemanticRenderGraph,
   describeRedeemerByConstructor,
@@ -26,12 +27,11 @@ const signer = "66".repeat(28);
 const rewardAddress =
   "stake_test1urqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg28d0";
 
-const constrData = (constructor: number): string => {
-  const fields = CML.PlutusDataList.new();
-  return CML.PlutusData.new_constr_plutus_data(
-    CML.ConstrPlutusData.new(BigInt(constructor), fields),
-  ).to_canonical_cbor_hex();
-};
+const constrData = (constructor: number): string =>
+  ledger<string>("data.encode", {
+    data: { constructor, fields: [] },
+    canonical: true,
+  });
 
 const trace: TxGraphTrace = {
   version: 1,
@@ -368,15 +368,7 @@ describe("buildSemanticRenderGraph", () => {
 
   test("is available from graph instances", async () => {
     const graph = createTxGraph();
-    const tx = CML.Transaction.new(
-      CML.TransactionBody.new(
-        CML.TransactionInputList.new(),
-        CML.TransactionOutputList.new(),
-        170_000n,
-      ),
-      CML.TransactionWitnessSet.new(),
-      true,
-    );
+    const tx = transaction([], []);
     await graph.record(tx, {
       label: "empty placeholder",
     });

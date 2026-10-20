@@ -1,8 +1,10 @@
-import { CML, makeReturn } from "../core.js";
-import { withCMLScope } from "@lucid-evolution/core-utils";
-import { LucidConfig } from "../lucid-evolution/LucidEvolution.js";
+import { makeReturn } from "../core.js";
+import {
+  inspectTransaction,
+  transactionJson,
+  type TransactionSnapshot,
+} from "@lucid-evolution/ledger";
 import * as Effect from "effect/Effect";
-import * as S from "@effect/schema/Schema";
 //TODO: move to commont utils
 import {
   PrivateKey,
@@ -27,8 +29,8 @@ import {
 } from "../script-context/index.js";
 
 export interface TxSignBuilderConfig {
-  txComplete: CML.Transaction;
-  witnessSetBuilder: CML.TransactionWitnessSetBuilder;
+  txComplete: TransactionSnapshot;
+  witnessSets: string[];
   programs: Effect.Effect<void, TransactionSignError, never>[];
   wallet: Wallet | undefined;
   fee: number;
@@ -74,7 +76,9 @@ export interface TxSignBuilder {
    *
    * Supports both canonical and non-canonical formats.
    *
-   * Canonical format follows [RFC 7049 Section 3.9](https://datatracker.ietf.org/doc/html/rfc7049#section-3.9) rules
+   * Canonical export normalizes uncommitted CBOR while preserving hashed payloads.
+   * Transactions with existing signatures retain their original bytes. To produce
+   * a canonical body, use `.complete({ canonical: true })` before signing.
    *
    * Non-canonical format example:
    * ```typescript
@@ -86,7 +90,7 @@ export interface TxSignBuilder {
    * ```
    */
   toCBOR: (options?: { canonical: boolean }) => CBORHex;
-  toTransaction: () => CML.Transaction;
+  toTransaction: () => TransactionSnapshot;
   /** Builds the Plutus V3 ScriptContext for one script purpose in this transaction. */
   toScriptContext: (
     purpose: ScriptPurposeData,
@@ -107,47 +111,29 @@ export interface TxSignBuilder {
 
 export const makeTxSignBuilder = (
   wallet: Wallet | undefined,
-  tx: CML.Transaction,
+  transaction: TransactionSnapshot | string,
   options: {
     resolvedInputs?: ReadonlyArray<UTxO>;
     slotConfig?: SlotConfig;
   } = {},
 ): TxSignBuilder => {
-  const exUnits = withCMLScope((own) => {
-    const totals = { cpu: 0, mem: 0 };
-    const add = (units: CML.ExUnits) => {
-      own(units);
-      totals.cpu += parseInt(units.steps().toString());
-      totals.mem += parseInt(units.mem().toString());
-    };
-    const redeemers = own(own(tx.witness_set()).redeemers());
-    if (redeemers) {
-      const arrLegacyRedeemer = own(redeemers.as_arr_legacy_redeemer());
-      if (arrLegacyRedeemer) {
-        for (let i = 0; i < arrLegacyRedeemer.len(); i++) {
-          add(own(arrLegacyRedeemer.get(i)).ex_units());
-        }
-      }
-      const mapRedeemerKeyToRedeemerVal = own(
-        redeemers.as_map_redeemer_key_to_redeemer_val(),
-      );
-      if (mapRedeemerKeyToRedeemerVal) {
-        const keys = own(mapRedeemerKeyToRedeemerVal.keys());
-        for (let i = 0; i < (keys.len() || 0); i++) {
-          const key = own(keys.get(i));
-          const value = own(mapRedeemerKeyToRedeemerVal.get(key));
-          add(value!.ex_units());
-        }
-      }
-    }
-    return totals;
-  });
+  const tx =
+    typeof transaction === "string"
+      ? inspectTransaction(transaction)
+      : transaction;
+  const exUnits = tx.redeemers.reduce(
+    (total, redeemer) => ({
+      cpu: total.cpu + Number(redeemer.exUnits.steps),
+      mem: total.mem + Number(redeemer.exUnits.mem),
+    }),
+    { cpu: 0, mem: 0 },
+  );
   const config: TxSignBuilderConfig = {
     txComplete: tx,
-    witnessSetBuilder: CML.TransactionWitnessSetBuilder.new(),
+    witnessSets: [],
     programs: [],
     wallet: wallet,
-    fee: withCMLScope((own) => parseInt(own(tx.body()).fee().toString())),
+    fee: Number(tx.body.fee),
     exUnits: exUnits,
     resolvedInputs: options.resolvedInputs ?? [],
     slotConfig: options.slotConfig,
@@ -193,7 +179,7 @@ export const makeTxSignBuilder = (
     toCBOR: (options = { canonical: false }) =>
       options.canonical
         ? canonicalTransactionHex(config.txComplete)
-        : config.txComplete.to_cbor_hex(),
+        : config.txComplete.cbor,
     toTransaction: () => config.txComplete,
     toScriptContext: (purpose, options) =>
       makeScriptContext(
@@ -203,12 +189,8 @@ export const makeTxSignBuilder = (
       ),
     toScriptContexts: (options) =>
       makeScriptContexts(config.txComplete, scriptContextOptions(options)),
-    toJSON: () =>
-      S.decodeUnknownSync(S.parseJson(S.Object))(config.txComplete.to_json()),
-    toHash: () =>
-      withCMLScope((own) =>
-        own(CML.hash_transaction(own(config.txComplete.body()))).to_hex(),
-      ),
+    toJSON: () => transactionJson(config.txComplete),
+    toHash: () => config.txComplete.hash,
     complete: () =>
       makeReturn(CompleteTxSigner.completeTxSigner(config)).unsafeRun(),
     completeProgram: () => CompleteTxSigner.completeTxSigner(config),

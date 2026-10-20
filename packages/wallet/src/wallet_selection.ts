@@ -1,7 +1,6 @@
-import {
+import type {
   Address,
   Delegation,
-  KeyHash,
   Network,
   Payload,
   PrivateKey,
@@ -10,81 +9,78 @@ import {
   SignedMessage,
   Transaction,
   TxHash,
-  TransactionSignatureRequest,
   UTxO,
   Wallet,
   WalletApi,
 } from "@lucid-evolution/core-types";
-import { fromHex, toHex, withCMLScope } from "@lucid-evolution/core-utils";
+import { ledger, decodeCbor, encodeCbor } from "@lucid-evolution/ledger";
 import {
   coreToUtxo,
+  credentialToAddress,
   credentialToRewardAddress,
   getAddressDetails,
   isEqualUTxO,
   utxoToCore,
 } from "@lucid-evolution/utils";
-import { CML } from "./core.js";
 import { signData } from "@lucid-evolution/sign_data";
 import { discoverOwnUsedTxKeyHashes, walletFromSeed } from "./wallet.js";
 
-type Config = {
-  overriddenUTxOs: UTxO[] | undefined;
-};
-
-const signTxsSequentially = async (
-  txs: CML.Transaction[],
-  signTx: (tx: CML.Transaction) => Promise<CML.TransactionWitnessSet>,
-): Promise<CML.TransactionWitnessSet[]> => {
-  const witnessSets: CML.TransactionWitnessSet[] = [];
-  for (const tx of txs) {
-    witnessSets.push(await signTx(tx));
-  }
-  return witnessSets;
-};
-
 const submitTxsSequentially = async (
   txs: Transaction[],
-  submitTx: (tx: Transaction) => Promise<TxHash>,
+  submit: (tx: Transaction) => Promise<TxHash>,
 ): Promise<TxHash[]> => {
-  const results: Array<TxHash | unknown> = [];
-  let hasFailure = false;
+  const results: unknown[] = [];
+  let failed = false;
   for (const tx of txs) {
     try {
-      results.push(await submitTx(tx));
+      results.push(await submit(tx));
     } catch (error) {
       results.push(error);
-      hasFailure = true;
+      failed = true;
     }
   }
-  if (hasFailure) {
-    throw results;
-  }
+  if (failed) throw results;
   return results as TxHash[];
 };
 
-const decodeWitnessSets = (
-  witnessSets: string[],
-  expectedLength: number,
-): CML.TransactionWitnessSet[] => {
-  if (witnessSets.length !== expectedLength) {
-    throw new Error("Wallet returned an unexpected number of witness sets.");
-  }
-  return witnessSets.map((witnessSet) =>
-    CML.TransactionWitnessSet.from_cbor_hex(witnessSet),
-  );
+const mapSequentially = async <A, B>(
+  values: A[],
+  f: (value: A) => Promise<B>,
+): Promise<B[]> => {
+  const result: B[] = [];
+  for (const value of values) result.push(await f(value));
+  return result;
 };
 
-const validateTxHashes = (
-  txHashes: TxHash[],
-  expectedLength: number,
-): TxHash[] => {
-  if (txHashes.length !== expectedLength) {
-    throw new Error(
-      "Wallet returned an unexpected number of transaction hashes.",
-    );
-  }
-  return txHashes;
-};
+function walletState(
+  provider: Provider,
+  address: Address,
+  rewardAddress: RewardAddress | null,
+  initial?: UTxO[],
+) {
+  let override = initial;
+  const getUtxos = async () =>
+    override === undefined ? provider.getUtxos(address) : override;
+  return {
+    overrideUTxOs: (utxos: UTxO[]) => {
+      override = utxos;
+    },
+    clearUTxOOverride: () => {
+      override = undefined;
+    },
+    address: async () => address,
+    rewardAddress: async () => rewardAddress,
+    getUtxos,
+    getUtxosCore: async () => (await getUtxos()).map(utxoToCore),
+    getDelegation: async (): Promise<Delegation> =>
+      rewardAddress
+        ? provider.getDelegation(rewardAddress)
+        : { poolId: null, rewards: 0n },
+    submitTx: (tx: Transaction) => provider.submitTx(tx),
+    submitTxs: (txs: Transaction[]) =>
+      submitTxsSequentially(txs, (tx) => provider.submitTx(tx)),
+  };
+}
 
 export const makeWalletFromSeed = (
   provider: Provider,
@@ -96,192 +92,67 @@ export const makeWalletFromSeed = (
     password?: string;
   },
 ): Wallet => {
-  const config: Config = {
-    overriddenUTxOs: undefined,
-  };
-
   const { address, rewardAddress, paymentKey, stakeKey } = walletFromSeed(
     seed,
-    {
-      addressType: options?.addressType || "Base",
-      accountIndex: options?.accountIndex || 0,
-      password: options?.password,
-      network: network,
-    },
+    { ...options, network },
   );
-  const paymentKeyHash = CML.PrivateKey.from_bech32(paymentKey)
-    .to_public()
-    .hash()
-    .to_hex();
-  const stakeKeyHash = stakeKey
-    ? CML.PrivateKey.from_bech32(stakeKey).to_public().hash().to_hex()
-    : "";
-
-  const privKeyHashMap = {
-    [paymentKeyHash]: paymentKey,
-    [stakeKeyHash]: stakeKey,
-  };
-  const signTx = async (
-    tx: CML.Transaction,
-  ): Promise<CML.TransactionWitnessSet> => {
-    const utxos =
-      config.overriddenUTxOs !== undefined
-        ? config.overriddenUTxOs
-        : await provider.getUtxos(address);
-
-    const ownKeyHashes: Array<KeyHash> = [paymentKeyHash, stakeKeyHash];
-
-    const usedKeyHashes = discoverOwnUsedTxKeyHashes(tx, ownKeyHashes, utxos);
-
-    return withCMLScope((own) => {
-      const txWitnessSetBuilder = own(CML.TransactionWitnessSetBuilder.new());
-      const txHash = own(CML.hash_transaction(own(tx.body())));
-      for (const keyHash of usedKeyHashes) {
-        const priv = own(CML.PrivateKey.from_bech32(privKeyHashMap[keyHash]!));
-        txWitnessSetBuilder.add_vkey(own(CML.make_vkey_witness(txHash, priv)));
-      }
-      return txWitnessSetBuilder.build();
+  const state = walletState(provider, address, rewardAddress);
+  const keys = new Map<string, string>();
+  for (const privateKey of [paymentKey, stakeKey])
+    if (privateKey)
+      keys.set(
+        ledger<{ keyHash: string }>("key.fromPrivate", { privateKey }).keyHash,
+        privateKey,
+      );
+  const signTx = async (cbor: Transaction): Promise<string> => {
+    const required = discoverOwnUsedTxKeyHashes(
+      cbor,
+      [...keys.keys()],
+      await state.getUtxos(),
+    );
+    return ledger("tx.sign", {
+      cbor,
+      privateKeys: required.map((hash) => keys.get(hash)!),
     });
   };
   return {
-    overrideUTxOs: (utxos: UTxO[]) => (config.overriddenUTxOs = utxos),
-    clearUTxOOverride: () => (config.overriddenUTxOs = undefined),
-    address: async (): Promise<Address> => address,
-    rewardAddress: async (): Promise<RewardAddress | null> =>
-      rewardAddress || null,
-    getUtxos: async (): Promise<UTxO[]> =>
-      config.overriddenUTxOs !== undefined
-        ? config.overriddenUTxOs
-        : provider.getUtxos(address),
-    getUtxosCore: async (): Promise<CML.TransactionUnspentOutput[]> => {
-      const utxos =
-        config.overriddenUTxOs !== undefined
-          ? config.overriddenUTxOs
-          : await provider.getUtxos(address);
-      const coreUtxos: CML.TransactionUnspentOutput[] = [];
-      for (const utxo of utxos) {
-        coreUtxos.push(utxoToCore(utxo));
-      }
-      return coreUtxos;
-    },
-    getDelegation: async (): Promise<Delegation> => {
-      return rewardAddress
-        ? await provider.getDelegation(rewardAddress)
-        : { poolId: null, rewards: 0n };
-    },
+    ...state,
     signTx,
-    signTxs: async (
-      txs: CML.Transaction[],
-    ): Promise<CML.TransactionWitnessSet[]> => signTxsSequentially(txs, signTx),
-    signMessage: async (
-      address: Address | RewardAddress,
-      payload: Payload,
-    ): Promise<SignedMessage> => {
-      const {
-        paymentCredential,
-        stakeCredential,
-        address: { hex: hexAddress },
-      } = getAddressDetails(address);
-
-      const keyHash = paymentCredential?.hash || stakeCredential?.hash;
-
-      const privateKey = privKeyHashMap[keyHash!];
-
-      if (!privateKey) {
+    signTxs: (txs) => mapSequentially(txs, signTx),
+    signMessage: async (address, payload) => {
+      const details = getAddressDetails(address);
+      const hash =
+        details.paymentCredential?.hash ?? details.stakeCredential?.hash;
+      const privateKey = hash && keys.get(hash);
+      if (!privateKey)
         throw new Error(`Cannot sign message for address: ${address}.`);
-      }
-
-      return signData(hexAddress, payload, privateKey);
+      return signData(details.address.hex, payload, privateKey);
     },
-    submitTx: async (tx: Transaction): Promise<TxHash> => provider.submitTx(tx),
-    submitTxs: async (txs: Transaction[]): Promise<TxHash[]> =>
-      submitTxsSequentially(txs, (tx) => provider.submitTx(tx)),
   };
 };
 
-/**
- * Cardano Private key in bech32; not the BIP32 private key or any key that is not fully derived.
- * Only an Enterprise address (without stake credential) is derived.
- */
 export const makeWalletFromPrivateKey = (
   provider: Provider,
   network: Network,
   privateKey: PrivateKey,
 ): Wallet => {
-  const priv = CML.PrivateKey.from_bech32(privateKey);
-  const pubKeyHash = priv.to_public().hash();
-  const address = CML.EnterpriseAddress.new(
-    network === "Mainnet" ? 1 : 0,
-    CML.Credential.new_pub_key(pubKeyHash),
-  )
-    .to_address()
-    .to_bech32(undefined);
-  const config: Config = {
-    overriddenUTxOs: undefined,
-  };
-  const signTx = async (
-    tx: CML.Transaction,
-  ): Promise<CML.TransactionWitnessSet> => {
-    return withCMLScope((own) => {
-      const witness = own(
-        CML.make_vkey_witness(own(CML.hash_transaction(own(tx.body()))), priv),
-      );
-      const txWitnessSetBuilder = own(CML.TransactionWitnessSetBuilder.new());
-      txWitnessSetBuilder.add_vkey(witness);
-      return txWitnessSetBuilder.build();
-    });
-  };
-
+  const { keyHash } = ledger<{ keyHash: string }>("key.fromPrivate", {
+    privateKey,
+  });
+  const address = credentialToAddress(network, { type: "Key", hash: keyHash });
+  const state = walletState(provider, address, null);
+  const signTx = async (cbor: Transaction): Promise<string> =>
+    ledger("tx.sign", { cbor, privateKeys: [privateKey] });
   return {
-    overrideUTxOs: (utxos: UTxO[]) => (config.overriddenUTxOs = utxos),
-    clearUTxOOverride: () => (config.overriddenUTxOs = undefined),
-    address: async (): Promise<Address> => address,
-    rewardAddress: async (): Promise<RewardAddress | null> => null,
-    getUtxos: async (): Promise<UTxO[]> =>
-      config.overriddenUTxOs !== undefined
-        ? config.overriddenUTxOs
-        : provider.getUtxos(address),
-    getUtxosCore: async (): Promise<CML.TransactionUnspentOutput[]> => {
-      const utxos =
-        config.overriddenUTxOs !== undefined
-          ? config.overriddenUTxOs
-          : await provider.getUtxos(address);
-      const coreUtxos: CML.TransactionUnspentOutput[] = [];
-      for (const utxo of utxos) {
-        coreUtxos.push(utxoToCore(utxo));
-      }
-      return coreUtxos;
-    },
-    getDelegation: async (): Promise<Delegation> => {
-      return { poolId: null, rewards: 0n };
-    },
+    ...state,
     signTx,
-    signTxs: async (
-      txs: CML.Transaction[],
-    ): Promise<CML.TransactionWitnessSet[]> => signTxsSequentially(txs, signTx),
-    signMessage: async (
-      address: Address | RewardAddress,
-      payload: Payload,
-    ): Promise<SignedMessage> => {
-      const {
-        paymentCredential,
-        address: { hex: hexAddress },
-      } = getAddressDetails(address);
-      const keyHash = paymentCredential?.hash;
-
-      const originalKeyHash = pubKeyHash.to_hex();
-
-      if (!keyHash || keyHash !== originalKeyHash) {
+    signTxs: (txs) => mapSequentially(txs, signTx),
+    signMessage: async (address, payload) => {
+      const details = getAddressDetails(address);
+      if (details.paymentCredential?.hash !== keyHash)
         throw new Error(`Cannot sign message for address: ${address}.`);
-      }
-
-      return signData(hexAddress, payload, privateKey);
+      return signData(details.address.hex, payload, privateKey);
     },
-    submitTx: async (tx: Transaction): Promise<TxHash> => {
-      return await provider.submitTx(tx);
-    },
-    submitTxs: async (txs: Transaction[]): Promise<TxHash[]> =>
-      submitTxsSequentially(txs, (tx) => provider.submitTx(tx)),
   };
 };
 
@@ -289,132 +160,85 @@ export const makeWalletFromAPI = (
   provider: Provider,
   api: WalletApi,
 ): Wallet => {
-  const config: Config = {
-    overriddenUTxOs: undefined,
+  let override: UTxO[] | undefined;
+  const address = async () => {
+    const [used] = await api.getUsedAddresses();
+    const raw = used ?? (await api.getUnusedAddresses())[0];
+    return getAddressDetails(raw).address.bech32;
   };
-  const getAddressHex = async () => {
-    const [addressHex] = await api.getUsedAddresses();
-    if (addressHex) return addressHex;
-
-    const [unusedAddressHex] = await api.getUnusedAddresses();
-    return unusedAddressHex;
+  const rewardAddress = async () => {
+    const [raw] = await api.getRewardAddresses();
+    return raw ? getAddressDetails(raw).address.bech32 : null;
   };
-
-  const getRewardAddress = async () => {
-    const [rewardAddressHex] = await api.getRewardAddresses();
-    const rewardAddress = rewardAddressHex
-      ? CML.RewardAddress.from_address(CML.Address.from_hex(rewardAddressHex))!
-          .to_address()
-          .to_bech32(undefined)
-      : null;
-    return rewardAddress;
+  const signTx = async (tx: Transaction) => {
+    const witnesses = await api.signTx(tx, true);
+    decodeCbor(witnesses);
+    return witnesses;
   };
-
   return {
-    overrideUTxOs: (utxos: UTxO[]) => (config.overriddenUTxOs = utxos),
-    clearUTxOOverride: () => (config.overriddenUTxOs = undefined),
-    address: async (): Promise<Address> =>
-      CML.Address.from_hex(await getAddressHex()).to_bech32(undefined),
-    rewardAddress: async (): Promise<RewardAddress | null> =>
-      getRewardAddress(),
-    getUtxos: async (): Promise<UTxO[]> => {
-      const utxos =
-        config.overriddenUTxOs !== undefined
-          ? config.overriddenUTxOs
-          : ((await api.getUtxos()) || []).map((utxo) =>
-              coreToUtxo(
-                CML.TransactionUnspentOutput.from_cbor_bytes(fromHex(utxo)),
-              ),
-            );
-      return utxos;
+    overrideUTxOs: (utxos) => {
+      override = utxos;
     },
-    // Exposed only when the CIP-30 wallet implements getCollateral. With a
-    // UTxO override, only candidates in the override are returned, so a
-    // collateral UTxO spent by a pending chained transaction is not reused.
+    clearUTxOOverride: () => {
+      override = undefined;
+    },
+    address,
+    rewardAddress,
+    getUtxos: async () =>
+      override ?? ((await api.getUtxos()) ?? []).map(coreToUtxo),
+    getUtxosCore: async () =>
+      override ? override.map(utxoToCore) : ((await api.getUtxos()) ?? []),
     ...(typeof api.getCollateral !== "function"
       ? {}
       : {
-          getCollateral: async (amount?: bigint): Promise<UTxO[]> => {
-            // CIP-30 takes the amount as CBOR-encoded Coin.
+          getCollateral: async (amount?: bigint) => {
             const params =
-              amount === undefined
-                ? undefined
-                : {
-                    amount: withCMLScope((own) =>
-                      toHex(own(CML.Value.from_coin(amount)).to_cbor_bytes()),
-                    ),
-                  };
-            const hexes = (await api.getCollateral!(params)) || [];
-            const candidates = withCMLScope((own) =>
-              hexes.map((utxo) =>
-                coreToUtxo(
-                  own(
-                    CML.TransactionUnspentOutput.from_cbor_bytes(fromHex(utxo)),
-                  ),
-                ),
-              ),
+              amount === undefined ? undefined : { amount: encodeCbor(amount) };
+            const candidates = ((await api.getCollateral!(params)) ?? []).map(
+              coreToUtxo,
             );
-            const override = config.overriddenUTxOs;
             return override === undefined
               ? candidates
               : candidates.filter((candidate) =>
-                  override.some((utxo) => isEqualUTxO(utxo, candidate)),
+                  override!.some((utxo) => isEqualUTxO(utxo, candidate)),
                 );
           },
         }),
-    getUtxosCore: async (): Promise<CML.TransactionUnspentOutput[]> => {
-      const utxos =
-        config.overriddenUTxOs !== undefined
-          ? config.overriddenUTxOs.map(utxoToCore)
-          : ((await api.getUtxos()) || []).map((utxo: string) =>
-              CML.TransactionUnspentOutput.from_cbor_hex(utxo),
-            );
-      return utxos;
-    },
-    getDelegation: async (): Promise<Delegation> => {
-      const rewardAddr = await getRewardAddress();
-      return rewardAddr
-        ? await provider.getDelegation(rewardAddr)
+    getDelegation: async () => {
+      const reward = await rewardAddress();
+      return reward
+        ? provider.getDelegation(reward)
         : { poolId: null, rewards: 0n };
     },
-    signTx: async (tx: CML.Transaction): Promise<CML.TransactionWitnessSet> => {
-      const witnessSet = await api.signTx(toHex(tx.to_cbor_bytes()), true);
-      return CML.TransactionWitnessSet.from_cbor_hex(witnessSet);
-    },
-    signTxs: async (
-      txs: CML.Transaction[],
-    ): Promise<CML.TransactionWitnessSet[]> => {
-      const cbors = txs.map((tx) => toHex(tx.to_cbor_bytes()));
-      const requests: TransactionSignatureRequest[] = cbors.map((cbor) => ({
-        cbor,
-        partialSign: true,
-      }));
-      const signTxs =
+    signTx,
+    signTxs: async (txs) => {
+      const batch =
         api.cip103?.signTxs?.bind(api.cip103) ??
         api.experimental?.signTxs?.bind(api.experimental) ??
         api.signTxs?.bind(api);
-      const witnessSets = signTxs ? await signTxs(requests) : [];
-      if (!signTxs) {
-        for (const cbor of cbors) {
-          witnessSets.push(await api.signTx(cbor, true));
-        }
-      }
-      return decodeWitnessSets(witnessSets, txs.length);
+      const witnesses = batch
+        ? await batch(txs.map((cbor) => ({ cbor, partialSign: true })))
+        : await mapSequentially(txs, signTx);
+      if (witnesses.length !== txs.length)
+        throw new Error(
+          "Wallet returned an unexpected number of witness sets.",
+        );
+      witnesses.forEach(decodeCbor);
+      return witnesses;
     },
-    signMessage: async (
-      address: Address | RewardAddress,
-      payload: Payload,
-    ): Promise<SignedMessage> => {
-      const hexAddress = toHex(CML.Address.from_bech32(address).to_raw_bytes());
-      return await api.signData(hexAddress, payload);
-    },
-    submitTx: async (tx: Transaction): Promise<TxHash> => api.submitTx(tx),
-    submitTxs: async (txs: Transaction[]): Promise<TxHash[]> => {
-      const submitTxs = api.cip103?.submitTxs?.bind(api.cip103);
-      const txHashes = submitTxs
-        ? await submitTxs(txs)
+    signMessage: (address, payload) =>
+      api.signData(getAddressDetails(address).address.hex, payload),
+    submitTx: (tx) => api.submitTx(tx),
+    submitTxs: async (txs) => {
+      const batch = api.cip103?.submitTxs?.bind(api.cip103);
+      const hashes = batch
+        ? await batch(txs)
         : await submitTxsSequentially(txs, (tx) => api.submitTx(tx));
-      return validateTxHashes(txHashes, txs.length);
+      if (hashes.length !== txs.length)
+        throw new Error(
+          "Wallet returned an unexpected number of transaction hashes.",
+        );
+      return hashes;
     },
   };
 };
@@ -422,58 +246,21 @@ export const makeWalletFromAPI = (
 export const makeWalletFromAddress = (
   provider: Provider,
   network: Network,
-  address: string,
+  address: Address,
   utxos: UTxO[],
 ): Wallet => {
-  const { stakeCredential } = getAddressDetails(address);
-  const rewardAddress = stakeCredential
-    ? credentialToRewardAddress(network, stakeCredential)
-    : null;
-  const config: Config = {
-    overriddenUTxOs: utxos,
-  };
+  const stake = getAddressDetails(address).stakeCredential;
+  const reward = stake ? credentialToRewardAddress(network, stake) : null;
   return {
-    overrideUTxOs: (utxos: UTxO[]) => (config.overriddenUTxOs = utxos),
-    clearUTxOOverride: () => (config.overriddenUTxOs = undefined),
-    address: async (): Promise<Address> => address,
-    rewardAddress: async (): Promise<RewardAddress | null> => rewardAddress,
-    getUtxos: async (): Promise<UTxO[]> =>
-      config.overriddenUTxOs !== undefined
-        ? config.overriddenUTxOs
-        : provider.getUtxos(address),
-    getUtxosCore: async (): Promise<CML.TransactionUnspentOutput[]> => {
-      const utxos =
-        config.overriddenUTxOs !== undefined
-          ? config.overriddenUTxOs
-          : await provider.getUtxos(address);
-      const coreUtxos: CML.TransactionUnspentOutput[] = [];
-      for (const utxo of utxos) {
-        coreUtxos.push(utxoToCore(utxo));
-      }
-      return coreUtxos;
-    },
-    getDelegation: async (): Promise<Delegation> =>
-      rewardAddress
-        ? provider.getDelegation(rewardAddress)
-        : { poolId: null, rewards: 0n },
-    signTx: async (
-      _tx: CML.Transaction,
-    ): Promise<CML.TransactionWitnessSet> => {
+    ...walletState(provider, address, reward, utxos),
+    signTx: async () => {
       throw new Error("Not implemented");
     },
-    signTxs: async (
-      _txs: CML.Transaction[],
-    ): Promise<CML.TransactionWitnessSet[]> => {
+    signTxs: async () => {
       throw new Error("Not implemented");
     },
-    signMessage: async (
-      _address: Address | RewardAddress,
-      _payload: Payload,
-    ): Promise<SignedMessage> => {
+    signMessage: async () => {
       throw new Error("Not implemented");
     },
-    submitTx: async (tx: Transaction): Promise<TxHash> => provider.submitTx(tx),
-    submitTxs: async (txs: Transaction[]): Promise<TxHash[]> =>
-      submitTxsSequentially(txs, (tx) => provider.submitTx(tx)),
   };
 };

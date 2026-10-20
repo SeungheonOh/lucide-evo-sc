@@ -1,4 +1,7 @@
-import * as CML from "@lucid-evolution/cml";
+import type {
+  CborValue,
+  TransactionBodySnapshot,
+} from "@lucid-evolution/ledger";
 
 export type CostModels = Record<PlutusVersion, number[]>;
 
@@ -90,7 +93,7 @@ export type EvaluationContext = {
   network: Network;
   slotConfig: SlotConfig;
   protocolParameters: ProtocolParameters;
-  costModels: CML.CostModels;
+  costModels: CostModels;
 };
 
 export type EvaluationInput = {
@@ -250,7 +253,7 @@ export type RedeemerContext = Readonly<{
    * script-context projection; raw body internals may expose additional body
    * details that scripts cannot inspect.
    */
-  txBody: CML.TransactionBody;
+  txBody: TransactionBodySnapshot;
   inputs: ReadonlyArray<UTxO>;
   referenceInputs: ReadonlyArray<UTxO>;
   outputs: ReadonlyArray<TxOutput>;
@@ -373,7 +376,7 @@ export interface Wallet {
   address(): Promise<Address>;
   rewardAddress(): Promise<RewardAddress | null>;
   getUtxos(): Promise<UTxO[]>;
-  getUtxosCore(): Promise<Array<CML.TransactionUnspentOutput>>;
+  getUtxosCore(): Promise<string[]>;
   /**
    * Collateral candidates preferred by the wallet, separate from the UTxOs
    * used for coin selection. `amount` is the collateral, in lovelace, the
@@ -383,8 +386,8 @@ export interface Wallet {
    */
   getCollateral?(amount?: bigint): Promise<UTxO[]>;
   getDelegation(): Promise<Delegation>;
-  signTx(tx: CML.Transaction): Promise<CML.TransactionWitnessSet>;
-  signTxs?(txs: CML.Transaction[]): Promise<CML.TransactionWitnessSet[]>;
+  signTx(tx: string): Promise<string>;
+  signTxs?(txs: string[]): Promise<string[]>;
   signMessage(
     address: Address | RewardAddress,
     payload: Payload,
@@ -525,7 +528,7 @@ export type GovernanceAction =
   | {
       type: "ParameterChange";
       actionId?: GovernanceActionId | null;
-      protocolParamUpdate: CML.ProtocolParamUpdate | string;
+      protocolParamUpdate: Map<CborValue, CborValue> | string;
       policyHash?: ScriptHash | null;
     }
   | {
@@ -566,10 +569,6 @@ export type GovernanceAction =
   | {
       type: "Cbor";
       cbor: string;
-    }
-  | {
-      type: "CML";
-      action: CML.GovAction;
     };
 
 export type GovernanceProposal = {

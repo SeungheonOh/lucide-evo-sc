@@ -1,132 +1,64 @@
-import { Assets, OutRef, TxOutput, UTxO } from "@lucid-evolution/core-types";
-import { CMLOwn, withCMLScope } from "@lucid-evolution/core-utils";
-import { CML } from "./core.js";
-import { fromScriptRef, toScriptRef } from "./scripts.js";
-import { assetsToValue, valueToAssets } from "./value.js";
+import type {
+  Assets,
+  OutRef,
+  TxOutput,
+  UTxO,
+} from "@lucid-evolution/core-types";
+import { ledger } from "@lucid-evolution/ledger";
+import {
+  asList,
+  asBytes,
+  asInteger,
+  decodeTerm,
+  encodeTerm,
+  integer,
+} from "./ledger-cbor.js";
 
-/**
- * Builds the output directly rather than through `TransactionOutputBuilder`,
- * whose every stage copies the datum and script; the result is the same.
- */
-export const utxoToTransactionOutput = (utxo: UTxO): CML.TransactionOutput =>
-  withCMLScope((own) => {
-    const address = own(CML.Address.from_bech32(utxo.address));
-    const value = own(assetsToValue(utxo.assets));
-    const datum = utxo.datum
-      ? own(CML.PlutusData.from_cbor_hex(utxo.datum))
-      : undefined;
-    const datumHash = utxo.datumHash
-      ? own(
-          datum
-            ? CML.hash_plutus_data(datum)
-            : CML.DatumHash.from_hex(utxo.datumHash),
-        )
-      : undefined;
-    // `TransactionOutput.new` consumes the script and datum option, so they
-    // are created last and left out of the scope.
-    const scriptRef = utxo.scriptRef ? toScriptRef(utxo.scriptRef) : undefined;
-    const datumOption = datumHash
-      ? CML.DatumOption.new_hash(datumHash)
-      : datum
-        ? CML.DatumOption.new_datum(datum)
-        : undefined;
-    return CML.TransactionOutput.new(address, value, datumOption, scriptRef);
+export const utxoToTransactionOutput = (utxo: TxOutput): string =>
+  ledger("output.encode", { utxo });
+export const utxoToTransactionInput = (utxo: OutRef): string =>
+  encodeTerm({ list: [{ bytes: utxo.txHash }, integer(utxo.outputIndex)] });
+export const utxoToCore = (utxo: UTxO): string =>
+  encodeTerm({
+    list: [
+      decodeTerm(utxoToTransactionInput(utxo)),
+      decodeTerm(utxoToTransactionOutput(utxo)),
+    ],
   });
-
-export const utxoToTransactionInput = (utxo: UTxO): CML.TransactionInput =>
-  withCMLScope((own) =>
-    CML.TransactionInput.new(
-      own(CML.TransactionHash.from_hex(utxo.txHash)),
-      BigInt(utxo.outputIndex),
+export const utxosToCores = (utxos: UTxO[]): string[] => utxos.map(utxoToCore);
+export function coreToUtxo(cbor: string): UTxO {
+  const [input, output] = asList(decodeTerm(cbor));
+  return {
+    ...coreToOutRef(encodeTerm(input)),
+    ...coreToTxOutput(encodeTerm(output)),
+  };
+}
+export const coresToUtxos = (utxos: string[]): UTxO[] => utxos.map(coreToUtxo);
+export function coreToOutRef(cbor: string): OutRef {
+  const [hash, index] = asList(decodeTerm(cbor));
+  return { txHash: asBytes(hash), outputIndex: Number(asInteger(index)) };
+}
+export const coresToOutRefs = (inputs: string[]): OutRef[] =>
+  inputs.map(coreToOutRef);
+export function coreToTxOutput(cbor: string): TxOutput {
+  const output = ledger<
+    Omit<TxOutput, "assets"> & { assets: Record<string, string> }
+  >("output.decode", { cbor });
+  return {
+    ...output,
+    datum: output.datum ?? undefined,
+    datumHash: output.datumHash ?? undefined,
+    scriptRef: output.scriptRef ?? undefined,
+    assets: Object.fromEntries(
+      Object.entries(output.assets).map(([unit, amount]) => [
+        unit,
+        BigInt(amount),
+      ]),
     ),
-  );
-
-export const utxoToCore = (utxo: UTxO): CML.TransactionUnspentOutput =>
-  withCMLScope((own) =>
-    CML.TransactionUnspentOutput.new(
-      own(utxoToTransactionInput(utxo)),
-      own(utxoToTransactionOutput(utxo)),
-    ),
-  );
-
-export function utxosToCores(utxos: UTxO[]): CML.TransactionUnspentOutput[] {
-  const result: CML.TransactionUnspentOutput[] = [];
-  for (const utxo of utxos) {
-    result.push(utxoToCore(utxo));
-  }
-  return result;
+  };
 }
-
-//TODO: test coreToUtxo -> utxoToCore strict equality
-export function coreToUtxo(coreUtxo: CML.TransactionUnspentOutput): UTxO {
-  return withCMLScope((own) => ({
-    ...coreToOutRef(own(coreUtxo.input())),
-    ...coreToTxOutput(own(coreUtxo.output())),
-  }));
-}
-
-export function coresToUtxos(utxos: CML.TransactionUnspentOutput[]): UTxO[] {
-  const result: UTxO[] = [];
-  for (let i = 0; i < utxos.length; i++) {
-    result.push(coreToUtxo(utxos[i]));
-  }
-  return result;
-}
-
-export function coreToOutRef(input: CML.TransactionInput): OutRef {
-  return withCMLScope((own) => ({
-    txHash: own(input.transaction_id()).to_hex(),
-    outputIndex: parseInt(input.index().toString()),
-  }));
-}
-
-export function coresToOutRefs(inputs: CML.TransactionInput[]): OutRef[] {
-  const result: OutRef[] = [];
-  for (let i = 0; i < inputs.length; i++) {
-    result.push(coreToOutRef(inputs[i]));
-  }
-  return result;
-}
-
-export function coreToTxOutput(output: CML.TransactionOutput): TxOutput {
-  return withCMLScope((own) => {
-    const datum = own(output.datum());
-    const scriptRef = own(output.script_ref());
-    return {
-      assets: valueToAssets(own(output.amount())),
-      address: own(output.address()).to_bech32(undefined),
-      datumHash: own(datum?.as_hash())?.to_hex(),
-      datum: own(datum?.as_datum())?.to_cbor_hex(),
-      scriptRef: scriptRef && fromScriptRef(scriptRef),
-    };
-  });
-}
-
-export function coresToTxOutputs(outputs: CML.TransactionOutput[]): TxOutput[] {
-  let result: TxOutput[] = [];
-  for (let i = 0; i < outputs.length; i++) {
-    result.push(coreToTxOutput(outputs[i]));
-  }
-  return result;
-}
-
-//TODO: disable for now
-// export function producedUtxosFrom(unsignedTx: TxComplete): UTxO[] {
-//   const result: UTxO[] = [];
-//   const hash = unsignedTx.toHash();
-//   const outputs = unsignedTx.txComplete.body().outputs();
-//   const outputsArray = new Array<CML.TransactionOutput>(outputs.len()).map(
-//     (_, index) => outputs.get(index),
-//   );
-//   coresToTxOutputs(outputsArray).forEach((output, index) => {
-//     result.push({
-//       outputIndex: index,
-//       txHash: hash,
-//       ...output,
-//     });
-//   });
-//   return result;
-// }
+export const coresToTxOutputs = (outputs: string[]): TxOutput[] =>
+  outputs.map(coreToTxOutput);
 
 /**
  * Returns a list of UTxOs whose total assets are equal to or greater than the asset value provided
@@ -271,63 +203,14 @@ export function getInputIndices(
     else return [];
   });
 }
-//TODO: add
-// sortCanonical -> sorting following ledger rules
-// sortBy -> sort by amount of specific unit
 
 export const calculateMinLovelaceFromUTxO = (
   coinsPerUtxoByte: bigint,
   utxo: UTxO,
 ): bigint =>
-  withCMLScope((own) => {
-    const value = own(assetsToValue(utxo.assets));
-    const builder = own(
-      buildOutput(utxo, own).with_asset_and_min_required_coin(
-        own(value.multi_asset()),
-        coinsPerUtxoByte,
-      ),
-    );
-    const output = own(own(builder.build()).output());
-    return own(output.amount()).coin();
-  });
-
-/**
- * Every builder stage is a fresh CML object; they are all registered with the
- * caller's scope so only the caller's final result outlives the conversion.
- */
-const buildOutput = (
-  utxo: UTxO,
-  own: CMLOwn,
-): CML.TransactionOutputAmountBuilder => {
-  const address = own(CML.Address.from_bech32(utxo.address));
-  const addressed = own(
-    own(CML.TransactionOutputBuilder.new()).with_address(address),
+  BigInt(
+    ledger<string>("output.minAda", {
+      output: utxo,
+      coinsPerUtxoByte: String(coinsPerUtxoByte),
+    }),
   );
-  const builder = buildDatum(utxo, addressed, own);
-  if (!utxo.scriptRef) return own(builder.next());
-  const scriptRef = own(toScriptRef(utxo.scriptRef));
-  return own(own(builder.with_reference_script(scriptRef)).next());
-};
-
-const buildDatum = (
-  utxo: UTxO,
-  builder: CML.TransactionOutputBuilder,
-  own: CMLOwn,
-): CML.TransactionOutputBuilder => {
-  // with DatumHash
-  if (utxo.datumHash && utxo.datum) {
-    const datum = own(CML.PlutusData.from_cbor_hex(utxo.datum));
-    return own(builder.with_communication_data(datum));
-  }
-  // The datum need not be fetched to preserve the hash on a resolved UTxO.
-  if (utxo.datumHash) {
-    const hash = own(CML.DatumHash.from_hex(utxo.datumHash));
-    return own(builder.with_data(own(CML.DatumOption.new_hash(hash))));
-  }
-  // with InlineDatum
-  if (utxo.datum) {
-    const datum = own(CML.PlutusData.from_cbor_hex(utxo.datum));
-    return own(builder.with_data(own(CML.DatumOption.new_datum(datum))));
-  }
-  return builder;
-};

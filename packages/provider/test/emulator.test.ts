@@ -1,9 +1,11 @@
 import { ProtocolParameters } from "@lucid-evolution/core-types";
 import { assert, describe, test } from "vitest";
 import { PROTOCOL_PARAMETERS_DEFAULT } from "@lucid-evolution/utils";
-import { Emulator, generateEmulatorAccount } from "../src";
+import { Emulator, generateEmulatorAccount } from "../src/index.js";
 import { Effect } from "effect";
-import * as PreprodConstants from "./preprod-constants";
+import { expect } from "vitest";
+import { Lucid } from "../../lucid/src/index.js";
+import * as PreprodConstants from "./preprod-constants.js";
 
 export const EMULATOR_ACCOUNT = generateEmulatorAccount({
   lovelace: 80000000000n,
@@ -63,6 +65,15 @@ describe.sequential("Emulator", () => {
     );
     assert.deepStrictEqual(
       redeemers,
+      // Actual evaluation uses the current emulator cost models. The old
+      // implementation only echoed the transaction's embedded budget.
+      PreprodConstants.evalSample1.redeemersExUnits.map((redeemer) => ({
+        ...redeemer,
+        ex_units: { mem: 26_285, steps: 7_850_649 },
+      })),
+    );
+    assert.notDeepEqual(
+      redeemers,
       PreprodConstants.evalSample1.redeemersExUnits,
     );
   });
@@ -100,16 +111,26 @@ describe.sequential("Emulator", () => {
         spent: false,
       },
     };
-    const txHash = await emulator.submitTx(PreprodConstants.submitCbor);
-    assert.equal(
-      txHash,
-      "edfc1d75074d741f5b7c97e8ddb81de956a43b6fca8664dff5722bb1d136ff3f",
-    );
+    // The historical transaction commits to different protocol cost models.
+    // Actual ledger validation rejects its stale script integrity hash.
+    await expect(
+      emulator.submitTx(PreprodConstants.submitCbor),
+    ).rejects.toThrow(/ScriptIntegrityHashMismatch/);
+    const lucid = await Lucid(emulator, "Custom");
+    lucid.selectWallet.fromSeed(EMULATOR_ACCOUNT.seedPhrase);
+    const tx = await lucid
+      .newTx()
+      .pay.ToAddress(EMULATOR_ACCOUNT.address, { lovelace: 10_000_000n })
+      .complete();
+    const signed = await tx.sign.withWallet().complete();
+    const txHash = await signed.submit();
+    assert.equal(txHash, signed.toHash());
 
     const spentEntry = Object.values(emulator.ledger).find(
       ({ spent }) => spent,
     );
     assert.isDefined(spentEntry);
+    if (!spentEntry) throw new Error("Missing spent input after submission");
 
     const spentUnit = `${"f".repeat(56)}01`;
     spentEntry.utxo.assets[spentUnit] = 1n;
@@ -156,13 +177,14 @@ describe.sequential("Emulator", () => {
       ([, { utxo }]) => utxo.txHash === txHash,
     );
     assert.isDefined(confirmedOutput);
+    if (!confirmedOutput) throw new Error("Missing confirmed output");
     confirmedOutput[1].spent = true;
     emulator.awaitBlock(2);
     assert.notProperty(emulator.ledger, confirmedOutput[0]);
+    const finalStatus = await emulator.getTransactionStatus(txHash);
     assert.equal(
-      (await emulator.getTransactionStatus(txHash)).status === "confirmed"
-        ? (await emulator.getTransactionStatus(txHash)).confirmation
-            .confirmations
+      finalStatus.status === "confirmed"
+        ? finalStatus.confirmation.confirmations
         : undefined,
       3,
     );

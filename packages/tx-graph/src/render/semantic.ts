@@ -7,7 +7,7 @@ import type {
   TraceWarning,
   TxGraphTrace,
 } from "../model.js";
-import { CML } from "../core.js";
+import { ledger } from "@lucid-evolution/ledger";
 import { outRefKey } from "../resolve.js";
 import { addressName, assetName, shortHash } from "./common.js";
 
@@ -1218,9 +1218,9 @@ const matchesRedeemer = (
 
 const constructorOf = (data: string): number | undefined => {
   try {
-    const alternative = CML.PlutusData.from_cbor_hex(data)
-      .as_constr_plutus_data()
-      ?.alternative();
+    const alternative = ledger<{ constructor?: number }>("data.decode", {
+      cbor: data,
+    }).constructor;
     if (alternative === undefined) return undefined;
     const value = Number(alternative);
     return Number.isSafeInteger(value) ? value : undefined;

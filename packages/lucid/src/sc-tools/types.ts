@@ -28,7 +28,7 @@ export type ScToolsChainContext = {
   }>;
 };
 
-/** Compatible with sc-tools-wasm's Engine. No wallet secrets cross this boundary. */
+/** Runtime transport for Haskell balancing and mockchain operations. */
 export interface ScToolsRuntime {
   run(payload: Record<string, unknown>): Promise<unknown>;
 }
@@ -36,7 +36,10 @@ export interface ScToolsRuntime {
 export type ScToolsBalancer = {
   type: "sc-tools";
   runtime: ScToolsRuntime;
-  /** Optional full node context. By default, uses Lucid's provider parameters and slot mapping. */
+  /**
+   * Overrides the full node context. By default, uses provider chain state when
+   * available with Lucid's pinned parameters and slot mapping.
+   */
   chainContext?: (context: {
     provider: Provider;
     network: Network;

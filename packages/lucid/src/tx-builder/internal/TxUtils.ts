@@ -1,278 +1,70 @@
-import * as CML from "@lucid-evolution/cml";
-import { CBORHex } from "../types.js";
 import * as Effect from "effect/Effect";
-import { pipe } from "effect/Function";
-import {
-  applyDoubleCborEncoding,
-  getAddressDetails,
-  networkToId,
-  scriptCborBytes,
-} from "@lucid-evolution/utils";
-import { withCMLScope } from "@lucid-evolution/core-utils";
-import {
+import { getAddressDetails, networkToId } from "@lucid-evolution/utils";
+import type {
   Address,
   AddressDetails,
-  Redeemer,
-  RedeemerBuilder,
   RewardAddress,
+  RedeemerBuilder,
   Credential,
   UTxO,
   Provider,
 } from "@lucid-evolution/core-types";
 import { ERROR_MESSAGE, TxBuilderError } from "../../Errors.js";
-import { LucidConfig } from "../../lucid-evolution/LucidEvolution.js";
-import { TxBuilderConfig } from "../TxBuilder.js";
-
-import * as TxBuilder from "../TxBuilder.js";
+import type { LucidConfig } from "../../lucid-evolution/LucidEvolution.js";
+import type { TxBuilderConfig } from "../TxBuilder.js";
 import { TxConfig } from "./Service.js";
-import { Data } from "@lucid-evolution/plutus";
-
 export const txBuilderError = (cause: unknown) =>
-  new TxBuilderError({ cause: `{ TxBuilderError : ${cause} }` });
-
-//TODO: improve error message, utils is used in different modules
-export const toCMLAddress = (
-  address: Address | RewardAddress,
-  lucidConfig: LucidConfig,
-): Effect.Effect<CML.Address, TxBuilderError, never> =>
-  Effect.gen(function* ($) {
-    const { type } = yield* validateAddressDetails(address, lucidConfig);
-    return type === "Byron"
-      ? withCMLScope((own) =>
-          own(CML.ByronAddress.from_base58(address)).to_address(),
-        )
-      : CML.Address.from_bech32(address);
-  });
-
-/**
- * Script bytes from the shared script cache when `script` is already double
- * CBOR encoded (always the case for scripts in `config.scripts`), so a script
- * replayed by delayed completion is not decoded from hex again. Anything else
- * takes the original `from_cbor_hex` path.
- */
-const cachedPlutusBytes = (
-  type: "PlutusV1" | "PlutusV2" | "PlutusV3",
-  script: string,
-): Uint8Array | undefined => {
-  try {
-    return applyDoubleCborEncoding(script) === script
-      ? scriptCborBytes({ type, script })
-      : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-export const toV1 = (script: string) =>
-  withCMLScope((own) => {
-    const bytes = cachedPlutusBytes("PlutusV1", script);
-    return CML.PlutusScript.from_v1(
-      own(
-        bytes
-          ? CML.PlutusV1Script.from_cbor_bytes(bytes)
-          : CML.PlutusV1Script.from_cbor_hex(script),
-      ),
-    );
-  });
-
-export const toV2 = (script: string) =>
-  withCMLScope((own) => {
-    const bytes = cachedPlutusBytes("PlutusV2", script);
-    return CML.PlutusScript.from_v2(
-      own(
-        bytes
-          ? CML.PlutusV2Script.from_cbor_bytes(bytes)
-          : CML.PlutusV2Script.from_cbor_hex(script),
-      ),
-    );
-  });
-
-export const toV3 = (script: string) =>
-  withCMLScope((own) => {
-    const bytes = cachedPlutusBytes("PlutusV3", script);
-    return CML.PlutusScript.from_v3(
-      own(
-        bytes
-          ? CML.PlutusV3Script.from_cbor_bytes(bytes)
-          : CML.PlutusV3Script.from_cbor_hex(script),
-      ),
-    );
-  });
-
-export const toPartial = (script: CML.PlutusScript, redeemer: CBORHex) =>
-  withCMLScope((own) =>
-    CML.PartialPlutusWitness.new(
-      own(CML.PlutusScriptWitness.new_script(script)),
-      own(CML.PlutusData.from_cbor_hex(redeemer)),
-    ),
-  );
-
+  new TxBuilderError({ cause: `{ TxBuilder: ${cause} }` });
 export const handleRedeemerBuilder = (
   config: TxBuilderConfig,
   partialProgram: (
-    redeemer?: string | undefined,
+    redeemer?: string,
   ) => Effect.Effect<void, TxBuilderError, TxConfig>,
   redeemer?: string | RedeemerBuilder,
 ) => {
-  if (typeof redeemer === "object") {
+  if (typeof redeemer === "object")
     config.partialPrograms.set(redeemer, partialProgram);
-  } else {
-    const program = partialProgram(redeemer);
-    config.programs.push(program);
-  }
+  else config.programs.push(partialProgram(redeemer));
 };
-
-//NOTE: deprecated
-// export function toCMLTransactionHash(body: CML.TransactionBody) {
-//   const TransactionHash = C.hash_transaction(
-//     C.TransactionBody.from_bytes(fromHex(body.to_cbor_hex())),
-//   );
-//   return CML.TransactionHash.from_hex(TransactionHash.to_hex());
-// }
-
-export function isEqual(arr1: Uint8Array, arr2: Uint8Array): boolean {
-  if (arr1.length !== arr2.length) {
-    return false;
-  }
-  return arr1.every((value, index) => value === arr2[index]);
-}
-
+export const isEqual = (a: Uint8Array, b: Uint8Array): boolean =>
+  a.length === b.length && a.every((v, i) => v === b[i]);
 export const validateAddressDetails = (
   address: Address | RewardAddress,
   lucidConfig: LucidConfig,
-): Effect.Effect<AddressDetails, TxBuilderError, never> =>
-  Effect.gen(function* ($) {
-    const addressDetails = yield* $(
-      Effect.try({
-        try: () => getAddressDetails(address),
-        catch: (cause) =>
-          new TxBuilderError({
-            cause,
-          }),
-      }),
-    );
-    const actualNetworkId = networkToId(lucidConfig.network);
-    if (addressDetails.networkId !== actualNetworkId)
-      yield* new TxBuilderError({
-        cause: ERROR_MESSAGE.INVALID_NETWORK(
-          address,
-          actualNetworkId,
-          lucidConfig.network,
-        ),
-      });
-
-    return addressDetails;
+): Effect.Effect<AddressDetails, TxBuilderError> =>
+  Effect.try({
+    try: () => {
+      const details = getAddressDetails(address),
+        id = networkToId(lucidConfig.network);
+      if (details.networkId !== id)
+        throw new Error(
+          ERROR_MESSAGE.INVALID_NETWORK(address, id, lucidConfig.network),
+        );
+      return details;
+    },
+    catch: txBuilderError,
   });
-
-export const processCertificate = (
-  stakeCredential: Credential,
-  config: TxBuilder.TxBuilderConfig,
-  buildCert: (credential: CML.Credential) => CML.SingleCertificateBuilder,
-  redeemer?: Redeemer,
-): Effect.Effect<void, TxBuilderError> =>
-  Effect.gen(function* () {
-    switch (stakeCredential.type) {
-      case "Key": {
-        const credential = CML.Credential.new_pub_key(
-          CML.Ed25519KeyHash.from_hex(stakeCredential.hash),
-        );
-        const certBuilder = buildCert(credential);
-        config.txBuilder.add_cert(certBuilder.payment_key());
-        break;
-      }
-
-      case "Script": {
-        const credential = CML.Credential.new_script(
-          CML.ScriptHash.from_hex(stakeCredential.hash),
-        );
-        const certBuilder = buildCert(credential);
-
-        const script = yield* pipe(
-          Effect.fromNullable(config.scripts.get(stakeCredential.hash)),
-          Effect.orElseFail(() =>
-            txBuilderError(ERROR_MESSAGE.MISSING_SCRIPT(stakeCredential.hash)),
-          ),
-        );
-
-        const addPlutusCertificate = (
-          scriptVersion: CML.PlutusScript,
-        ): Effect.Effect<void, TxBuilderError> => {
-          return Effect.gen(function* () {
-            const red = yield* pipe(
-              Effect.fromNullable(redeemer),
-              Effect.orElseFail(() =>
-                txBuilderError(ERROR_MESSAGE.MISSING_REDEEMER),
-              ),
-            );
-            config.txBuilder.add_cert(
-              certBuilder.plutus_script(
-                toPartial(scriptVersion, red),
-                CML.Ed25519KeyHashList.new(),
-              ),
-            );
-          });
-        };
-
-        switch (script.type) {
-          case "PlutusV1":
-            yield* addPlutusCertificate(toV1(script.script));
-            break;
-
-          case "PlutusV2":
-            yield* addPlutusCertificate(toV2(script.script));
-            break;
-          case "PlutusV3":
-            yield* addPlutusCertificate(toV3(script.script));
-            break;
-
-          case "Native":
-            config.txBuilder.add_cert(
-              certBuilder.native_script(
-                CML.NativeScript.from_cbor_hex(script.script),
-                CML.NativeScriptWitnessInfo.assume_signature_count(),
-              ),
-            );
-            break;
-        }
-        break;
-      }
-    }
-  });
-
 export const validateAndGetStakeCredential = (
-  rewardAddress: RewardAddress,
-  config: TxBuilder.TxBuilderConfig,
+  address: RewardAddress,
+  config: TxBuilderConfig,
 ): Effect.Effect<Credential, TxBuilderError> =>
   Effect.gen(function* () {
-    const addressDetails = yield* pipe(
-      validateAddressDetails(rewardAddress, config.lucidConfig),
-      Effect.andThen((address) =>
-        address.type !== "Reward"
-          ? txBuilderError(ERROR_MESSAGE.MISSING_REWARD_TYPE)
-          : Effect.succeed(address),
-      ),
-    );
-
-    const stakeCredential = yield* pipe(
-      Effect.fromNullable(addressDetails.stakeCredential),
-      Effect.orElseFail(() =>
-        txBuilderError(ERROR_MESSAGE.MISSING_STAKE_CREDENTIAL),
-      ),
-    );
-
-    return stakeCredential;
+    const details = yield* validateAddressDetails(address, config.lucidConfig);
+    if (details.type !== "Reward" || !details.stakeCredential)
+      return yield* Effect.fail(
+        txBuilderError(ERROR_MESSAGE.MISSING_REWARD_TYPE),
+      );
+    return details.stakeCredential;
   });
-
 export const resolveDatum = (
-  datumHash: UTxO["datumHash"],
+  hash: UTxO["datumHash"],
   datum: UTxO["datum"],
   provider: Provider,
 ) =>
   Effect.gen(function* () {
-    // Only fetch the datum if the datumHash is present and the datum is not present.
-    if (!datumHash || datum) return datum;
+    if (!hash || datum) return datum;
     return yield* Effect.tryPromise({
-      try: () => provider.getDatum(datumHash),
+      try: () => provider.getDatum(hash),
       catch: txBuilderError,
     });
   });

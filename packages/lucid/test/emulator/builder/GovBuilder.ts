@@ -1,5 +1,9 @@
 import { Effect } from "effect";
-import { CML, PoolParams, paymentCredentialOf } from "../../../src/index.js";
+import {
+  poolIdFromHex,
+  PoolParams,
+  paymentCredentialOf,
+} from "../../../src/index.js";
 import { User } from "../service/EmulatorUser.js";
 
 const poolParams = Effect.gen(function* () {
@@ -11,9 +15,7 @@ const poolParams = Effect.gen(function* () {
   }
 
   return {
-    poolId: CML.Ed25519KeyHash.from_hex(paymentCredential.hash).to_bech32(
-      "pool",
-    ),
+    poolId: poolIdFromHex(paymentCredential.hash),
     vrfKeyHash: "00".repeat(32),
     pledge: 0n,
     cost: 340_000_000n,

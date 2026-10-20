@@ -35,10 +35,10 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@lucid-evolution/cml": "workspace:*",
     "@lucid-evolution/core-types": "workspace:*",
     "@lucid-evolution/core-utils": "workspace:*",
-    "@lucid-evolution/utils": "workspace:*"
+    "@lucid-evolution/utils": "workspace:*",
+    "@lucid-evolution/ledger": "workspace:*"
   },
   "devDependencies": {
     "@lucid-evolution/provider": "workspace:*",

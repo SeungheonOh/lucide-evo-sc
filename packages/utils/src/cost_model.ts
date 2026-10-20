@@ -1,30 +1,10 @@
-import { CML } from "./core.js";
-import { CostModels, ProtocolParameters } from "@lucid-evolution/core-types";
+import type {
+  CostModels,
+  ProtocolParameters,
+} from "@lucid-evolution/core-types";
 
-type Cost = Record<number, number[] | null>;
-
-export function createCostModels(costModels: CostModels): CML.CostModels {
-  const costmodel: Cost = {
-    0: [],
-    1: [],
-    2: [],
-  };
-  // add plutus v1
-  for (const cost of costModels.PlutusV1) {
-    costmodel[0]?.push(cost);
-  }
-
-  // add plutus v2
-  for (const cost of costModels.PlutusV2) {
-    costmodel[1]?.push(cost);
-  }
-
-  // add plutus v3
-  for (const cost of costModels.PlutusV3) {
-    costmodel[2]?.push(cost);
-  }
-
-  return CML.CostModels.from_json(JSON.stringify(costmodel));
+export function createCostModels(costModels: CostModels): CostModels {
+  return structuredClone(costModels);
 }
 
 export const PROTOCOL_PARAMETERS_DEFAULT: ProtocolParameters = {

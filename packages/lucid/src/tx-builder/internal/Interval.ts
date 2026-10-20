@@ -12,7 +12,6 @@ export const validFrom = (unixTime: UnixTime) =>
       unixTime,
       config.lucidConfig.slotConfig,
     );
-    config.txBuilder.set_validity_start_interval(BigInt(slot));
     recordScValidity(config, "from", slot);
   });
 export const validTo = (unixTime: UnixTime) =>
@@ -22,6 +21,5 @@ export const validTo = (unixTime: UnixTime) =>
       unixTime,
       config.lucidConfig.slotConfig,
     );
-    config.txBuilder.set_ttl(BigInt(slot));
     recordScValidity(config, "until", slot);
   });

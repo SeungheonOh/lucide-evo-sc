@@ -1,3 +1,4 @@
+import { createLedgerRuntime, fillSecureRandom } from "@lucid-evolution/ledger";
 import type { ScToolsRuntime } from "./types.js";
 
 /** Attach the worker shipped in sc-tools-wasm/output/browser/worker.js. */
@@ -57,12 +58,17 @@ export function createScToolsWorkerRuntime(worker: Worker): ScToolsRuntime & {
   };
 }
 
-/** Reuse one compiled module; each request gets isolated WASI memory and descriptors.
- * In a browser, call this in a worker to keep ledger evaluation off the UI thread.
+/** Load a Haskell reactor or command module. Reactor requests share one instance;
+ * command requests have isolated WASI state. Use a worker for background evaluation.
  */
 export async function createScToolsWasmRuntime(
   module: WebAssembly.Module,
 ): Promise<ScToolsRuntime> {
+  if (
+    WebAssembly.Module.exports(module).some(({ name }) => name === "lucid_run")
+  ) {
+    return createLedgerRuntime(module);
+  }
   const { WASI, File, OpenFile, ConsoleStdout, PreopenDirectory } =
     await import("@bjorn3/browser_wasi_shim");
   return {
@@ -82,7 +88,18 @@ export async function createScToolsWasmRuntime(
         ],
         { debug: false },
       );
-      const instance = await WebAssembly.instantiate(module, {
+      let instance: WebAssembly.Instance;
+      wasi.wasiImport.random_get = (pointer, length) => {
+        fillSecureRandom(
+          new Uint8Array(
+            (instance.exports.memory as WebAssembly.Memory).buffer,
+            pointer,
+            length,
+          ),
+        );
+        return 0;
+      };
+      instance = await WebAssembly.instantiate(module, {
         wasi_snapshot_preview1: wasi.wasiImport,
       });
       const code = wasi.start(instance as Parameters<typeof wasi.start>[0]);

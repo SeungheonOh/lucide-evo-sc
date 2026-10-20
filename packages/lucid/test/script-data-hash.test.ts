@@ -10,7 +10,6 @@ import {
   mintingPolicyToId,
   validatorToRewardAddress,
 } from "../src/index.js";
-import { CML } from "../src/core.js";
 import scripts from "./specs/contracts/plutus.json" assert { type: "json" };
 
 test("refreshes script data hash from final redeemer witnesses", async () => {
@@ -38,6 +37,12 @@ test("refreshes script data hash from final redeemer witnesses", async () => {
 
   const policyId = mintingPolicyToId(mint);
   const rewardAddress = validatorToRewardAddress("Custom", stake);
+  const registration = await lucid
+    .newTx()
+    .register.Stake(rewardAddress)
+    .complete();
+  await (await registration.sign.withWallet().complete()).submit();
+  emulator.awaitBlock();
   const signBuilder = await lucid
     .newTx()
     .mintAssets(
@@ -49,14 +54,10 @@ test("refreshes script data hash from final redeemer witnesses", async () => {
     .attach.MintingPolicy(mint)
     .complete();
   const tx = signBuilder.toTransaction();
-  const redeemers = tx.witness_set().redeemers()!;
-  const datums = tx.witness_set().plutus_datums() ?? CML.PlutusDataList.new();
-  const expectedHash = CML.calc_script_data_hash(
-    redeemers,
-    datums,
-    lucid.config().costModels,
-    tx.witness_set().languages(),
-  )!.to_hex();
-
-  expect(tx.body().script_data_hash()?.to_hex()).toBe(expectedHash);
+  expect(tx.redeemers).toHaveLength(2);
+  expect(tx.body.scriptDataHash).toMatch(/^[0-9a-f]{64}$/);
+  // Ledger submission independently checks the final integrity hash against
+  // the actual redeemer bytes, execution budgets, datums, and language views.
+  const signed = await signBuilder.sign.withWallet().complete();
+  expect(await signed.submit()).toBe(tx.hash);
 });

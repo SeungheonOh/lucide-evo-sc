@@ -2,7 +2,7 @@ import { Callout } from "nextra/components";
 
 # Under The Hood: How Evolution Works
 
-## Fundamentals 
+## Fundamentals
 
 Evolution library simplifies the process of building, signing, and submitting Cardano transactions. This document explains the key components and processes that happen "under the hood".
 
@@ -22,7 +22,7 @@ Every UTxO on Cardano must hold a minimum amount of Ada (lovelace), which increa
 ```typescript
 const minLovelace = calculateMinLovelaceFromUTxO(
   coinsPerUtxoByte, // from protocol parameters
-  utxo
+  utxo,
 );
 ```
 
@@ -51,6 +51,7 @@ To be more specific, let's look at a basic case where you have these UTxOs in yo
 - 5 ADA goes to the recipient
 - ~0.18 ADA covers transaction fees
 - ~4.82 ADA returns to your wallet as change
+
 </Callout>
 
 ### Fee Calculation
@@ -76,7 +77,7 @@ const draftTx = await lucid
   .pay.ToAddress("addr_test...", { lovelace: amount })
   .complete();
 
-const fee = (await draftTx.complete()).toTransaction().body().fee();
+const fee = draftTx.toTransaction().body.fee;
 
 // Build the final transaction using calculated fee
 const finalTx = await lucid
@@ -89,36 +90,14 @@ const finalTx = await lucid
 
 ## Integrations
 
-### CML
+### Haskell WASM
 
-CML (Cardano Multiplatform Library) provides low-level primitives for Cardano blockchain interactions, and Lucid Evolution heavily leverages CML for various core functionality.
+This fork bundles a Haskell reactor for Cardano ledger serialization, address and key operations, script application, execution, signing, and sc-tools transaction balancing. The `Emulator` runs the actual convex-mockchain ledger transition rules.
 
-- **Fee Estimation**: Evolution uses CML for base fee calculation, while handling specific cases like script execution fees (via local UPLC or providers) and reference script fees internally.
+The runtime loads once when the package is imported. Node supports ESM and CommonJS. Browsers initialize the reactor asynchronously through the ESM entry; utility methods remain synchronous after import. Browser bundles must serve the packaged `sc-tools.wasm` at the URL resolved by that entry.
 
-- **Key Management**: For operations like deriving addresses from private keys, Evolution provides high-level APIs (like `makeWalletFromPrivateKey`), but you can also use CML directly for more granular control:
+Low-level helpers exchange CBOR hex and plain transaction snapshots. `toTransaction()` exposes fields such as `body.fee`, `body.inputs`, and `redeemers`. CML objects and their memory-management methods are no longer exported.
 
-```typescript
-const pubKeyHash = CML.PrivateKey.from_bech32(privateKey)
-  .to_public()
-  .hash()
-  .to_hex();
-```
+### Hashing
 
-<Callout type="info">
-  While Evolution abstracts most CML complexity, understanding that CML powers
-  the core operations can help when you need fine-grained control or are
-  debugging transaction issues.
-</Callout>
-
-### Noble Hashes
-
-Lucid Evolution doesn't expose hash functions directly. Instead, it recommends using the [noble-hashes](https://github.com/paulmillr/noble-hashes) library for cryptographic hashing needs, which is audited and secure.
-
-- Compatible with both Node.js and browser environments
-- Provides implementations of common hash functions including `blake2b` which is compatible with Aiken's on-chain hash functions
-
-<Callout type="info">
-  When working with smart contracts, ensure you're using the same hash function
-  and parameters as your on-chain code. For example, if using Aiken's
-  `blake2b_224`, configure noble-hashes accordingly.
-</Callout>
+Ledger hashes, including transaction IDs, datum hashes, and script hashes, are calculated inside the Haskell runtime. Public helpers such as `datumToHash` and `mintingPolicyToId` apply the ledger's encoding and hash rules. For application-specific hashing, use the same algorithm, digest length, and input encoding as your on-chain validator.

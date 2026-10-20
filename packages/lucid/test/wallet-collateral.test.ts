@@ -1,6 +1,7 @@
+import type { TransactionSnapshot } from "@lucid-evolution/ledger";
 import { describe, expect, test } from "vitest";
 import {
-  CML,
+  getAddressDetails,
   Data,
   Emulator,
   generateEmulatorAccount,
@@ -17,13 +18,8 @@ import { alwaysSucceedV3Script } from "./fixtures/scripts.js";
 
 const outRef = (utxo: UTxO): string => `${utxo.txHash}#${utxo.outputIndex}`;
 
-const collateralInputs = (tx: CML.Transaction): string[] => {
-  const inputs = tx.body().collateral_inputs();
-  return Array.from({ length: inputs?.len() ?? 0 }, (_, index) => {
-    const input = inputs!.get(index);
-    return `${input.transaction_id().to_hex()}#${input.index()}`;
-  });
-};
+const collateralInputs = (tx: TransactionSnapshot): string[] =>
+  tx.body.collateralInputs.map((ref) => `${ref.txHash}#${ref.outputIndex}`);
 
 // A wallet with ADA-only UTxOs of 2, 5, 7 and 9 ADA plus change, and a script
 // UTxO to spend.
@@ -66,7 +62,7 @@ const spendScript = (
 
 const expectFromWalletUtxos = async (
   lucid: LucidEvolution,
-  tx: CML.Transaction,
+  tx: TransactionSnapshot,
 ) => {
   const walletUtxos = (await lucid.wallet().getUtxos()).map(outRef);
   const collateral = collateralInputs(tx);
@@ -118,7 +114,7 @@ describe("wallet collateral candidates", () => {
     const completed = await spendScript(lucid, scriptUtxo);
     const tx = completed.toTransaction();
     expect(collateralInputs(tx)).toEqual([outRef(candidate)]);
-    expect(tx.body().collateral_return()).toBeUndefined();
+    expect(tx.body.collateralReturn).toBeUndefined();
     await lucid.awaitTx(
       await (await completed.sign.withWallet().complete()).submit(),
     );
@@ -201,23 +197,18 @@ const makeCip30 = async (
   const signer = await Lucid(emulator, "Custom");
   signer.selectWallet.fromSeed(seedPhrase);
   const address = await signer.wallet().address();
-  const addressHex = CML.Address.from_bech32(address).to_hex();
+  const addressHex = getAddressDetails(address).address.hex;
   const api = {
     getNetworkId: async () => 0,
     getUtxos: async () =>
-      (await emulator.getUtxos(address)).map((utxo) =>
-        utxoToCore(utxo).to_cbor_hex(),
-      ),
-    getCollateral: async () => [utxoToCore(collateral()).to_cbor_hex()],
+      (await emulator.getUtxos(address)).map((utxo) => utxoToCore(utxo)),
+    getCollateral: async () => [utxoToCore(collateral())],
     getBalance: async () => "",
     getUsedAddresses: async () => [addressHex],
     getUnusedAddresses: async () => [],
     getChangeAddress: async () => addressHex,
     getRewardAddresses: async () => [],
-    signTx: async (tx: string) =>
-      (
-        await signer.wallet().signTx(CML.Transaction.from_cbor_hex(tx))
-      ).to_cbor_hex(),
+    signTx: async (tx: string) => signer.wallet().signTx(tx),
     signData: async () => {
       throw new Error("not used");
     },

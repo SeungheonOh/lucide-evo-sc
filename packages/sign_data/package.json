@@ -21,24 +21,21 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "lint": "tsc --noEmit",
-    "clean": "rm -rf .turbo && rm -rf node_modules && rm -rf dist"
+    "clean": "rm -rf .turbo && rm -rf node_modules && rm -rf dist",
+    "test": "vitest run"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
-  "browser": {
-    "@emurgo/cardano-message-signing-nodejs": "@emurgo/cardano-message-signing-browser"
-  },
   "dependencies": {
-    "@emurgo/cardano-message-signing-browser": "^1.0.1",
-    "@emurgo/cardano-message-signing-nodejs": "^1.0.1",
-    "@lucid-evolution/cml": "workspace:*",
     "@lucid-evolution/core-types": "workspace:*",
-    "@lucid-evolution/core-utils": "workspace:*"
+    "@lucid-evolution/core-utils": "workspace:*",
+    "@lucid-evolution/ledger": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.12.8",
     "tsup": "^8.0.2",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.4"
   }
 }

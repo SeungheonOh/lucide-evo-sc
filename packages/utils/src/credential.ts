@@ -7,7 +7,7 @@ import {
   RewardAddress,
 } from "@lucid-evolution/core-types";
 import { networkToId } from "./network.js";
-import { CML } from "./core.js";
+import { ledger } from "@lucid-evolution/ledger";
 import { getAddressDetails } from "./address.js";
 import { toHex } from "@lucid-evolution/core-utils";
 import { bech32 } from "@scure/base";
@@ -17,40 +17,11 @@ export function credentialToAddress(
   paymentCredential: Credential,
   stakeCredential?: Credential,
 ): Address {
-  if (stakeCredential) {
-    return CML.BaseAddress.new(
-      networkToId(network),
-      paymentCredential.type === "Key"
-        ? CML.Credential.new_pub_key(
-            CML.Ed25519KeyHash.from_hex(paymentCredential.hash),
-          )
-        : CML.Credential.new_script(
-            CML.ScriptHash.from_hex(paymentCredential.hash),
-          ),
-      stakeCredential.type === "Key"
-        ? CML.Credential.new_pub_key(
-            CML.Ed25519KeyHash.from_hex(stakeCredential.hash),
-          )
-        : CML.Credential.new_script(
-            CML.ScriptHash.from_hex(stakeCredential.hash),
-          ),
-    )
-      .to_address()
-      .to_bech32(undefined);
-  } else {
-    return CML.EnterpriseAddress.new(
-      networkToId(network),
-      paymentCredential.type === "Key"
-        ? CML.Credential.new_pub_key(
-            CML.Ed25519KeyHash.from_hex(paymentCredential.hash),
-          )
-        : CML.Credential.new_script(
-            CML.ScriptHash.from_hex(paymentCredential.hash),
-          ),
-    )
-      .to_address()
-      .to_bech32(undefined);
-  }
+  return ledger("address.fromCredentials", {
+    network: networkToId(network),
+    payment: paymentCredential,
+    stake: stakeCredential,
+  });
 }
 
 export function scriptHashToCredential(scriptHash: ScriptHash): Credential {
@@ -89,10 +60,8 @@ export function stakeCredentialOf(rewardAddress: RewardAddress): Credential {
 
 /**
  * Accepts CIP-105 IDs (`drep` or `drep_script` and the bare hash) and CIP-129
- * IDs (`drep`, a header byte and the hash), with the checks `@cardano-sdk/core`
- * applies, without loading that package. A CIP-129 header must name a DRep
- * (`0x2_`) and a key hash (`0x22`) or script hash (`0x23`), which
- * `@cardano-sdk/core` does not check.
+ * IDs (`drep`, a header byte and the hash). A CIP-129 header must identify
+ * a DRep key hash (`0x22`) or script hash (`0x23`).
  *
  * @example
  * import { drepIDToCredential } from "@lucid-evolution/utils";
@@ -130,3 +99,25 @@ export const drepIDToCredential = (drepID: string): Credential => {
     hash: toHex(payload.subarray(1)),
   };
 };
+
+export function poolIdToHex(poolId: string): string {
+  if (/^[a-fA-F0-9]{56}$/.test(poolId)) return poolId.toLowerCase();
+  const { prefix, words } = bech32.decode(
+    poolId as `${string}1${string}`,
+    1023,
+  );
+  const bytes = bech32.fromWords(words);
+  if (prefix !== "pool" || bytes.length !== 28)
+    throw new Error("Invalid pool ID");
+  return toHex(bytes);
+}
+
+export function hashToBech32(prefix: string, hash: string): string {
+  if (!/^[a-fA-F0-9]{56}$/.test(hash))
+    throw new Error("Invalid credential hash");
+  const bytes = Uint8Array.from(hash.match(/../g)!, (b) => parseInt(b, 16));
+  return bech32.encode(prefix, bech32.toWords(bytes), 1023);
+}
+
+export const poolIdFromHex = (hash: string): string =>
+  hashToBech32("pool", hash);

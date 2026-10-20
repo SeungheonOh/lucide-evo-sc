@@ -7,7 +7,7 @@ import {
   Lucid,
 } from "../src/index.js";
 import { Config, Effect } from "effect";
-import { CML } from "../src/core.js";
+import { generatePrivateKey } from "@lucid-evolution/utils";
 
 const loadConfig = Effect.gen(function* () {
   return yield* Config.all([
@@ -86,7 +86,7 @@ describe("Wallet", () => {
 
   liveProviderTest("selectWallet.fromPrivateKey", async () => {
     const program = Effect.gen(function* () {
-      const privateKey = CML.PrivateKey.generate_ed25519().to_bech32();
+      const privateKey = generatePrivateKey();
       const [VITE_API_URL, VITE_BLOCKFROST_KEY] = yield* loadConfig;
 
       const user = yield* Effect.tryPromise(() =>

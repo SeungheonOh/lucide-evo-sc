@@ -1,7 +1,11 @@
+import {
+  inspectTransaction,
+  type TransactionSnapshot,
+  type LedgerOutRef,
+} from "@lucid-evolution/ledger";
 import { describe, expect, test } from "vitest";
 import {
   applyParamsToScript,
-  CML,
   Data,
   Emulator,
   EvaluatorAdapter,
@@ -81,14 +85,7 @@ const spend = (
     .pay.ToAddress(fixture.address, { lovelace: 10_000_000n })
     .complete(options);
 
-const outRefs = (inputs: CML.TransactionInputList | undefined) =>
-  Array.from({ length: inputs?.len() ?? 0 }, (_, index) => {
-    const input = inputs!.get(index);
-    return {
-      txHash: input.transaction_id().to_hex(),
-      outputIndex: Number(input.index()),
-    };
-  });
+const outRefs = (inputs: LedgerOutRef[] | undefined) => inputs ?? [];
 
 /**
  * Asserts the ledger's collateral rule on the completed transaction, returning
@@ -100,19 +97,19 @@ const expectLedgerCollateral = async (
   signBuilder: TxSignBuilder,
 ): Promise<bigint> => {
   const tx = signBuilder.toTransaction();
-  const body = tx.body();
-  expect(tx.witness_set().redeemers()).toBeDefined();
+  const body = tx.body;
+  expect(tx.redeemers.length).toBeGreaterThan(0);
   const collateralInputs: UTxO[] = await fixture.emulator.getUtxosByOutRef(
-    outRefs(body.collateral_inputs()),
+    outRefs(body.collateralInputs),
   );
   expect(collateralInputs.length).toBeGreaterThan(0);
   const balance =
     collateralInputs.reduce((sum, utxo) => sum + utxo.assets.lovelace, 0n) -
-    (body.collateral_return()?.amount().coin() ?? 0n);
+    (body.collateralReturn?.assets.lovelace ?? 0n);
   const required =
-    (body.fee() * BigInt(EXPENSIVE_PRICES.collateralPercentage) + 99n) / 100n;
+    (body.fee * BigInt(EXPENSIVE_PRICES.collateralPercentage) + 99n) / 100n;
   expect(balance).toBeGreaterThanOrEqual(required);
-  const totalCollateral = body.total_collateral();
+  const totalCollateral = body.totalCollateral;
   if (totalCollateral !== undefined) expect(totalCollateral).toBe(balance);
   await fixture.lucid.awaitTx(
     await (await signBuilder.sign.withWallet().complete()).submit(),
@@ -124,18 +121,11 @@ const expectLedgerCollateral = async (
 const largeExUnitsEvaluator: EvaluatorAdapter = {
   name: "large-ex-units",
   evaluate: async ({ tx }) => {
-    const redeemers = CML.Transaction.from_cbor_hex(tx)
-      .witness_set()
-      .redeemers()!
-      .to_flat_format();
-    return Array.from({ length: redeemers.len() }, (_, index) => {
-      const redeemer = redeemers.get(index);
-      return {
-        redeemer_tag: "spend" as const,
-        redeemer_index: Number(redeemer.index()),
-        ex_units: { mem: 3_000_000, steps: 1_000_000_000 },
-      };
-    });
+    return inspectTransaction(tx).redeemers.map((redeemer) => ({
+      redeemer_tag: "spend" as const,
+      redeemer_index: Number(redeemer.index),
+      ex_units: { mem: 3_000_000, steps: 1_000_000_000 },
+    }));
   },
 };
 
@@ -259,8 +249,7 @@ describe("completed script transactions satisfy the ledger collateral rule", () 
     const evaluator: EvaluatorAdapter = {
       name: "collateral-dependent",
       evaluate: async ({ tx }) => {
-        const collateral =
-          CML.Transaction.from_cbor_hex(tx).body().total_collateral() ?? 0n;
+        const collateral = inspectTransaction(tx).body.totalCollateral ?? 0n;
         return [
           {
             redeemer_tag: "spend",
@@ -278,18 +267,17 @@ describe("completed script transactions satisfy the ledger collateral rule", () 
 
 // Counts evaluator calls; the execution units may depend on the transaction.
 const countingEvaluator = (
-  exUnits: (tx: CML.Transaction) => { mem: number; steps: number },
+  exUnits: (tx: TransactionSnapshot) => { mem: number; steps: number },
 ) => {
   const counter = { calls: 0 };
   const evaluator: EvaluatorAdapter = {
     name: "counting",
     evaluate: async ({ tx }) => {
       counter.calls++;
-      const transaction = CML.Transaction.from_cbor_hex(tx);
-      const redeemers = transaction.witness_set().redeemers()!.to_flat_format();
-      return Array.from({ length: redeemers.len() }, (_, index) => ({
+      const transaction = inspectTransaction(tx);
+      return transaction.redeemers.map((redeemer) => ({
         redeemer_tag: "spend" as const,
-        redeemer_index: Number(redeemers.get(index).index()),
+        redeemer_index: Number(redeemer.index),
         ex_units: exUnits(transaction),
       }));
     },
@@ -303,13 +291,11 @@ const SMALL_EX_UNITS = { mem: 1_000, steps: 1_000_000 };
 // Small execution units for the collateral-free draft, large ones once the
 // transaction carries collateral: the collateral sized from the draft's fee
 // must grow for the final fee.
-const growingExUnits = (tx: CML.Transaction) =>
-  (tx.body().collateral_inputs()?.len() ?? 0) > 0
-    ? LARGE_EX_UNITS
-    : SMALL_EX_UNITS;
+const growingExUnits = (tx: TransactionSnapshot) =>
+  tx.body.collateralInputs.length > 0 ? LARGE_EX_UNITS : SMALL_EX_UNITS;
 
 const collateralOutRefs = (signBuilder: TxSignBuilder) =>
-  outRefs(signBuilder.toTransaction().body().collateral_inputs()).map(
+  outRefs(signBuilder.toTransaction().body.collateralInputs).map(
     ({ txHash, outputIndex }) => `${txHash}#${outputIndex}`,
   );
 
@@ -355,11 +341,11 @@ describe("collateral top-up", () => {
     const fixture = await setup(alwaysSucceedV3Script);
     const { evaluator } = countingEvaluator(growingExUnits);
     const signBuilder = await spend(fixture, { evaluator });
-    const body = signBuilder.toTransaction().body();
+    const body = signBuilder.toTransaction().body;
     expect(collateralOutRefs(signBuilder)).toHaveLength(1);
     const required = await expectLedgerCollateral(fixture, signBuilder);
     expect(required).toBeGreaterThan(5_000_000n);
-    expect(body.total_collateral()).toBe(required);
+    expect(body.totalCollateral).toBe(required);
   });
 
   test("a top-up adds a collateral input when the selected ones cannot cover it", async () => {

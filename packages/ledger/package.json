@@ -1,0 +1,38 @@
+{
+  "name": "@lucid-evolution/ledger",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/node.cjs",
+  "types": "./dist/node.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/node.d.ts",
+      "browser": "./dist/browser.js",
+      "import": "./dist/node.js",
+      "require": "./dist/node.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "sc-tools.wasm",
+    "THIRD_PARTY_NOTICES.txt",
+    "artifact.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bjorn3/browser_wasi_shim": "0.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.16",
+    "tsup": "^8.3.6",
+    "typescript": "5.5.0-dev.20240430",
+    "vitest": "^2.1.8"
+  },
+  "description": "Haskell WASM Cardano ledger primitives for Lucid",
+  "license": "MIT"
+}

@@ -1,68 +1,55 @@
-import { Assets, PolicyId, UTxO, Unit } from "@lucid-evolution/core-types";
-import {
-  fromHex,
-  fromText,
-  toHex,
-  toText,
-  withCMLScope,
-} from "@lucid-evolution/core-utils";
-import { CML } from "./core.js";
+import type { Assets, PolicyId, UTxO, Unit } from "@lucid-evolution/core-types";
+import { fromHex, toHex } from "@lucid-evolution/core-utils";
 import { fromLabel, toLabel } from "./label.js";
 import { pipe } from "effect/Function";
+import {
+  asBytes,
+  asInteger,
+  asList,
+  asMap,
+  decodeTerm,
+  encodeTerm,
+  integer,
+  type CborTerm,
+} from "./ledger-cbor.js";
 
-export function valueToAssets(value: CML.Value): Assets {
-  const assets: Assets = {};
-  assets["lovelace"] = value.coin();
-  if (value.has_multiassets()) {
-    withCMLScope((own) => {
-      const ma = own(value.multi_asset());
-      const multiAssets = own(ma.keys());
-      for (let j = 0; j < multiAssets.len(); j++) {
-        const policy = own(multiAssets.get(j));
-        const policyAssets = own(ma.get_assets(policy)!);
-        const assetNames = own(policyAssets.keys());
-        for (let k = 0; k < assetNames.len(); k++) {
-          const policyAsset = own(assetNames.get(k));
-          const quantity = policyAssets.get(policyAsset)!;
-          // Note: Using policyAsset.to_js_value() as a work around till AssetName provides to_hex() method
-          // https://github.com/dcSpark/cardano-multiplatform-lib/issues/334
-          const unit = policy.to_hex() + policyAsset.to_js_value();
-          assets[unit] = quantity;
-        }
-      }
-    });
-  }
+export function valueToAssets(cbor: string): Assets {
+  const value = decodeTerm(cbor);
+  if (value && typeof value === "object" && "int" in value)
+    return { lovelace: BigInt(value.int) };
+  const [coin, policies] = asList(value);
+  const assets: Assets = { lovelace: asInteger(coin) };
+  for (const [policy, names] of asMap(policies))
+    for (const [name, amount] of asMap(names))
+      assets[asBytes(policy) + asBytes(name)] = asInteger(amount);
   return assets;
 }
 
-export function assetsToValue(assets: Assets): CML.Value {
-  return withCMLScope((own) => {
-    const multiAsset = own(CML.MultiAsset.new());
-    const lovelace = assets["lovelace"] ? BigInt(assets["lovelace"]) : 0n;
-    const units = Object.keys(assets);
-    const policies = Array.from(
-      new Set(
-        units
-          .filter((unit) => unit !== "lovelace")
-          .map((unit) => unit.slice(0, 56)),
-      ),
-    );
-    for (const policy of policies) {
-      const policyUnits = units.filter((unit) => unit.slice(0, 56) === policy);
-      const assetsValue = own(CML.MapAssetNameToCoin.new());
-      for (const unit of policyUnits) {
-        assetsValue.insert(
-          own(CML.AssetName.from_hex(unit.slice(56))),
-          BigInt(assets[unit]),
-        );
-      }
-      multiAsset.insert_assets(
-        own(CML.ScriptHash.from_hex(policy)),
-        assetsValue,
-      );
-    }
-    return CML.Value.new(lovelace, multiAsset);
-  });
+export function assetsToValue(assets: Assets): string {
+  const policies = new Map<string, [CborTerm, CborTerm][]>();
+  for (const [unit, amount] of Object.entries(assets)) {
+    if (unit === "lovelace") continue;
+    const policy = unit.slice(0, 56);
+    const names = policies.get(policy) ?? [];
+    names.push([{ bytes: unit.slice(56) }, integer(amount)]);
+    policies.set(policy, names);
+  }
+  const coin = integer(assets.lovelace ?? 0n);
+  return encodeTerm(
+    policies.size
+      ? {
+          list: [
+            coin,
+            {
+              map: [...policies].map(([policy, names]) => [
+                { bytes: policy },
+                { map: names },
+              ]),
+            },
+          ],
+        }
+      : coin,
+  );
 }
 
 /**

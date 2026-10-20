@@ -1,4 +1,4 @@
-import { CML } from "./core.js";
+import { hashToBech32 } from "@lucid-evolution/utils";
 import { fromHex, sleep } from "@lucid-evolution/core-utils";
 import {
   applyDoubleCborEncoding,
@@ -42,12 +42,10 @@ const toBlockfrostQueryPredicate = (
   addressOrCredential: Address | Credential,
 ): string => {
   if (typeof addressOrCredential === "string") return addressOrCredential;
-  if (addressOrCredential.type === "Key") {
-    return CML.Ed25519KeyHash.from_hex(addressOrCredential.hash).to_bech32(
-      "addr_vkh",
-    );
-  }
-  return CML.ScriptHash.from_hex(addressOrCredential.hash).to_bech32("script");
+  return hashToBech32(
+    addressOrCredential.type === "Key" ? "addr_vkh" : "script",
+    addressOrCredential.hash,
+  );
 };
 
 export class Blockfrost implements Provider {

@@ -3,8 +3,10 @@ import { describe, expect, test } from "vitest";
 import {
   PROTOCOL_PARAMETERS_DEFAULT,
   validatorToAddress,
+  scriptFromNative,
 } from "@lucid-evolution/utils";
-import { CML } from "../src/core.js";
+import { ledger } from "@lucid-evolution/ledger";
+import { fixtureTransaction } from "./transaction-fixture.js";
 import {
   Emulator,
   generateEmulatorAccountFromPrivateKey,
@@ -18,20 +20,9 @@ const SCRIPT_UTXO_HASH = "11".repeat(32);
 const REFERENCE_UTXO_HASH = "22".repeat(32);
 
 const keyHashOf = (privateKey: string): string =>
-  CML.PrivateKey.from_bech32(privateKey).to_public().hash().to_hex();
-
-const requireSignature = (keyHash: string): Script => ({
-  type: "Native",
-  script: CML.NativeScript.new_script_pubkey(
-    CML.Ed25519KeyHash.from_hex(keyHash),
-  ).to_cbor_hex(),
-});
-
-const txInput = (txHash: string, outputIndex: number) =>
-  CML.TransactionInput.new(
-    CML.TransactionHash.from_hex(txHash),
-    BigInt(outputIndex),
-  );
+  ledger<{ keyHash: string }>("key.fromPrivate", { privateKey }).keyHash;
+const requireSignature = (keyHash: string): Script =>
+  scriptFromNative({ type: "sig", keyHash });
 
 const setup = () => {
   const owner = generateEmulatorAccountFromPrivateKey({
@@ -75,30 +66,16 @@ const spendWithReferenceScript = (
   signer: { address: string; privateKey: string },
   genesisIndex: number,
 ): string => {
-  const inputs = CML.TransactionInputList.new();
-  inputs.add(txInput(GENESIS_HASH, genesisIndex));
-  inputs.add(txInput(SCRIPT_UTXO_HASH, 0));
-  const outputs = CML.TransactionOutputList.new();
-  outputs.add(
-    CML.TransactionOutput.new(
-      CML.Address.from_bech32(signer.address),
-      CML.Value.from_coin(109_800_000n),
-    ),
-  );
-  const body = CML.TransactionBody.new(inputs, outputs, 200_000n);
-  const referenceInputs = CML.TransactionInputList.new();
-  referenceInputs.add(txInput(REFERENCE_UTXO_HASH, 0));
-  body.set_reference_inputs(referenceInputs);
-  const witnesses = CML.TransactionWitnessSet.new();
-  const vkeys = CML.VkeywitnessList.new();
-  vkeys.add(
-    CML.make_vkey_witness(
-      CML.hash_transaction(body),
-      CML.PrivateKey.from_bech32(signer.privateKey),
-    ),
-  );
-  witnesses.set_vkeywitnesses(vkeys);
-  return CML.Transaction.new(body, witnesses, true).to_cbor_hex();
+  return fixtureTransaction({
+    inputs: [
+      { txHash: GENESIS_HASH, outputIndex: genesisIndex },
+      { txHash: SCRIPT_UTXO_HASH, outputIndex: 0 },
+    ],
+    outputs: [{ address: signer.address, assets: { lovelace: 109_800_000n } }],
+    fee: 200_000n,
+    referenceInputs: [{ txHash: REFERENCE_UTXO_HASH, outputIndex: 0 }],
+    privateKeys: [signer.privateKey],
+  });
 };
 
 describe("Emulator native reference scripts", () => {
@@ -113,9 +90,8 @@ describe("Emulator native reference scripts", () => {
 
   test("rejects a spend whose signer does not satisfy the reference script", async () => {
     const { emulator, other } = setup();
-    // submitTx throws before it returns a promise.
     await expect(
       (async () => emulator.submitTx(spendWithReferenceScript(other, 1)))(),
-    ).rejects.toThrow(/Invalid native script witness/);
+    ).rejects.toThrow(/ScriptWitnessNotValidating/);
   });
 });

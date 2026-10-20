@@ -1,37 +1,43 @@
 import { describe, expect, test } from "vitest";
 import { Emulator, generateEmulatorAccount } from "@lucid-evolution/provider";
-import { CML } from "../src/core.js";
+import {
+  decodeCbor,
+  encodeCbor,
+  inspectTransaction,
+  hexToBytes,
+  type CborValue,
+} from "@lucid-evolution/ledger";
+import { utxoToTransactionOutput } from "@lucid-evolution/utils";
 import { createTxGraph } from "../src/graph.js";
 import { outRefKey } from "../src/resolve.js";
-
-const makeInput = (txHash: string, outputIndex: number): CML.TransactionInput =>
-  CML.TransactionInput.new(
-    CML.TransactionHash.from_hex(txHash),
-    BigInt(outputIndex),
-  );
 
 const makeEvaluationTx = (
   txHash: string,
   outputIndex: number,
   address: string,
-): CML.Transaction => {
-  const inputs = CML.TransactionInputList.new();
-  inputs.add(makeInput(txHash, outputIndex));
-
-  const outputs = CML.TransactionOutputList.new();
-  outputs.add(
-    CML.TransactionOutput.new(
-      CML.Address.from_bech32(address),
-      CML.Value.from_coin(2_000_000n),
-    ),
+) =>
+  inspectTransaction(
+    encodeCbor([
+      new Map<CborValue, CborValue>([
+        [0n, [[hexToBytes(txHash), BigInt(outputIndex)]]],
+        [
+          1n,
+          [
+            decodeCbor(
+              utxoToTransactionOutput({
+                address,
+                assets: { lovelace: 2_000_000n },
+              }),
+            ),
+          ],
+        ],
+        [2n, 170_000n],
+      ]),
+      new Map(),
+      true,
+      null,
+    ]),
   );
-
-  return CML.Transaction.new(
-    CML.TransactionBody.new(inputs, outputs, 170_000n),
-    CML.TransactionWitnessSet.new(),
-    true,
-  );
-};
 
 describe("tx graph with Emulator provider", () => {
   test("wraps a real Emulator evaluateTx flow and resolves additional UTxOs", async () => {
@@ -55,7 +61,7 @@ describe("tx graph with Emulator provider", () => {
     });
 
     await expect(
-      tracedProvider.evaluateTx(tx.to_cbor_hex(), [seedUtxo]),
+      tracedProvider.evaluateTx(tx.cbor, [seedUtxo]),
     ).resolves.toEqual([]);
 
     const trace = graph.toJSON();

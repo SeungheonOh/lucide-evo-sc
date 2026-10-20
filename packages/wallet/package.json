@@ -28,12 +28,12 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@lucid-evolution/cml": "workspace:*",
     "@lucid-evolution/core-types": "workspace:*",
     "@lucid-evolution/core-utils": "workspace:*",
     "@lucid-evolution/sign_data": "workspace:*",
     "@lucid-evolution/utils": "workspace:*",
-    "bip39": "^3.1.0"
+    "@lucid-evolution/ledger": "workspace:*",
+    "@scure/bip39": "^1.6.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.8",

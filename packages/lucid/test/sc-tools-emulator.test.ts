@@ -1,14 +1,24 @@
+import {
+  getLedgerRuntime,
+  encodeCbor,
+  decodeCbor,
+  CborTag,
+  type CborValue,
+} from "@lucid-evolution/ledger";
+import { fromHex, toHex } from "@lucid-evolution/core-utils";
+import {
+  credentialToRewardAddress,
+  validatorToScriptHash,
+  poolIdFromHex,
+} from "@lucid-evolution/utils";
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import { readFile } from "node:fs/promises";
 import {
   mintingPolicyToId,
   applyParamsToScript,
-  makeAikenEvaluator,
-  CML,
+  makeHaskellEvaluator,
   Data,
   Lucid,
   ScToolsEmulator,
-  createScToolsWasmRuntime,
   generateEmulatorAccount,
   getAddressDetails,
   validatorToAddress,
@@ -24,13 +34,10 @@ import {
   feeThresholdV3Script,
 } from "./fixtures/scripts.js";
 
-const wasmPath = process.env.SC_TOOLS_WASM;
-describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
+describe("convex-mockchain actual WASM", () => {
   let runtime: ScToolsRuntime;
   beforeAll(async () => {
-    runtime = await createScToolsWasmRuntime(
-      await WebAssembly.compile(await readFile(wasmPath!)),
-    );
+    runtime = getLedgerRuntime();
   });
   const setup = async (extras: EmulatorAccount[] = []) => {
     const account = generateEmulatorAccount({ lovelace: 1_000_000_000_000n });
@@ -63,7 +70,8 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       );
       const context = await emulator.getChainContext();
       expect(context.protocolParameters.protocolVersion).toEqual({
-        major: version ?? 10,
+        // ScToolsEmulator is the standard Emulator alias and preserves its default.
+        major: version ?? 11,
         minor: 0,
       });
     },
@@ -112,21 +120,14 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       expect(calls).not.toContain("provided");
       if (delayed) expect(calls).toContain("bootstrap");
       const evaluated = await emulator.evaluateTx(tx.toCBOR());
-      const redeemer = tx
-        .toTransaction()
-        .witness_set()
-        .redeemers()!
-        .to_flat_format()
-        .get(0);
-      expect(redeemer.ex_units().steps()).toBe(
-        BigInt(evaluated[0].ex_units.steps),
-      );
-      expect(redeemer.ex_units().mem()).toBe(BigInt(evaluated[0].ex_units.mem));
+      const redeemer = tx.toTransaction().redeemers[0];
+      expect(redeemer.exUnits.steps).toBe(BigInt(evaluated[0].ex_units.steps));
+      expect(redeemer.exUnits.mem).toBe(BigInt(evaluated[0].ex_units.mem));
       await submit(sc, tx);
     },
   );
 
-  test("accepts explicit Aiken and byte evaluators with delayed redeemers", async () => {
+  test("accepts explicit Haskell and byte evaluators with delayed redeemers", async () => {
     const { lucid, account, emulator } = await setup();
     const script = alwaysSucceedV3Script;
     const address = validatorToAddress("Custom", script);
@@ -173,19 +174,13 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
     const fromBytes = await build(bytes);
     expect(bytesCalls).toBeGreaterThan(0);
     expect(hexCalls).toBe(0);
-    const fromAiken = await build(makeAikenEvaluator());
-    const final = fromAiken
-      .toTransaction()
-      .witness_set()
-      .redeemers()!
-      .to_flat_format()
-      .get(0)
-      .ex_units();
-    const expected = await emulator.evaluateTx(fromAiken.toCBOR());
-    expect(final.steps()).toBe(BigInt(expected[0].ex_units.steps));
-    expect(final.mem()).toBe(BigInt(expected[0].ex_units.mem));
-    expect(fromBytes.toTransaction().body().fee()).toBeGreaterThan(0n);
-    await submit(lucid, fromAiken);
+    const fromHaskell = await build(makeHaskellEvaluator());
+    const final = fromHaskell.toTransaction().redeemers[0].exUnits;
+    const expected = await emulator.evaluateTx(fromHaskell.toCBOR());
+    expect(final.steps).toBe(BigInt(expected[0].ex_units.steps));
+    expect(final.mem).toBe(BigInt(expected[0].ex_units.mem));
+    expect(fromBytes.toTransaction().body.fee).toBeGreaterThan(0n);
+    await submit(lucid, fromHaskell);
   });
 
   test("synchronizes public ledger fixtures into actual ledger validation", async () => {
@@ -218,14 +213,14 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       .newTx()
       .pay.ToAddress(account.address, { lovelace: 200_000_000n })
       .complete();
-    expect(tx.toTransaction().body().fee()).toBeGreaterThan(300_000n);
+    expect(tx.toTransaction().body.fee).toBeGreaterThan(300_000n);
     await submit(lucid, tx);
     expect(
       (await lucid.wallet().getUtxos()).reduce(
         (sum, u) => sum + u.assets.lovelace,
         0n,
       ),
-    ).toBe(400_000_000n - tx.toTransaction().body().fee());
+    ).toBe(400_000_000n - tx.toTransaction().body.fee);
   });
 
   test("synchronizes stake, reward and treasury fixtures without losing ledger deposits", async () => {
@@ -244,7 +239,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
     emulator.chain[reward] = {
       registeredStake: true,
       delegation: {
-        poolId: CML.Ed25519KeyHash.from_hex("11".repeat(28)).to_bech32("pool"),
+        poolId: poolIdFromHex("11".repeat(28)),
         rewards: 10_000_000n,
       },
     };
@@ -270,7 +265,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
     expect((await emulator.getRewardAccount(reward)).registered).toBe(true);
   });
 
-  test.each(["sc-tools", "cml"] as const)(
+  test.each(["sc-tools", "default"] as const)(
     "spends Plutus V1 datum hashes through the real ledger with %s",
     async (backend) => {
       const { account, emulator } = await setup();
@@ -311,21 +306,13 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
   test("mints and burns native tokens and validates a Byron destination", async () => {
     const { lucid, account, emulator } = await setup();
     const hash = getAddressDetails(account.address).paymentCredential!.hash;
-    const native = CML.NativeScript.new_script_pubkey(
-      CML.Ed25519KeyHash.from_hex(hash),
-    );
-    const policy = { type: "Native" as const, script: native.to_cbor_hex() };
+    const policy = {
+      type: "Native" as const,
+      script: encodeCbor([0n, fromHex(hash)]),
+    };
     const unit = mintingPolicyToId(policy) + "abcd";
-    const key = CML.Bip32PrivateKey.from_bip39_entropy(
-      new Uint8Array(32).fill(1),
-      new Uint8Array(),
-    );
-    const byron = CML.AddressContent.icarus_from_key(
-      key.to_public(),
-      CML.ProtocolMagic.new(1),
-    )
-      .to_address()
-      .to_base58();
+    const byron =
+      "FHnt4NL7yPYE12tjbSxG56jGYhzPQUfnCS2GkRhtyBzeVG3CHVJgPUFbdRFWgY2";
     await submit(
       lucid,
       await lucid
@@ -407,7 +394,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       .attach.SpendingValidator(script)
       .pay.ToAddress(account.address, { lovelace: 2_000_000n })
       .complete({ localUPLCEval: false, setCollateral: 7_000_000n });
-    expect(tx.toTransaction().body().total_collateral()).toBe(7_000_000n);
+    expect(tx.toTransaction().body.totalCollateral).toBe(7_000_000n);
     await submit(lucid, tx);
     expect(await emulator.getUtxos(lockedAddress)).toHaveLength(0);
   });
@@ -423,7 +410,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       })
       .setMinFee(1_000_000n)
       .complete();
-    expect(tx.toTransaction().body().fee()).toBe(1_000_000n);
+    expect(tx.toTransaction().body.fee).toBe(1_000_000n);
     await submit(lucid, tx);
   });
   test("tracks stake registration deposits and refunds in the real ledger", async () => {
@@ -441,10 +428,8 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
   });
   test("tracks DRep state and validates duplicate registrations", async () => {
     const { lucid, emulator, account } = await setup();
-    const credential = CML.Address.from_bech32(account.address).payment_cred()!;
-    const drep = CML.RewardAddress.new(0, credential)
-      .to_address()
-      .to_bech32(undefined);
+    const credential = getAddressDetails(account.address).paymentCredential!;
+    const drep = credentialToRewardAddress("Custom", credential);
     await submit(lucid, await lucid.newTx().register.DRep(drep).complete());
     expect((await emulator.getChainContext()).drepDeposits).toHaveLength(1);
     const duplicate = await lucid.newTx().register.DRep(drep).complete();
@@ -463,7 +448,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       expect(await emulator.getTreasury()).toBe(100_000n + n * 1_000_000n);
     }
   });
-  test.each(["sc-tools", "cml"])(
+  test.each(["sc-tools", "default"])(
     "submits mixed script/key Conway votes through the ledger with %s",
     async (backend) => {
       const setupResult = await setup();
@@ -474,9 +459,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
           : await Lucid(emulator, "Custom");
       lucid.selectWallet.fromSeed(account.seedPhrase);
       const reward = (await lucid.wallet().rewardAddress())!;
-      const cred = CML.RewardAddress.from_address(
-        CML.Address.from_bech32(reward),
-      )!.payment();
+      const cred = getAddressDetails(reward).stakeCredential!;
       await submit(
         lucid,
         await lucid
@@ -505,7 +488,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
           .vote(
             {
               type: "DRep",
-              credential: { type: "Key", hash: cred.as_pub_key()!.to_hex() },
+              credential: { type: "Key", hash: cred.hash },
             },
             { txHash: proposalHash, index: 0 },
             "Yes",
@@ -530,7 +513,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
         .vote(
           {
             type: "DRep",
-            credential: { type: "Key", hash: cred.as_pub_key()!.to_hex() },
+            credential: { type: "Key", hash: cred.hash },
           },
           { txHash: proposalHash, index: 0 },
           "No",
@@ -561,10 +544,8 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
     async (margin) => {
       const { lucid, emulator, account } = await setup();
       const reward = (await lucid.wallet().rewardAddress())!;
-      const key = CML.Address.from_bech32(account.address)
-        .payment_cred()!
-        .as_pub_key()!;
-      const poolId = key.to_bech32("pool");
+      const key = getAddressDetails(account.address).paymentCredential!.hash;
+      const poolId = poolIdFromHex(key);
       const metadata =
         '{"name":"Fixture","ticker":"SC","homepage":"https://example.com","description":"Test pool"}';
       const fetchMock = vi
@@ -605,23 +586,19 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       } finally {
         fetchMock.mockRestore();
       }
-      const params = poolTx
-        .toTransaction()
-        .body()
-        .certs()!
-        .get(0)
-        .as_pool_registration()!
-        .pool_params();
-      expect(params.margin().start()).toBe(margin === 0 ? 0n : 1n);
-      expect(params.margin().end()).toBe(margin === 0 ? 1n : 8n);
-      expect(params.relays().len()).toBe(3);
-      expect(params.pool_metadata()!.pool_metadata_hash().to_hex()).toBe(
+      const params = poolTx.toTransaction().body.certificates[0] as CborValue[];
+      const marginValue =
+        params[5] instanceof CborTag
+          ? (params[5].value as CborValue[])
+          : (params[5] as CborValue[]);
+      expect(marginValue[0]).toBe(margin === 0 ? 0n : 1n);
+      expect(marginValue[1]).toBe(margin === 0 ? 1n : 8n);
+      expect((params[8] as CborValue[]).length).toBe(3);
+      expect(toHex((params[9] as CborValue[])[1] as Uint8Array)).toBe(
         "953a8195fedf3b7ef6da7d8f4a42b3657bf9c2120730775b3d826d0ecf6365f2",
       );
       await submit(lucid, poolTx);
-      expect((await emulator.getChainContext()).stakePools).toEqual([
-        key.to_hex(),
-      ]);
+      expect((await emulator.getChainContext()).stakePools).toEqual([key]);
       emulator.distributeRewards(5_000_000n);
       expect((await emulator.getDelegation(reward)).rewards).toBe(5_000_000n);
       await submit(
@@ -711,7 +688,7 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       .newTx()
       .pay.ToAddress(recipient.address, { lovelace: 2_000_000n })
       .complete();
-    expect(tx.toTransaction().body().outputs().len()).toBeGreaterThan(2);
+    expect(tx.toTransaction().body.outputs.length).toBeGreaterThan(2);
     await submit(lucid, tx);
     const received = (await emulator.getUtxos(account.address)).reduce<
       Record<string, bigint>
@@ -741,8 +718,8 @@ describe.skipIf(!wasmPath)("convex-mockchain actual WASM", () => {
       coinSelection: false,
       includeLeftoverLovelaceAsFee: true,
     });
-    expect(tx.toTransaction().body().fee()).toBe(1_000_000n);
-    expect(tx.toTransaction().body().outputs().len()).toBe(1);
+    expect(tx.toTransaction().body.fee).toBe(1_000_000n);
+    expect(tx.toTransaction().body.outputs.length).toBe(1);
     await submit(lucid, tx);
   });
 });

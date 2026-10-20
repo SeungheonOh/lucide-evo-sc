@@ -1,3 +1,4 @@
+import { getLedgerRuntime } from "@lucid-evolution/ledger";
 import type { ProtocolParameters } from "@lucid-evolution/core-types";
 import type { LucidConfig } from "../lucid-evolution/LucidEvolution.js";
 import type { ScToolsChainContext } from "./types.js";
@@ -8,7 +9,7 @@ export function protocolOverrides(
 ): Record<string, unknown> {
   return {
     protocolVersion: {
-      // Match Lucid's Aiken fallback when a provider omits the version.
+      // Match Lucid's generic-provider fallback when a provider omits the version.
       major: p.protocolMajorVersion ?? 10,
       minor: p.protocolMinorVersion ?? 0,
     },
@@ -33,16 +34,37 @@ export function protocolOverrides(
   };
 }
 
-/** Use exactly the parameter snapshot and slot mapping that the CML backend uses. */
+/** Use exactly the parameter snapshot and slot mapping that Lucid uses. */
 export async function scChainContext(
   config: LucidConfig,
 ): Promise<ScToolsChainContext> {
-  const backend = config.balancer!;
-  if (backend.chainContext) return backend.chainContext(config);
+  const backend = config.balancer ?? { runtime: getLedgerRuntime() };
+  if ("chainContext" in backend && backend.chainContext)
+    return backend.chainContext(config);
+  const provider = config.provider as typeof config.provider & {
+    getChainContext?: () => Promise<ScToolsChainContext>;
+  };
+  const current = provider.getChainContext
+    ? await provider.getChainContext()
+    : undefined;
+  const parameters = protocolOverrides(config.protocolParameters);
+  const currentVersion = current?.protocolParameters.protocolVersion as
+    | { major: number; minor: number }
+    | undefined;
+  if (
+    currentVersion &&
+    config.protocolParameters.protocolMajorVersion === undefined
+  ) {
+    parameters.protocolVersion = {
+      ...currentVersion,
+      minor:
+        config.protocolParameters.protocolMinorVersion ?? currentVersion.minor,
+    };
+  }
   const response = (await backend.runtime.run({
     action: "lucidContext",
     network: config.network.toLowerCase(),
-    protocolParameters: protocolOverrides(config.protocolParameters),
+    protocolParameters: { ...current?.protocolParameters, ...parameters },
     slotConfig: config.slotConfig,
   })) as { ok?: boolean; error?: string; chain?: ScToolsChainContext };
   if (!response?.ok || !response.chain) {
@@ -50,5 +72,12 @@ export async function scChainContext(
       `sc-tools could not prepare Lucid context: ${response?.error ?? "missing chain context"}`,
     );
   }
-  return response.chain;
+  return current
+    ? {
+        ...current,
+        protocolParameters: response.chain.protocolParameters,
+        systemStart: response.chain.systemStart,
+        eraSummaries: response.chain.eraSummaries,
+      }
+    : response.chain;
 }

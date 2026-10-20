@@ -1,12 +1,18 @@
 import { expect, it } from "vitest";
-import * as CML from "@lucid-evolution/cml";
 import { coreToUtxo, utxoToCore } from "../src/index.js";
+import {
+  bytesToHex,
+  CborTag,
+  decodeCbor,
+  encodeCbor,
+  hexToBytes,
+  type CborValue,
+} from "@lucid-evolution/ledger";
 import { UTxO } from "@lucid-evolution/core-types";
 
 it("should deserialize CBOR UTXO data from the first sample", () => {
-  const cmlUTXO = CML.TransactionUnspentOutput.from_cbor_hex(
-    "8282582095cdc0b23b21f9f0ac5b2580b025c4bc64034ff5e9d97f8ecb51d78151a3223f18228258390115c2e6ade9b92c86a252f6fb1d2a01b2d70a6a5db943fd368bd30c6fc28ad299e38676d1647f6d8f31234c34a914d8488ff86ca2d5df70df821a00116d86a1581cffbe813449ec642880ec645af88a4df2f586b0b677c44ecf4a1ef834a145414d494c4b01",
-  );
+  const encodedUTxO =
+    "8282582095cdc0b23b21f9f0ac5b2580b025c4bc64034ff5e9d97f8ecb51d78151a3223f18228258390115c2e6ade9b92c86a252f6fb1d2a01b2d70a6a5db943fd368bd30c6fc28ad299e38676d1647f6d8f31234c34a914d8488ff86ca2d5df70df821a00116d86a1581cffbe813449ec642880ec645af88a4df2f586b0b677c44ecf4a1ef834a145414d494c4b01";
   const utxo: UTxO = {
     txHash: "95cdc0b23b21f9f0ac5b2580b025c4bc64034ff5e9d97f8ecb51d78151a3223f",
     outputIndex: 34,
@@ -20,13 +26,12 @@ it("should deserialize CBOR UTXO data from the first sample", () => {
     datum: undefined,
     scriptRef: undefined,
   };
-  expect(coreToUtxo(cmlUTXO)).toStrictEqual(utxo);
+  expect(coreToUtxo(encodedUTxO)).toStrictEqual(utxo);
 });
 
 it("should deserialize CBOR UTXO data from the second sample", () => {
-  const cmlUTXO = CML.TransactionUnspentOutput.from_cbor_hex(
-    "8282582037e57c21550383d404248c67c6611f64d2db8e33ea08d81090324b34ac44a9c600a300581d70c1fe430f19ac248a8a7ea47db106002c4327e542c3fdc60ad6481103011a00989680028201d8185821d87981581ce6849315a2984aadcd1e42d9628f6d6cc071685bef02bb52502f86c9",
-  );
+  const encodedUTxO =
+    "8282582037e57c21550383d404248c67c6611f64d2db8e33ea08d81090324b34ac44a9c600a300581d70c1fe430f19ac248a8a7ea47db106002c4327e542c3fdc60ad6481103011a00989680028201d8185821d87981581ce6849315a2984aadcd1e42d9628f6d6cc071685bef02bb52502f86c9";
   const utxo: UTxO = {
     txHash: "37e57c21550383d404248c67c6611f64d2db8e33ea08d81090324b34ac44a9c6",
     outputIndex: 0,
@@ -36,7 +41,7 @@ it("should deserialize CBOR UTXO data from the second sample", () => {
     datum: "d87981581ce6849315a2984aadcd1e42d9628f6d6cc071685bef02bb52502f86c9",
     scriptRef: undefined,
   };
-  expect(coreToUtxo(cmlUTXO)).toStrictEqual(utxo);
+  expect(coreToUtxo(encodedUTxO)).toStrictEqual(utxo);
 });
 
 it("should deserialize to utxo withn datumHash", () => {
@@ -73,10 +78,49 @@ it("preserves a datum hash when the datum has not been fetched", () => {
       "48300c087b5dbc6198ed7cfbd5c04028360e0d9270eec318addbae8b6305a909",
   };
   const encoded = utxoToCore(utxo);
-  expect(encoded.output().datum()!.as_hash()!.to_hex()).toBe(utxo.datumHash);
+  expect(coreToUtxo(encoded).datumHash).toBe(utxo.datumHash);
   expect(coreToUtxo(encoded)).toEqual({
     ...utxo,
     datum: undefined,
     scriptRef: undefined,
   });
+});
+
+it("preserves the public double-encoded reference script when decoding an output", () => {
+  const utxo: UTxO = {
+    txHash: "11".repeat(32),
+    outputIndex: 0,
+    address: "addr_test1wqn7wnkhny2j475ac709vg3kw6wf59f3hdl3htfpwg8xmtqtxyz6a",
+    assets: { lovelace: 2_000_000n },
+    scriptRef: { type: "PlutusV3", script: "46450100002499" },
+  };
+  expect(coreToUtxo(utxoToCore(utxo)).scriptRef).toEqual(utxo.scriptRef);
+});
+
+const nativeReference: UTxO = {
+  txHash: "11".repeat(32),
+  outputIndex: 0,
+  address: "addr_test1wqn7wnkhny2j475ac709vg3kw6wf59f3hdl3htfpwg8xmtqtxyz6a",
+  assets: { lovelace: 2_000_000n },
+  scriptRef: { type: "Native", script: `9f00581c${"12".repeat(28)}ff` },
+};
+
+it("preserves the native script hash when encoding a reference script", () => {
+  const [, output] = decodeCbor(utxoToCore(nativeReference)) as CborValue[];
+  const reference = (output as Map<CborValue, CborValue>).get(3n) as CborTag;
+  expect(bytesToHex(reference.value as Uint8Array)).toBe(
+    `8200${nativeReference.scriptRef!.script}`,
+  );
+});
+
+it("preserves the native script hash when decoding a reference script", () => {
+  const decoded = decodeCbor(utxoToCore(nativeReference)) as CborValue[];
+  const output = decoded[1] as Map<CborValue, CborValue>;
+  output.set(
+    3n,
+    new CborTag(24n, hexToBytes(`8200${nativeReference.scriptRef!.script}`)),
+  );
+  expect(coreToUtxo(encodeCbor(decoded)).scriptRef).toEqual(
+    nativeReference.scriptRef,
+  );
 });

@@ -11,7 +11,7 @@
  * text, keeping at most `MAX_CHAIN` scripts per fingerprint.
  *
  * Store only immutable values: strings, or byte arrays that are never handed
- * to callers (return copies). Never store CML objects. Eviction is first-in
+ * to callers (return copies). Store only values owned by the caller. Eviction is first-in
  * first-out.
  */
 

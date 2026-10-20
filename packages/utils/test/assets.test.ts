@@ -1,3 +1,4 @@
+import { encodeCbor, decodeCbor } from "@lucid-evolution/ledger";
 import { assert, test } from "vitest";
 import { assetsToValue, sortCanonical } from "../src/value.js";
 
@@ -42,14 +43,14 @@ test("Canonical sorting of Assets", () => {
 
 test("Canonical sorting of Assets (CBOR)", () => {
   assert.deepStrictEqual(
-    assetsToValue(unsortedAssets).to_canonical_cbor_hex(),
-    assetsToValue(sortCanonical(unsortedAssets)).to_cbor_hex(),
+    encodeCbor(decodeCbor(assetsToValue(unsortedAssets)), true),
+    assetsToValue(sortCanonical(unsortedAssets)),
   );
 });
 
 test("CBOR equality after canonical sorting of Assets", () => {
   assert.deepStrictEqual(
     sortedAssetsCBOR,
-    assetsToValue(sortCanonical(unsortedAssets)).to_cbor_hex(),
+    assetsToValue(sortCanonical(unsortedAssets)),
   );
 });

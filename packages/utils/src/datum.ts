@@ -1,6 +1,5 @@
-import { Datum, DatumHash } from "@lucid-evolution/core-types";
-import { CML } from "./core.js";
-
+import type { Datum, DatumHash } from "@lucid-evolution/core-types";
+import { ledger } from "@lucid-evolution/ledger";
 export function datumToHash(datum: Datum): DatumHash {
-  return CML.hash_plutus_data(CML.PlutusData.from_cbor_hex(datum)).to_hex();
+  return ledger("data.hash", { cbor: datum });
 }

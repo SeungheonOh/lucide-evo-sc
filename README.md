@@ -15,7 +15,7 @@
   <img alt="NPM Version" src="https://img.shields.io/npm/v/%40lucid-evolution%2Flucid?color=%2350C62A">
 </p>
 
-This fork adds an optional [sc-tools WASM balancing backend and convex-mockchain integration](docs/integrations/sc-tools.md). Full Lucid parity is not yet achieved; see the guide for known compatibility limits, setup, and verification. The WASM bridge is maintained as a separate project.
+This fork uses [Haskell WASM for ledger operations, sc-tools balancing, and convex-mockchain](docs/integrations/sc-tools.md). The runtime is bundled and selected by default. CML, Aiken’s evaluator, and Scalus are removed. The fluent transaction API remains; raw library objects become CBOR or plain transaction snapshots. See the [migration and runtime guide](docs/integrations/sc-tools.md) and [verification instructions](docs/integrations/sc-tools-verification.md). The Haskell bridge source remains a separate project.
 
 There are a growing number of projects that are built on top of `lucid-evolution`! If you've built a library or a project on top of lucid-evolution, tell me about it [on X](https://twitter.com/solidsnakedev) or [on Discord](https://discord.gg/s89P9gpEff) . I'll add it below and tweet it out.
 

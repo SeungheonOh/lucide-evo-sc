@@ -1,11 +1,18 @@
 import { Assets, Script } from "@lucid-evolution/core-types";
 import { describe, expect, test } from "vitest";
 import {
-  assetsToValue,
+  utxoToTransactionInput,
+  utxoToTransactionOutput,
   PROTOCOL_PARAMETERS_DEFAULT,
   validatorToAddress,
 } from "@lucid-evolution/utils";
-import { CML } from "../src/core.js";
+import {
+  encodeCbor,
+  decodeCbor,
+  ledger,
+  type CborValue,
+} from "@lucid-evolution/ledger";
+import { Lucid } from "../../lucid/src/index.js";
 import {
   Emulator,
   generateEmulatorAccountFromPrivateKey,
@@ -30,16 +37,10 @@ const FEE = 200_000n;
 const REQUIRED = 300_000n;
 const SCRIPT_UTXO_HASH = "11".repeat(32);
 const COLLATERAL_HASH = "22".repeat(32);
-const SCRIPT: Script = { type: "PlutusV3", script: "49480100002221200101" };
+const SCRIPT: Script = { type: "PlutusV3", script: "450100002499" };
 const UNIT = "33".repeat(28) + "01";
 
 type OutRef = { txHash: string; outputIndex: number };
-
-const txInput = ({ txHash, outputIndex }: OutRef) =>
-  CML.TransactionInput.new(
-    CML.TransactionHash.from_hex(txHash),
-    BigInt(outputIndex),
-  );
 
 const setup = (collateralUTxOs: Assets[]) => {
   const account = generateEmulatorAccountFromPrivateKey({
@@ -53,7 +54,7 @@ const setup = (collateralUTxOs: Assets[]) => {
       address: validatorToAddress("Custom", SCRIPT),
       assets: { lovelace: 10_000_000n },
       datumHash: undefined,
-      datum: undefined,
+      datum: "d87980",
       scriptRef: SCRIPT,
     },
     spent: false,
@@ -78,58 +79,49 @@ const spendScript = async (
   },
 ) => {
   const { account, emulator, scriptOutRef } = fixture;
-  const inputs = CML.TransactionInputList.new();
-  inputs.add(txInput(scriptOutRef));
-  const outputs = CML.TransactionOutputList.new();
-  outputs.add(
-    CML.TransactionOutput.new(
-      CML.Address.from_bech32(account.address),
-      CML.Value.from_coin(10_000_000n - FEE),
-    ),
-  );
-  const body = CML.TransactionBody.new(inputs, outputs, FEE);
-  if (options.collateral.length > 0) {
-    const collateralInputs = CML.TransactionInputList.new();
-    for (const outRef of options.collateral) {
-      collateralInputs.add(txInput(outRef));
-    }
-    body.set_collateral_inputs(collateralInputs);
-  }
-  if (options.collateralReturn) {
-    body.set_collateral_return(
-      CML.TransactionOutput.new(
-        CML.Address.from_bech32(account.address),
-        assetsToValue(options.collateralReturn),
+  const lucid = await Lucid(emulator, "Custom");
+  lucid.selectWallet.fromPrivateKey(account.privateKey);
+  const locked =
+    emulator.ledger[scriptOutRef.txHash + scriptOutRef.outputIndex].utxo;
+  const prepared = await lucid
+    .newTx()
+    .collectFrom([locked], "00")
+    .attach.SpendingValidator(SCRIPT)
+    .pay.ToAddress(account.address, { lovelace: 10_000_000n - FEE })
+    .setMinFee(FEE)
+    .complete({ coinSelection: false });
+  const transaction = decodeCbor(prepared.toCBOR()) as CborValue[];
+  const body = transaction[0] as Map<CborValue, CborValue>;
+  body.delete(13n);
+  body.delete(16n);
+  body.delete(17n);
+  if (options.collateral.length)
+    body.set(
+      13n,
+      options.collateral.map((ref) => decodeCbor(utxoToTransactionInput(ref))),
+    );
+  if (options.collateralReturn)
+    body.set(
+      16n,
+      decodeCbor(
+        utxoToTransactionOutput({
+          address: account.address,
+          assets: options.collateralReturn,
+        }),
       ),
     );
-  }
-  if (options.totalCollateral !== undefined) {
-    body.set_total_collateral(options.totalCollateral);
-  }
-  const witnesses = CML.TransactionWitnessSet.new();
-  if (options.collateral.length > 0) {
-    const vkeys = CML.VkeywitnessList.new();
-    vkeys.add(
-      CML.make_vkey_witness(
-        CML.hash_transaction(body),
-        CML.PrivateKey.from_bech32(account.privateKey),
-      ),
-    );
-    witnesses.set_vkeywitnesses(vkeys);
-  }
-  const redeemers = CML.LegacyRedeemerList.new();
-  redeemers.add(
-    CML.LegacyRedeemer.new(
-      CML.RedeemerTag.Spend,
-      0n,
-      CML.PlutusData.new_integer(CML.BigInteger.from_str("0")),
-      CML.ExUnits.new(0n, 0n),
-    ),
-  );
-  witnesses.set_redeemers(CML.Redeemers.new_arr_legacy_redeemer(redeemers));
-  return emulator.submitTx(
-    CML.Transaction.new(body, witnesses, true).to_cbor_hex(),
-  );
+  if (options.totalCollateral !== undefined)
+    body.set(17n, options.totalCollateral);
+  const cbor = encodeCbor(transaction);
+  const witness = ledger<string>("tx.sign", {
+    cbor,
+    privateKeys: [account.privateKey],
+  });
+  const signed = ledger<string>("tx.mergeWitnesses", {
+    cbor,
+    witnessSets: [witness],
+  });
+  return emulator.submitTx(signed);
 };
 
 describe("Emulator collateral checks", () => {
@@ -161,9 +153,7 @@ describe("Emulator collateral checks", () => {
     const fixture = setup([{ lovelace: REQUIRED - 1n }]);
     await expect(
       spendScript(fixture, { collateral: fixture.collateral }),
-    ).rejects.toThrow(
-      /InsufficientCollateral: collateral balance is 299999 Lovelace, but the fee of 200000 requires 300000/,
-    );
+    ).rejects.toThrow(/InsufficientCollateral/);
   });
 
   test("rejects a collateral return that leaves too little collateral", async () => {
@@ -195,9 +185,7 @@ describe("Emulator collateral checks", () => {
         collateralReturn: { lovelace: 500_000n },
         totalCollateral: 4_500_000n,
       }),
-    ).rejects.toThrow(
-      /BabbageOutputTooSmallUTxO: collateral return holds 500000 Lovelace/,
-    );
+    ).rejects.toThrow(/BabbageOutputTooSmallUTxO|OutputTooSmallUTxO/);
   });
 
   test("rejects collateral that keeps native assets", async () => {

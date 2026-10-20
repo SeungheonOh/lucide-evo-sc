@@ -5,6 +5,8 @@ import {
   generateEmulatorAccountFromPrivateKey,
 } from "@lucid-evolution/provider";
 import { Context, Effect, Layer } from "effect";
+import { getLedgerRuntime } from "@lucid-evolution/ledger";
+import { CONSTANTS } from "../Constants.js";
 import { PROTOCOL_PARAMETERS_DEFAULT } from "../../../src/index.js";
 
 const make = Effect.gen(function* () {
@@ -18,7 +20,11 @@ const make = Effect.gen(function* () {
   const ACCOUNTS = { SEED_ACCOUNTS, PRIVATE_KEY_ACCOUNTS };
   const emulator: Emulator = new Emulator(
     [...SEED_ACCOUNTS, ...PRIVATE_KEY_ACCOUNTS],
-    PROTOCOL_PARAMETERS_DEFAULT,
+    // These reward fixtures model bootstrap Conway, before DRep delegation is required.
+    { ...PROTOCOL_PARAMETERS_DEFAULT, protocolMajorVersion: 9 },
+    0n,
+    getLedgerRuntime(),
+    { stakePools: [CONSTANTS.EMULATOR_POOL_ID] },
   );
   return {
     emulator,

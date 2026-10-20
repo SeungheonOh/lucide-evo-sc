@@ -92,7 +92,7 @@ export class TxSubmitError extends Data.TaggedError("TxSubmitError")<{
   }
 }
 
-//NOTE: RunTimeError is used to catch all unexpected errors primarly from CML library
+// RunTimeError wraps unexpected failures at the ledger boundary.
 export class RunTimeError extends Data.TaggedError("RunTimeError")<{
   cause: unknown;
 }> {

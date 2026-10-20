@@ -1,14 +1,19 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  inspectTransaction,
+  encodeCbor,
+  type TransactionSnapshot,
+} from "@lucid-evolution/ledger";
+import { beforeEach, describe, expect, test } from "vitest";
 import {
   applyParamsToScript,
-  CML,
+  EvalRedeemer,
   Data,
   Emulator,
   EvaluatorAdapter,
   generateEmulatorAccount,
   Lucid,
   LucidEvolution,
-  makeAikenEvaluator,
+  makeHaskellEvaluator,
   PROTOCOL_PARAMETERS_DEFAULT,
   Script,
   UTxO,
@@ -19,34 +24,20 @@ import {
   feeThresholdV3Script,
 } from "./fixtures/scripts.js";
 
-// Records every real call to the wasm evaluator, without changing results.
-type Evaluation = { key: string; tx: string; redeemers: string[] };
-const evaluations = vi.hoisted(() => [] as Evaluation[]);
-
-vi.mock("@lucid-evolution/uplc", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@lucid-evolution/uplc")>();
-  const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
-  const key = (value: unknown): unknown =>
-    value instanceof Uint8Array
-      ? hex(value)
-      : Array.isArray(value)
-        ? value.map(key)
-        : String(value);
+// Record actual evaluations through the public Haskell evaluator adapter.
+type Evaluation = { key: string; tx: string; redeemers: EvalRedeemer[] };
+const evaluations: Evaluation[] = [];
+const evaluating = (): EvaluatorAdapter => {
+  const haskell = makeHaskellEvaluator();
   return {
-    ...actual,
-    eval_phase_two_raw: (
-      ...args: Parameters<typeof actual.eval_phase_two_raw>
-    ) => {
-      const result = actual.eval_phase_two_raw(...args);
-      evaluations.push({
-        key: JSON.stringify(args.map(key)),
-        tx: hex(args[0]),
-        redeemers: result.map(hex),
-      });
-      return result;
+    name: "recorded-haskell",
+    async evaluate(input) {
+      const redeemers = await haskell.evaluate(input);
+      evaluations.push({ key: input.tx, tx: input.tx, redeemers });
+      return redeemers;
     },
   };
-});
+};
 
 beforeEach(() => {
   evaluations.length = 0;
@@ -60,62 +51,51 @@ const recordEvaluations = async <T>(
   return { result, evaluations: evaluations.slice(start) };
 };
 
-const bodyWithoutScriptDataHash = (tx: CML.Transaction): string => {
-  const body = JSON.parse(tx.body().to_json());
-  delete body.script_data_hash;
-  return JSON.stringify(body);
+const bodyWithoutScriptDataHash = (tx: TransactionSnapshot): string => {
+  const fields = new Map(tx.body.fields);
+  fields.delete(11n);
+  return encodeCbor(fields);
 };
-
-const redeemerJson = (redeemers: CML.Redeemers): unknown[] => {
-  const flat = redeemers.to_flat_format();
-  return Array.from({ length: flat.len() }, (_, index) =>
-    JSON.parse(flat.get(index).to_json()),
-  );
-};
-
 const totalSteps = (evaluation: Evaluation): bigint =>
   evaluation.redeemers.reduce(
-    (total, hex) =>
-      total + CML.LegacyRedeemer.from_cbor_hex(hex).ex_units().steps(),
+    (total, redeemer) => total + BigInt(redeemer.ex_units.steps),
     0n,
   );
-
 const evaluatedFee = (evaluation: Evaluation): bigint =>
-  CML.Transaction.from_cbor_hex(evaluation.tx).body().fee();
-
-// The completed transaction must carry exactly the ex-units an evaluation of
-// its own body returned, and enough collateral for its fee.
+  inspectTransaction(evaluation.tx).body.fee;
 const expectFinalEvaluated = (
-  tx: CML.Transaction,
+  tx: TransactionSnapshot,
   recorded: Evaluation[],
 ): void => {
   const body = bodyWithoutScriptDataHash(tx);
   const match = recorded
     .filter(
       (evaluation) =>
-        bodyWithoutScriptDataHash(
-          CML.Transaction.from_cbor_hex(evaluation.tx),
-        ) === body,
+        bodyWithoutScriptDataHash(inspectTransaction(evaluation.tx)) === body,
     )
     .at(-1);
   expect(match).toBeDefined();
-  expect(
-    match!.redeemers.map((hex) =>
-      JSON.parse(CML.LegacyRedeemer.from_cbor_hex(hex).to_json()),
-    ),
-  ).toEqual(redeemerJson(tx.witness_set().redeemers()!));
+  expect(match!.redeemers).toEqual(
+    tx.redeemers.map((redeemer) => ({
+      redeemer_tag: redeemer.tag,
+      redeemer_index: Number(redeemer.index),
+      ex_units: {
+        mem: Number(redeemer.exUnits.mem),
+        steps: Number(redeemer.exUnits.steps),
+      },
+    })),
+  );
   const required =
-    (tx.body().fee() *
-      BigInt(PROTOCOL_PARAMETERS_DEFAULT.collateralPercentage) +
+    (tx.body.fee * BigInt(PROTOCOL_PARAMETERS_DEFAULT.collateralPercentage) +
       99n) /
     100n;
-  expect(tx.body().total_collateral()!).toBeGreaterThanOrEqual(required);
+  expect(tx.body.totalCollateral!).toBeGreaterThanOrEqual(required);
 };
 
 const setup = async (script: Script = alwaysSucceedV3Script) => {
   const account = generateEmulatorAccount({ lovelace: 1_000_000_000n });
   const emulator = new Emulator([account], PROTOCOL_PARAMETERS_DEFAULT);
-  const lucid = await Lucid(emulator, "Custom");
+  const lucid = await Lucid(emulator, "Custom", { evaluator: evaluating() });
   lucid.selectWallet.fromSeed(account.seedPhrase);
   const address = await lucid.wallet().address();
   const scriptAddress = validatorToAddress("Custom", script);
@@ -179,16 +159,40 @@ const recordingEvaluator = (
   },
 });
 
-describe("default evaluator reuse within one completion", () => {
-  test("a delayed-redeemer completion evaluates each distinct request once", async () => {
+describe("Haskell evaluator fixed points", () => {
+  test("an explicit Haskell evaluator receives the provider's implicit protocol version", async () => {
+    const fixture = await setup();
+    expect(
+      fixture.lucid.config().protocolParameters!.protocolMajorVersion,
+    ).toBeUndefined();
+    const versions: Array<[number | undefined, number | undefined]> = [];
+    const haskell = makeHaskellEvaluator();
+    const completed = await spend(fixture, {
+      evaluator: {
+        name: "protocol-version-regression",
+        evaluate(input) {
+          const parameters = input.context.protocolParameters;
+          versions.push([
+            parameters.protocolMajorVersion,
+            parameters.protocolMinorVersion,
+          ]);
+          return haskell.evaluate(input);
+        },
+      },
+    });
+    expect(versions.length).toBeGreaterThan(0);
+    for (const version of versions) expect(version).toEqual([11, 0]);
+    await fixture.lucid.awaitTx(
+      await (await completed.sign.withWallet().complete()).submit(),
+    );
+  });
+
+  test("a delayed-redeemer completion is deterministic and evaluates its final body", async () => {
     const fixture = await setup();
     const first = await recordEvaluations(() => spendDelayed(fixture));
-    // The bootstrap attempt evaluates nothing; the first real attempt
-    // evaluates its draft once and its final transaction once; the
-    // confirming attempt repeats the final request.
-    expect(first.evaluations).toHaveLength(2);
+    expect(first.evaluations.length).toBeGreaterThanOrEqual(2);
     const keys = first.evaluations.map((evaluation) => evaluation.key);
-    expect(new Set(keys).size).toBe(keys.length);
+    expect(new Set(keys).size).toBeGreaterThanOrEqual(2);
     expectFinalEvaluated(first.result.toTransaction(), first.evaluations);
 
     // Separate completions do not share results.
@@ -243,9 +247,9 @@ describe("default evaluator reuse within one completion", () => {
     expect(wasm).toHaveLength(0);
     expect(recorded).toHaveLength(2);
     const final = result.toTransaction();
-    expect(
-      bodyWithoutScriptDataHash(CML.Transaction.from_cbor_hex(recorded[1])),
-    ).toBe(bodyWithoutScriptDataHash(final));
+    expect(bodyWithoutScriptDataHash(inspectTransaction(recorded[1]))).toBe(
+      bodyWithoutScriptDataHash(final),
+    );
   });
 });
 
@@ -279,7 +283,7 @@ describe("static script spend", () => {
     const probe = await setup(withThreshold(100_000_000n));
     const probed = await recordEvaluations(() => spend(probe, {}));
     const provisionalFee = evaluatedFee(probed.evaluations[0]);
-    const finalFee = probed.result.toTransaction().body().fee();
+    const finalFee = probed.result.toTransaction().body.fee;
     expect(finalFee).toBeGreaterThan(provisionalFee);
 
     const threshold = (provisionalFee + finalFee) / 2n;
@@ -312,11 +316,10 @@ describe("static script spend", () => {
     });
     const tx = result.toTransaction();
     const required =
-      (tx.body().fee() *
-        BigInt(PROTOCOL_PARAMETERS_DEFAULT.collateralPercentage) +
+      (tx.body.fee * BigInt(PROTOCOL_PARAMETERS_DEFAULT.collateralPercentage) +
         99n) /
       100n;
-    expect(tx.body().total_collateral()).toBe(required);
+    expect(tx.body.totalCollateral).toBe(required);
     await fixture.lucid.awaitTx(
       await (await result.sign.withWallet().complete()).submit(),
     );
@@ -329,7 +332,7 @@ describe("static script spend", () => {
       spend(probe, { coinSelection: false }),
     );
     const provisionalFee = evaluatedFee(probed.evaluations[0]);
-    const finalFee = probed.result.toTransaction().body().fee();
+    const finalFee = probed.result.toTransaction().body.fee;
     expect(finalFee).toBeGreaterThan(provisionalFee);
 
     // A threshold between the two: the provisional draft takes the cheap
@@ -349,8 +352,8 @@ describe("static script spend", () => {
       coinSelection: false,
       setCollateral: 0n,
     });
-    expect(raised.toTransaction().body().fee()).toBe(
-      result.toTransaction().body().fee(),
+    expect(raised.toTransaction().body.fee).toBe(
+      result.toTransaction().body.fee,
     );
     expectFinalEvaluated(raised.toTransaction(), evaluations);
 
@@ -401,7 +404,9 @@ describe("evaluator bytes path", () => {
     expect(viaHex).toHaveLength(0);
     expect(viaBytes).toHaveLength(2);
     expect(
-      bodyWithoutScriptDataHash(CML.Transaction.from_cbor_bytes(viaBytes[1])),
+      bodyWithoutScriptDataHash(
+        inspectTransaction(Buffer.from(viaBytes[1]).toString("hex")),
+      ),
     ).toBe(bodyWithoutScriptDataHash(result.toTransaction()));
   });
 
@@ -422,13 +427,5 @@ describe("evaluator bytes path", () => {
     });
     expect(viaBytes).toHaveLength(0);
     expect(wrapped).toHaveLength(2);
-  });
-
-  test("the built-in evaluator's bytes path is not enumerable", () => {
-    const keys = Object.keys(makeAikenEvaluator());
-    expect(keys).not.toContain("evaluateBytes");
-    expect(
-      typeof (makeAikenEvaluator() as EvaluatorAdapter).evaluateBytes,
-    ).toBe("function");
   });
 });

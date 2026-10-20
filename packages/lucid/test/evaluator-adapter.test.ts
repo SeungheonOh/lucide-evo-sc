@@ -1,6 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
 import {
-  CML,
   EvalRedeemer,
   EvaluatorAdapter,
   Provider,
@@ -46,7 +45,7 @@ const makeWallet = (utxos: UTxO[]): Wallet => ({
   getUtxos: async () => utxos,
   getUtxosCore: async () => [],
   getDelegation: async () => ({ poolId: null, rewards: 0n }),
-  signTx: async () => CML.TransactionWitnessSet.new(),
+  signTx: async () => "a0",
   signMessage: async () => ({ signature: "", key: "" }),
   submitTx: async () => "00".repeat(32),
 });
@@ -153,30 +152,43 @@ describe("evaluator adapter selection", () => {
     expect(adapterEvaluate).not.toHaveBeenCalled();
   });
 
-  test("passes the per-builder slot mapping to evaluator adapters", async () => {
-    const walletInput = makeUtxo("66");
-    const scriptUtxo = makeScriptUtxo("77");
-    const slotConfig = {
-      zeroTime: 1_700_000_000_000,
-      zeroSlot: 123_456,
-      slotLength: 250,
-    };
-    const adapterEvaluate = vi.fn<EvaluatorAdapter["evaluate"]>(async () => [
-      evalRedeemer(),
-    ]);
+  test.each([undefined, 9, 11])(
+    "passes the slot mapping and resolved protocol version (%s) to evaluators",
+    async (major) => {
+      const walletInput = makeUtxo("66");
+      const scriptUtxo = makeScriptUtxo("77");
+      const slotConfig = {
+        zeroTime: 1_700_000_000_000,
+        zeroSlot: 123_456,
+        slotLength: 250,
+      };
+      const adapterEvaluate = vi.fn<EvaluatorAdapter["evaluate"]>(async () => [
+        evalRedeemer(),
+      ]);
 
-    await makeTxBuilder({
-      ...lucidConfig(makeProvider(), makeWallet([walletInput])),
-      slotConfig,
-      evaluator: { name: "slot-aware", evaluate: adapterEvaluate },
-    })
-      .attach.SpendingValidator(alwaysSucceedScript)
-      .collectFrom([scriptUtxo], Data.void())
-      .complete({ presetWalletInputs: [walletInput] });
+      await makeTxBuilder({
+        ...lucidConfig(makeProvider(), makeWallet([walletInput])),
+        protocolParameters: {
+          ...protocolParameters,
+          protocolMajorVersion: major,
+        },
+        slotConfig,
+        evaluator: { name: "slot-aware", evaluate: adapterEvaluate },
+      })
+        .attach.SpendingValidator(alwaysSucceedScript)
+        .collectFrom([scriptUtxo], Data.void())
+        .complete({ presetWalletInputs: [walletInput] });
 
-    expect(adapterEvaluate).toHaveBeenCalled();
-    expect(adapterEvaluate.mock.calls.at(-1)?.[0].context.slotConfig).toEqual(
-      slotConfig,
-    );
-  });
+      expect(adapterEvaluate).toHaveBeenCalled();
+      expect(adapterEvaluate.mock.calls.at(-1)?.[0].context.slotConfig).toEqual(
+        slotConfig,
+      );
+      expect(
+        adapterEvaluate.mock.calls.at(-1)?.[0].context.protocolParameters,
+      ).toMatchObject({
+        protocolMajorVersion: major ?? 10,
+        protocolMinorVersion: 0,
+      });
+    },
+  );
 });

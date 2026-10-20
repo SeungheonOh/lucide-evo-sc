@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "compiler": "wasm32-wasi-ghc 9.12.4.20260731",
+  "upstreamRevision": "4546122230491db4839a4a42fc2bc601f7900909",
+  "bridgeRepository": "https://github.com/SeungheonOh/lucide-evo-sc",
+  "bridgeBranch": "sc-tools-wasm",
+  "bridgeRevision": "d0cdc6bcd5a6981abb9f48678611dd34bbecad6f",
+  "reactorAbiVersion": 1,
+  "bytes": 63668118,
+  "sha256": "a25796a197fcc9419d8e12b50fc0f427dce617e2d2520a3a90edcad204608c72"
+}

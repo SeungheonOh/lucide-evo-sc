@@ -41,7 +41,7 @@ const ownKeyHashes: Array<KeyHash> = ["KeyHash1", "KeyHash2", "OtherKeyHash"];
 const ownUtxos: Array<UTxO> = utxos;
 
 const usedKeyHashes: Array<KeyHash> = discoverOwnUsedTxKeyHashes(
-  tx.toTransaction(),
+  tx.toCBOR(),
   ownKeyHashes,
   ownUtxos,
 );

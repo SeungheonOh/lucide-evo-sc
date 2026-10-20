@@ -1,7 +1,6 @@
-import { UTxO } from "@lucid-evolution/core-types";
+import { Credential, UTxO } from "@lucid-evolution/core-types";
 import { describe, expect, test } from "vitest";
-import { getAddressDetails } from "@lucid-evolution/utils";
-import { CML } from "../src/core.js";
+import { getAddressDetails, credentialToAddress } from "@lucid-evolution/utils";
 import { Emulator } from "../src/index.js";
 
 /*
@@ -11,14 +10,12 @@ import { Emulator } from "../src/index.js";
 */
 
 const keyHash = (byte: number) => byte.toString(16).padStart(2, "0").repeat(28);
-
+const credential = (byte: number): Credential => ({
+  type: "Key",
+  hash: keyHash(byte),
+});
 const enterprise = (payment: number) =>
-  CML.EnterpriseAddress.new(
-    0,
-    CML.Credential.new_pub_key(CML.Ed25519KeyHash.from_hex(keyHash(payment))),
-  )
-    .to_address()
-    .to_bech32(undefined);
+  credentialToAddress("Custom", credential(payment));
 
 const NFT = "aa".repeat(28) + "01";
 

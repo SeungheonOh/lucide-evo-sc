@@ -1,13 +1,13 @@
 import { scChainContext } from "./context.js";
-import type { ScToolsChainContext } from "./types.js";
-import { CML } from "../core.js";
-import { canonicalTransaction } from "../CanonicalTransaction.js";
-import { fromHex, withCMLScope } from "@lucid-evolution/core-utils";
 import {
-  utxoToCore,
-  paymentCredentialOf,
-  coreToOutRef,
-} from "@lucid-evolution/utils";
+  inspectTransaction,
+  encodeCbor,
+  decodeCbor,
+  getLedgerRuntime,
+  type TransactionSnapshot,
+} from "@lucid-evolution/ledger";
+import { fromHex } from "@lucid-evolution/core-utils";
+import { utxoToCore, paymentCredentialOf } from "@lucid-evolution/utils";
 import type {
   EvalRedeemer,
   EvaluatorAdapter,
@@ -16,9 +16,8 @@ import type {
 import type { TxBuilderConfig } from "../tx-builder/TxBuilder.js";
 import type { CompleteOptions } from "../tx-builder/internal/CompleteTxBuilder.js";
 import { scBlocks, scOutRef, resolveScReferences } from "./intent.js";
-
 export class ScToolsRedeemerRefresh extends Error {
-  constructor(readonly transaction: CML.Transaction) {
+  constructor(readonly transaction: TransactionSnapshot) {
     super("sc-tools selected different inputs; rebuild delayed redeemers");
   }
 }
@@ -26,21 +25,27 @@ export type ScToolsCompletionContext = {
   bootstrapExUnits?: boolean;
   collateralInputs?: UTxO[];
   redeemerInputFingerprint?: string;
+  pinnedInputs?: UTxO[];
+  evaluatedExUnits?: EvalRedeemer[];
 };
-
 export async function balanceScTools(
   config: TxBuilderConfig,
   walletInputs: UTxO[],
   changeAddress: string,
   options: CompleteOptions,
   internal: ScToolsCompletionContext = {},
-  refreshHash?: (
-    tx: CML.Transaction,
-    chain: ScToolsChainContext,
-  ) => Promise<CML.Transaction>,
-): Promise<CML.Transaction> {
-  const backend = config.lucidConfig.balancer!;
+): Promise<TransactionSnapshot> {
+  const runtime = config.lucidConfig.balancer?.runtime ?? getLedgerRuntime();
   const chain = await scChainContext(config.lucidConfig);
+  const protocolVersion = chain.protocolParameters.protocolVersion as {
+    major: number;
+    minor: number;
+  };
+  const evaluationParameters = {
+    ...config.lucidConfig.protocolParameters,
+    protocolMajorVersion: protocolVersion.major,
+    protocolMinorVersion: protocolVersion.minor,
+  };
   if (chain.network !== config.lucidConfig.network.toLowerCase())
     throw new Error("sc-tools chain context does not match Lucid network");
   const parameterNames = {
@@ -50,26 +55,25 @@ export async function balanceScTools(
     drepDeposit: "dRepDeposit",
     govActionDeposit: "govActionDeposit",
   } as const;
-  for (const [lucidName, chainName] of Object.entries(parameterNames)) {
-    const value =
-      config.lucidConfig.protocolParameters[
-        lucidName as keyof typeof parameterNames
-      ];
-    if (String(value) !== String(chain.protocolParameters[chainName]))
+  for (const [key, value] of Object.entries(parameterNames))
+    if (
+      String(
+        config.lucidConfig.protocolParameters[
+          key as keyof typeof parameterNames
+        ],
+      ) !== String(chain.protocolParameters[value])
+    )
       throw new Error(
-        `sc-tools chain context disagrees with Lucid protocol parameter: ${lucidName}`,
+        `sc-tools chain context disagrees with Lucid protocol parameter: ${key}`,
       );
-  }
   const blocks = scBlocks(config).map((block) => ({ ...block }));
-  withCMLScope((own) => {
-    const aux = own(config.txBuilder.get_auxiliary_data());
-    const metadata = aux && own(aux.metadata());
-    if (metadata)
-      blocks.push({
-        type: "metadata",
-        cbor: own(CML.AuxiliaryData.new_shelley(metadata)).to_cbor_hex(),
-      });
-  });
+  if (config.metadata.size)
+    blocks.push({
+      type: "metadata",
+      cbor: encodeCbor(
+        config.metadata as import("@lucid-evolution/ledger").CborValue,
+      ),
+    });
   const read = new Set(config.readInputs.map(scOutRef));
   const funding = walletInputs.filter(
     (u) =>
@@ -77,6 +81,9 @@ export async function balanceScTools(
   );
   for (const utxo of config.readInputs)
     blocks.push({ type: "reference", input: scOutRef(utxo) });
+  for (const utxo of internal.pinnedInputs ?? [])
+    if (!config.collectedInputs.some((u) => scOutRef(u) === scOutRef(utxo)))
+      blocks.push({ type: "input", input: scOutRef(utxo) });
   resolveScReferences(config, blocks);
   if (config.treasuryDonation)
     blocks.push({
@@ -95,34 +102,26 @@ export async function balanceScTools(
       ...config.readInputs,
     ].map((u) => [scOutRef(u), u]),
   );
-  const encode = (u: UTxO) =>
-    withCMLScope((own) => own(utxoToCore(u)).to_cbor_hex());
-  const expectedInputs =
-    internal.redeemerInputFingerprint === undefined
-      ? undefined
-      : withCMLScope((own) =>
-          internal
-            .redeemerInputFingerprint!.split(",")
-            .filter(Boolean)
-            .map((hex) =>
-              scOutRef(
-                coreToOutRef(
-                  own(CML.TransactionInput.from_cbor_hex(hex)),
-                ) as UTxO,
-              ),
-            ),
-        );
+  const nativeKeys = new Set<string>();
+  const nativeSigners = (term: unknown): void => {
+    if (!Array.isArray(term)) return;
+    if (term[0] === 0n && term[1] instanceof Uint8Array) {
+      nativeKeys.add(
+        Array.from(term[1], (b) => b.toString(16).padStart(2, "0")).join(""),
+      );
+      return;
+    }
+    const children = term[0] === 3n ? term[2] : term[1];
+    if (Array.isArray(children)) children.forEach(nativeSigners);
+  };
+  for (const script of config.scripts.values())
+    if (script.type === "Native") nativeSigners(decodeCbor(script.script));
   const external: EvaluatorAdapter | undefined =
     options.localUPLCEval === false
       ? {
           name: "provider",
-          evaluate: ({
-            tx,
-            additionalUTxOs,
-          }: {
-            tx: string;
-            additionalUTxOs: UTxO[];
-          }) => config.lucidConfig.provider.evaluateTx(tx, additionalUTxOs),
+          evaluate: ({ tx, additionalUTxOs }) =>
+            config.lucidConfig.provider.evaluateTx(tx, additionalUTxOs),
         }
       : (options.evaluator ?? config.lucidConfig.evaluator);
   const request = {
@@ -131,43 +130,33 @@ export async function balanceScTools(
     blocks,
     wallet: {
       changeAddress,
-      utxos: funding.map(encode),
-      collateral: collateral.map(encode),
+      utxos: funding.map(utxoToCore),
+      collateral: collateral.map(utxoToCore),
       collateralFallback: walletInputs
         .filter(
           (u) => !u.scriptRef && paymentCredentialOf(u.address).type === "Key",
         )
-        .map(encode),
+        .map(utxoToCore),
     },
-    resolvedInputs: [...byRef.values()].map(encode),
-    additionalWitnesses: withCMLScope((own) => {
-      const keys = new Set<string>();
-      for (const script of config.scripts.values())
-        if (script.type === "Native") {
-          const signers = own(
-            own(
-              CML.NativeScript.from_cbor_hex(script.script),
-            ).get_required_signers(),
-          );
-          for (let i = 0; i < signers.len(); i++)
-            keys.add(own(signers.get(i)).to_hex());
-        }
-      return keys.size;
-    }),
+    resolvedInputs: [...byRef.values()].map(utxoToCore),
+    additionalWitnesses: nativeKeys.size,
   };
-  let supplied: EvalRedeemer[] | undefined;
-  let previous: string | undefined;
+  let supplied = internal.evaluatedExUnits,
+    previous: string | undefined;
   for (let attempt = 0; attempt < 12; attempt++) {
-    const response = await backend.runtime.run({
+    const response = (await runtime.run({
       ...request,
       options: {
         coinSelection: options.coinSelection ?? true,
         minFee: String(config.minFee ?? 0n),
         explicitFee: config.minFee !== undefined,
-        setCollateral: String(options.setCollateral ?? 5_000_000n),
+        setCollateral: String(options.setCollateral ?? 5000000n),
         includeLeftoverLovelaceAsFee:
           options.includeLeftoverLovelaceAsFee ?? false,
-        expectedInputs,
+        expectedInputs: internal.redeemerInputFingerprint
+          ?.split(",")
+          .filter(Boolean),
+        canonical: options.canonical ?? false,
         evaluation: internal.bootstrapExUnits
           ? "bootstrap"
           : external
@@ -175,119 +164,78 @@ export async function balanceScTools(
             : "local",
         exUnits: supplied,
       },
-    });
-    if (!response || typeof response !== "object")
-      throw new Error("Invalid sc-tools response");
-    const result = response as {
+    })) as {
       ok?: boolean;
       error?: unknown;
       needsRedeemers?: boolean;
-      costModels?: Record<string, unknown>;
       transaction?: { cborHex?: string };
     };
-    if (result.ok !== true || typeof result.transaction?.cborHex !== "string")
+    if (response?.ok !== true || !response.transaction?.cborHex)
       throw new Error(
-        `sc-tools balance failed: ${String(result.error ?? "missing transaction")}`,
+        `sc-tools balance failed: ${String(response?.error ?? "missing transaction")}`,
       );
-    let tx = CML.Transaction.from_cbor_hex(result.transaction.cborHex);
-    if (options.canonical) {
-      const canonical = canonicalTransaction(tx);
-      tx.free();
-      tx = canonical;
-      if (refreshHash) {
-        const refreshed = await refreshHash(tx, {
-          ...chain,
-          protocolParameters: {
-            ...chain.protocolParameters,
-            costModels:
-              result.costModels ?? chain.protocolParameters.costModels,
-          },
-        });
-        if (refreshed !== tx) tx.free();
-        tx = refreshed;
-      }
-    }
-    let consumed: UTxO[];
-    try {
-      consumed = withCMLScope((own) => {
-        const inputs = own(own(tx.body()).inputs());
-        const spent = Array.from({ length: inputs.len() }, (_, i) => {
-          const key = scOutRef(coreToOutRef(own(inputs.get(i))) as UTxO);
-          const utxo = byRef.get(key);
-          if (!utxo || read.has(key))
-            throw new Error(
-              `sc-tools returned an unavailable spending input: ${key}`,
-            );
-          return utxo;
-        });
-        for (const input of config.collectedInputs)
-          if (!spent.some((u) => scOutRef(u) === scOutRef(input)))
-            throw new Error("sc-tools omitted an explicit input");
-        if (
-          options.coinSelection === false &&
-          spent.some(
-            (u) =>
-              !config.collectedInputs.some((v) => scOutRef(u) === scOutRef(v)),
-          )
-        )
-          throw new Error(
-            "sc-tools selected an input with coinSelection disabled",
-          );
-        return spent;
-      });
-    } catch (error) {
-      tx.free();
-      throw error;
-    }
-    config.consumedInputs = consumed;
-    if (result.needsRedeemers) throw new ScToolsRedeemerRefresh(tx);
-    if (!external || internal.bootstrapExUnits) return tx;
-    const hex = tx.to_cbor_hex();
-    const expected = withCMLScope((own) => {
-      const r = own(own(tx.witness_set()).redeemers());
-      if (!r) return new Set<string>();
-      const legacy = own(r.to_flat_format());
-      return new Set(
-        Array.from({ length: legacy.len() }, (_, i) => {
-          const redeemer = own(legacy.get(i));
-          return `${redeemer.tag()}:${redeemer.index()}`;
-        }),
-      );
+    const transaction = inspectTransaction(response.transaction.cborHex);
+    const consumed = transaction.body.inputs.map((ref) => {
+      const key = scOutRef(ref),
+        utxo = byRef.get(key);
+      if (!utxo || read.has(key))
+        throw new Error(
+          `sc-tools returned an unavailable spending input: ${key}`,
+        );
+      return utxo;
     });
-    if (expected.size === 0 || hex === previous) return tx;
-    previous = hex;
-    tx.free();
-    const evaluationInput = {
+    if (
+      config.collectedInputs.some(
+        (input) => !consumed.some((u) => scOutRef(u) === scOutRef(input)),
+      )
+    )
+      throw new Error("sc-tools omitted an explicit input");
+    if (
+      options.coinSelection === false &&
+      consumed.some(
+        (u) => !config.collectedInputs.some((v) => scOutRef(v) === scOutRef(u)),
+      )
+    )
+      throw new Error("sc-tools selected an input with coinSelection disabled");
+    config.consumedInputs = consumed;
+    if (response.needsRedeemers) throw new ScToolsRedeemerRefresh(transaction);
+    if (
+      !external ||
+      internal.bootstrapExUnits ||
+      !transaction.redeemers.length ||
+      transaction.cbor === previous
+    )
+      return transaction;
+    previous = transaction.cbor;
+    const input = {
       additionalUTxOs: [...consumed, ...config.readInputs],
       context: {
         network: config.lucidConfig.network,
         slotConfig: config.lucidConfig.slotConfig,
-        protocolParameters: config.lucidConfig.protocolParameters,
+        protocolParameters: evaluationParameters,
         costModels: config.lucidConfig.costModels,
       },
     };
     const evaluated = external.evaluateBytes
-      ? await external.evaluateBytes({ ...evaluationInput, tx: fromHex(hex) })
-      : await external.evaluate({ ...evaluationInput, tx: hex });
-    const tags = {
-      spend: 0,
-      mint: 1,
-      publish: 2,
-      withdraw: 3,
-      vote: 4,
-      propose: 5,
-    };
-    const seen = new Set<string>();
-    for (const value of evaluated) {
-      const key = `${tags[value.redeemer_tag]}:${value.redeemer_index}`;
+      ? await external.evaluateBytes({
+          ...input,
+          tx: fromHex(transaction.cbor),
+        })
+      : await external.evaluate({ ...input, tx: transaction.cbor });
+    const expected = new Set(
+        transaction.redeemers.map((r) => `${r.tag}:${r.index}`),
+      ),
+      seen = new Set<string>();
+    for (const result of evaluated) {
+      const key = `${result.redeemer_tag}:${result.redeemer_index}`;
       if (
         !expected.has(key) ||
         seen.has(key) ||
-        !Number.isSafeInteger(value.redeemer_index) ||
-        !Number.isSafeInteger(value.ex_units.mem) ||
-        !Number.isSafeInteger(value.ex_units.steps) ||
-        value.ex_units.mem < 0 ||
-        value.ex_units.steps < 0
+        !Number.isSafeInteger(result.redeemer_index) ||
+        !Number.isSafeInteger(result.ex_units.mem) ||
+        !Number.isSafeInteger(result.ex_units.steps) ||
+        result.ex_units.mem < 0 ||
+        result.ex_units.steps < 0
       )
         throw new Error("Invalid or duplicate external evaluation result");
       seen.add(key);

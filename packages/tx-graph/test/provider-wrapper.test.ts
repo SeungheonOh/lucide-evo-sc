@@ -5,7 +5,11 @@ import type {
   Provider,
   UTxO,
 } from "@lucid-evolution/core-types";
-import { CML } from "../src/core.js";
+import {
+  inspectTransaction,
+  type TransactionSnapshot,
+} from "@lucid-evolution/ledger";
+import { transaction } from "./ledger-fixtures.js";
 import { createTxGraph } from "../src/graph.js";
 import type { TraceOutRef } from "../src/model.js";
 import { wrapProvider } from "../src/provider-wrapper.js";
@@ -19,28 +23,9 @@ const ref = (byte: string, outputIndex: number): TraceOutRef => ({
   outputIndex,
 });
 
-const makeInput = (outRef: TraceOutRef): CML.TransactionInput =>
-  CML.TransactionInput.new(
-    CML.TransactionHash.from_hex(outRef.txHash),
-    BigInt(outRef.outputIndex),
-  );
-
-const makeTx = (input: TraceOutRef): CML.Transaction => {
-  const inputs = CML.TransactionInputList.new();
-  inputs.add(makeInput(input));
-  const outputs = CML.TransactionOutputList.new();
-  outputs.add(
-    CML.TransactionOutput.new(
-      CML.Address.from_bech32(address),
-      CML.Value.from_coin(2_000_000n),
-    ),
-  );
-  const body = CML.TransactionBody.new(inputs, outputs, 170_000n);
-  return CML.Transaction.new(body, CML.TransactionWitnessSet.new(), true);
-};
-
-const txHash = (tx: CML.Transaction): string =>
-  CML.hash_transaction(tx.body()).to_hex();
+const makeTx = (input: TraceOutRef): TransactionSnapshot =>
+  transaction([input], [2_000_000n]);
+const txHash = (tx: TransactionSnapshot): string => tx.hash;
 
 const utxo = (outRef: TraceOutRef, lovelace: bigint): UTxO => ({
   ...outRef,
@@ -68,9 +53,7 @@ const makeProvider = (
     getDelegation: vi.fn(async () => ({ poolId: null, rewards: 0n })),
     getDatum: vi.fn(async () => ""),
     awaitTx: vi.fn(async () => true),
-    submitTx: vi.fn(async (cbor: string) =>
-      txHash(CML.Transaction.from_cbor_hex(cbor)),
-    ),
+    submitTx: vi.fn(async (cbor: string) => txHash(inspectTransaction(cbor))),
     evaluateTx: vi.fn(async () => []),
     ...overrides,
   };
@@ -86,10 +69,10 @@ describe("wrapProvider", () => {
       submitLabel: "submit-flow",
     });
 
-    const submittedHash = await tracedProvider.submitTx(tx.to_cbor_hex());
+    const submittedHash = await tracedProvider.submitTx(tx.cbor);
 
     expect(submittedHash).toBe(txHash(tx));
-    expect(provider.submitTx).toHaveBeenCalledWith(tx.to_cbor_hex());
+    expect(provider.submitTx).toHaveBeenCalledWith(tx.cbor);
     expect(await tracedProvider.awaitTx(submittedHash)).toBe(true);
     const trace = graph.toJSON();
     expect(trace.transactions).toHaveLength(1);
@@ -120,7 +103,7 @@ describe("wrapProvider", () => {
       submitLabel: "bad-submit",
     });
 
-    await expect(tracedProvider.submitTx(tx.to_cbor_hex())).rejects.toThrow(
+    await expect(tracedProvider.submitTx(tx.cbor)).rejects.toThrow(
       providerError,
     );
 
@@ -150,9 +133,7 @@ describe("wrapProvider", () => {
     const graph = createTxGraph();
     const tracedProvider = graph.wrapProvider(provider);
 
-    await expect(tracedProvider.submitTx(tx.to_cbor_hex())).resolves.toBe(
-      wrongHash,
-    );
+    await expect(tracedProvider.submitTx(tx.cbor)).resolves.toBe(wrongHash);
 
     expect(graph.toJSON().warnings).toEqual([
       expect.objectContaining({
@@ -181,11 +162,11 @@ describe("wrapProvider", () => {
     });
 
     await expect(
-      tracedProvider.evaluateTx(tx.to_cbor_hex(), [utxo(seedRef, 3_000_000n)]),
+      tracedProvider.evaluateTx(tx.cbor, [utxo(seedRef, 3_000_000n)]),
     ).resolves.toEqual(evaluation);
 
     const trace = graph.toJSON();
-    expect(provider.evaluateTx).toHaveBeenCalledWith(tx.to_cbor_hex(), [
+    expect(provider.evaluateTx).toHaveBeenCalledWith(tx.cbor, [
       utxo(seedRef, 3_000_000n),
     ]);
     expect(trace.transactions[0]).toMatchObject({

@@ -1,8 +1,19 @@
+import {
+  inspectTransaction,
+  encodeCbor,
+  decodeCbor,
+  CborTag,
+  type CborValue,
+  type LedgerRedeemer,
+  type TransactionSnapshot,
+} from "@lucid-evolution/ledger";
 import { describe, expect, test, vi } from "vitest";
 import { Effect } from "effect";
 import {
   BuildTxWithRedeemer,
-  CML,
+  getAddressDetails,
+  fromHex,
+  toHex,
   GovernanceAction,
   GovernanceProposal,
   Provider,
@@ -28,7 +39,6 @@ import {
   PendingRedeemer,
   buildCanonicalRedeemerInfo,
   buildRedeemersFromCanonicalContext,
-  canonicalRedeemerEntries,
   registerPendingRedeemer,
 } from "../src/tx-builder/internal/RedeemerContext.js";
 
@@ -66,7 +76,7 @@ const makeWallet = (utxos: UTxO[]): Wallet => ({
   getUtxos: async () => utxos,
   getUtxosCore: async () => [],
   getDelegation: async () => ({ poolId: null, rewards: 0n }),
-  signTx: async () => CML.TransactionWitnessSet.new(),
+  signTx: async () => "a0",
   signMessage: async () => ({ signature: "", key: "" }),
   submitTx: async () => "00".repeat(32),
 });
@@ -94,48 +104,47 @@ const makeProvider = (
   evaluateTx,
 });
 
-const redeemerData = (value: bigint): CML.PlutusData =>
-  CML.PlutusData.from_cbor_hex(Data.to(value));
-
-const redeemerExUnits = (value: bigint): CML.ExUnits =>
-  CML.ExUnits.new(value, value + 100n);
-
-const redeemerVal = (value: bigint): CML.RedeemerVal =>
-  CML.RedeemerVal.new(redeemerData(value), redeemerExUnits(value));
-
-const firstCertificate = (tx: CML.Transaction): CML.Certificate | undefined =>
-  tx.body().certs()?.get(0);
-
-const legacyRedeemer = (
-  tag: CML.RedeemerTag,
-  index: bigint,
-  value: bigint,
-): CML.LegacyRedeemer =>
-  CML.LegacyRedeemer.new(
-    tag,
-    index,
-    redeemerData(value),
-    redeemerExUnits(value),
-  );
-
+const redeemerData = Data.to;
+const canonicalData = (cbor: string): string =>
+  encodeCbor(decodeCbor(cbor), true);
+const firstCertificate = (tx: TransactionSnapshot): CborValue[] | undefined =>
+  tx.body.certificates[0] as CborValue[] | undefined;
+const redeemerTags = [
+  "spend",
+  "mint",
+  "publish",
+  "withdraw",
+  "vote",
+  "propose",
+] as const;
 const makeRedeemerMap = (
-  order: ReadonlyArray<readonly [CML.RedeemerTag, bigint, bigint]>,
-): CML.Redeemers => {
-  const map = CML.MapRedeemerKeyToRedeemerVal.new();
-  for (const [tag, index, value] of order) {
-    map.insert(CML.RedeemerKey.new(tag, index), redeemerVal(value));
-  }
-  return CML.Redeemers.new_map_redeemer_key_to_redeemer_val(map);
-};
-
-const makeRedeemerList = (
-  order: ReadonlyArray<readonly [CML.RedeemerTag, bigint, bigint]>,
-): CML.Redeemers => {
-  const list = CML.LegacyRedeemerList.new();
-  for (const [tag, index, value] of order) {
-    list.add(legacyRedeemer(tag, index, value));
-  }
-  return CML.Redeemers.new_arr_legacy_redeemer(list);
+  order: ReadonlyArray<readonly [bigint, bigint, bigint]>,
+): LedgerRedeemer[] =>
+  order
+    .map(([tag, index, value]) => ({
+      tag: redeemerTags[Number(tag)],
+      index,
+      data: Data.to(value),
+      exUnits: { mem: value, steps: value + 100n },
+    }))
+    .sort(
+      (a, b) =>
+        redeemerTags.indexOf(a.tag) - redeemerTags.indexOf(b.tag) ||
+        Number(a.index - b.index),
+    );
+const makeRedeemerList = makeRedeemerMap;
+const canonicalRedeemerEntries = (redeemers: LedgerRedeemer[]) => redeemers;
+type Proposal = [bigint, Uint8Array, CborValue[], [string, Uint8Array]];
+type Voter = [bigint, Uint8Array];
+type VoteMap = Map<Voter, Map<[Uint8Array, bigint], [bigint, CborValue]>>;
+const proposalsOf = (tx: TransactionSnapshot): Proposal[] =>
+  tx.body.proposals as Proposal[];
+const votesOf = (tx: TransactionSnapshot): VoteMap => tx.body.votes as VoteMap;
+const nativeScriptsOf = (tx: TransactionSnapshot): CborValue[] => {
+  const scripts = tx.witnesses.get(1n);
+  return (
+    scripts instanceof CborTag ? scripts.value : (scripts ?? [])
+  ) as CborValue[];
 };
 
 const makeUtxo = (byte: string, outputIndex = 0): UTxO => ({
@@ -151,30 +160,21 @@ const makeRichUtxo = (byte: string, outputIndex = 0): UTxO => ({
 });
 
 const canonicalInputIndex = (
-  tx: CML.Transaction,
+  tx: TransactionSnapshot,
   utxo: UTxO,
 ): bigint | undefined => {
-  const inputs = tx.body().inputs();
-  for (let index = 0; index < inputs.len(); index++) {
-    const input = inputs.get(index);
-    if (
-      input.transaction_id().to_hex() === utxo.txHash &&
-      input.index() === BigInt(utxo.outputIndex)
-    ) {
-      return BigInt(index);
-    }
-  }
-  return undefined;
-};
-
-const makeRewardAddress = (byte: string): CML.RewardAddress =>
-  CML.RewardAddress.new(
-    0,
-    CML.Credential.new_script(CML.ScriptHash.from_hex(byte.repeat(28))),
+  const index = tx.body.inputs.findIndex(
+    (input) =>
+      input.txHash === utxo.txHash && input.outputIndex === utxo.outputIndex,
   );
-
-const rewardAddressBech32 = (rewardAddress: CML.RewardAddress): string =>
-  rewardAddress.to_address().to_bech32(undefined);
+  return index < 0 ? undefined : BigInt(index);
+};
+const makeRewardAddress = (byte: string): string =>
+  credentialToRewardAddress("Custom", {
+    type: "Script",
+    hash: byte.repeat(28),
+  });
+const rewardAddressBech32 = (rewardAddress: string): string => rewardAddress;
 
 const governanceAnchor = {
   url: "https://example.com/governance",
@@ -191,9 +191,10 @@ const governanceActionId = {
   index: 0n,
 };
 
-const parameterChangeAction = (policyHash: string): GovernanceAction => {
-  const update = CML.ProtocolParamUpdate.new();
-  update.set_minfee_a(44n);
+const parameterChangeAction = (
+  policyHash: string,
+): Extract<GovernanceAction, { type: "ParameterChange" }> => {
+  const update = new Map<CborValue, CborValue>([[0n, 44n]]);
   return {
     type: "ParameterChange",
     protocolParamUpdate: update,
@@ -215,10 +216,10 @@ const scriptProposal = (script: Script): GovernanceProposal => ({
 
 const makeTx = ({
   inputs = [makeUtxo("11")],
-  outputs = [{ address, lovelace: 1_000_000n }],
+  outputs = [{ address, lovelace: 1000000n }],
   mintPolicies = [],
   withdrawals = [],
-  redeemers,
+  redeemers = [],
 }: {
   inputs?: UTxO[];
   outputs?: ReadonlyArray<Readonly<{ address: string; lovelace: bigint }>>;
@@ -226,53 +227,50 @@ const makeTx = ({
     Readonly<{ policyId: string; quantity: bigint }>
   >;
   withdrawals?: ReadonlyArray<
-    Readonly<{ rewardAddress: CML.RewardAddress; amount: bigint }>
+    Readonly<{ rewardAddress: string; amount: bigint }>
   >;
-  redeemers?: CML.Redeemers;
-}) => {
-  const inputList = CML.TransactionInputList.new();
-  for (const input of inputs) {
-    inputList.add(
-      CML.TransactionInput.new(
-        CML.TransactionHash.from_hex(input.txHash),
-        BigInt(input.outputIndex),
+  redeemers?: LedgerRedeemer[];
+}): TransactionSnapshot => {
+  const body = new Map<CborValue, CborValue>([
+    [
+      0n,
+      inputs.map((input) => [fromHex(input.txHash), BigInt(input.outputIndex)]),
+    ],
+    [
+      1n,
+      outputs.map((output) => [
+        fromHex(getAddressDetails(output.address).address.hex),
+        output.lovelace,
+      ]),
+    ],
+    [2n, 0n],
+  ]);
+  if (mintPolicies.length)
+    body.set(
+      9n,
+      new Map(
+        mintPolicies.map(({ policyId, quantity }) => [
+          fromHex(policyId),
+          new Map([[new Uint8Array(), quantity]]),
+        ]),
       ),
     );
-  }
-
-  const outputList = CML.TransactionOutputList.new();
-  for (const output of outputs) {
-    outputList.add(
-      CML.TransactionOutput.new(
-        CML.Address.from_bech32(output.address),
-        CML.Value.from_coin(output.lovelace),
+  if (withdrawals.length)
+    body.set(
+      5n,
+      new Map(
+        withdrawals.map(({ rewardAddress, amount }) => [
+          fromHex(getAddressDetails(rewardAddress).address.hex),
+          amount,
+        ]),
       ),
     );
-  }
-
-  const body = CML.TransactionBody.new(inputList, outputList, 0n);
-
-  if (mintPolicies.length > 0) {
-    const mint = CML.Mint.new();
-    for (const { policyId, quantity } of mintPolicies) {
-      const assets = CML.MapAssetNameToNonZeroInt64.new();
-      assets.insert(CML.AssetName.from_raw_bytes(new Uint8Array([])), quantity);
-      mint.insert_assets(CML.ScriptHash.from_hex(policyId), assets);
-    }
-    body.set_mint(mint);
-  }
-
-  if (withdrawals.length > 0) {
-    const cmlWithdrawals = CML.MapRewardAccountToCoin.new();
-    for (const withdrawal of withdrawals) {
-      cmlWithdrawals.insert(withdrawal.rewardAddress, withdrawal.amount);
-    }
-    body.set_withdrawals(cmlWithdrawals);
-  }
-
-  const witnessSet = CML.TransactionWitnessSet.new();
-  if (redeemers) witnessSet.set_redeemers(redeemers);
-  return CML.Transaction.new(body, witnessSet, true);
+  // Context validation receives neutral snapshots, including deliberately invalid
+  // duplicate purposes that the callback resolver must reject independently.
+  return {
+    ...inspectTransaction(encodeCbor([body, new Map(), true, null])),
+    redeemers,
+  };
 };
 
 describe("context-dependent redeemers internal coverage", () => {
@@ -285,7 +283,7 @@ describe("context-dependent redeemers internal coverage", () => {
         { address, lovelace: 2_000_000n },
         { address, lovelace: 3_000_000n },
       ],
-      redeemers: makeRedeemerMap([[CML.RedeemerTag.Spend, 0n, 1n]]),
+      redeemers: makeRedeemerMap([[0n, 0n, 1n]]),
     });
 
     const source: BuildTxWithRedeemer = (ctx) => {
@@ -324,7 +322,7 @@ describe("context-dependent redeemers internal coverage", () => {
         { policyId: policyA, quantity: 5n },
         { policyId: policyB, quantity: 7n },
       ],
-      redeemers: makeRedeemerMap([[CML.RedeemerTag.Mint, 0n, 1n]]),
+      redeemers: makeRedeemerMap([[1n, 0n, 1n]]),
     });
 
     const info = await Effect.runPromise(
@@ -340,6 +338,8 @@ describe("context-dependent redeemers internal coverage", () => {
 
     const source: BuildTxWithRedeemer = (ctx) => {
       expect(ctx.ownPurpose).toEqual(mintPurpose);
+      if (ctx.ownPurpose.tag !== "mint")
+        throw new Error("Expected mint purpose");
       expect(ctx.mint[policyA]).toBe(5n);
       expect(ctx.mint[policyB]).toBe(7n);
       expect(ctx.mintPolicyIndex(ctx.ownPurpose.policyId)).toBe(
@@ -370,7 +370,7 @@ describe("context-dependent redeemers internal coverage", () => {
         { rewardAddress: firstRewardAddress, amount: 11n },
         { rewardAddress: secondRewardAddress, amount: 22n },
       ],
-      redeemers: makeRedeemerMap([[CML.RedeemerTag.Reward, 1n, 1n]]),
+      redeemers: makeRedeemerMap([[3n, 1n, 1n]]),
     });
 
     const info = await Effect.runPromise(
@@ -386,6 +386,8 @@ describe("context-dependent redeemers internal coverage", () => {
 
     const source: BuildTxWithRedeemer = (ctx) => {
       expect(ctx.ownPurpose).toEqual(withdrawPurpose);
+      if (ctx.ownPurpose.tag !== "withdraw")
+        throw new Error("Expected withdrawal purpose");
       const index = ctx.withdrawalIndex(ctx.ownPurpose.rewardAddress);
       expect(index).toBe(ctx.ownPurpose.index);
       expect(ctx.withdrawals[Number(index)]?.rewardAddress).toBe(
@@ -423,9 +425,9 @@ describe("context-dependent redeemers internal coverage", () => {
       mintPolicies: [{ policyId, quantity: 1n }],
       withdrawals: [{ rewardAddress, amount: 1n }],
       redeemers: makeRedeemerMap([
-        [CML.RedeemerTag.Reward, 0n, 3n],
-        [CML.RedeemerTag.Mint, 0n, 2n],
-        [CML.RedeemerTag.Spend, 0n, 1n],
+        [3n, 0n, 3n],
+        [1n, 0n, 2n],
+        [0n, 0n, 1n],
       ]),
     });
 
@@ -466,8 +468,8 @@ describe("context-dependent redeemers internal coverage", () => {
     const tx = makeTx({
       inputs: [utxo],
       redeemers: makeRedeemerList([
-        [CML.RedeemerTag.Spend, 0n, 1n],
-        [CML.RedeemerTag.Spend, 0n, 2n],
+        [0n, 0n, 1n],
+        [0n, 0n, 2n],
       ]),
     });
 
@@ -506,8 +508,8 @@ describe("context-dependent redeemers internal coverage", () => {
     const tx = makeTx({
       inputs: [firstUtxo, secondUtxo],
       redeemers: makeRedeemerMap([
-        [CML.RedeemerTag.Spend, 0n, 1n],
-        [CML.RedeemerTag.Spend, 1n, 2n],
+        [0n, 0n, 1n],
+        [0n, 1n, 2n],
       ]),
     });
     const makeRedeemer = vi.fn((indices: bigint[]) =>
@@ -622,16 +624,14 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const redeemers = signBuilder.toTransaction().witness_set().redeemers();
+    const redeemers = signBuilder.toTransaction().redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("spend");
     expect(redeemer.index).toBe(0n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(0n).to_canonical_cbor_hex(),
-    );
-    expect(redeemer.exUnits.mem()).toBe(500_000n);
-    expect(redeemer.exUnits.steps()).toBe(500_000n);
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(0n)));
+    expect(redeemer.exUnits.mem).toBe(500_000n);
+    expect(redeemer.exUnits.steps).toBe(500_000n);
     expect(evaluateTx).toHaveBeenCalled();
     expect(stableRedeemer).toHaveBeenCalled();
   });
@@ -669,16 +669,14 @@ describe("context-dependent redeemers internal coverage", () => {
       };
       const evaluatedInputCounts: number[] = [];
       const evaluateTx = vi.fn<Provider["evaluateTx"]>(async (txHex) => {
-        const tx = CML.Transaction.from_cbor_hex(txHex);
+        const tx = inspectTransaction(txHex);
         const inputIndex = canonicalInputIndex(tx, scriptInput);
         expect(inputIndex).toBeDefined();
-        evaluatedInputCounts.push(tx.body().inputs().len());
+        evaluatedInputCounts.push(tx.body.inputs.length);
 
-        const [redeemer] = canonicalRedeemerEntries(
-          tx.witness_set().redeemers()!,
-        );
-        expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-          redeemerData(inputIndex!).to_canonical_cbor_hex(),
+        const [redeemer] = canonicalRedeemerEntries(tx.redeemers!);
+        expect(canonicalData(redeemer.data)).toBe(
+          canonicalData(redeemerData(inputIndex!)),
         );
         return [
           {
@@ -704,7 +702,7 @@ describe("context-dependent redeemers internal coverage", () => {
 
       const tx = signBuilder.toTransaction();
       expect(canonicalInputIndex(tx, scriptInput)).toBe(0n);
-      expect(tx.body().inputs().len()).toBe(1);
+      expect(tx.body.inputs.length).toBe(1);
       expect(evaluatedInputCounts).toContain(2);
       expect(evaluatedInputCounts.at(-1)).toBe(1);
     },
@@ -740,21 +738,17 @@ describe("context-dependent redeemers internal coverage", () => {
     const tx = signBuilder.toTransaction();
     const cert = firstCertificate(tx);
     expect(cert).toBeDefined();
-    expect(cert!.kind()).toBe(CML.CertificateKind.RegCert);
-    expect(cert!.as_reg_cert()?.deposit()).toBe(
-      lucidConfig.protocolParameters.keyDeposit,
-    );
+    expect(cert![0]).toBe(7n);
+    expect(cert![2]).toBe(lucidConfig.protocolParameters.keyDeposit);
 
-    const redeemers = tx.witness_set().redeemers();
+    const redeemers = tx.redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("publish");
     expect(redeemer.index).toBe(0n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      CML.PlutusData.from_cbor_hex(Data.void()).to_canonical_cbor_hex(),
-    );
-    expect(redeemer.exUnits.mem()).toBe(600_000n);
-    expect(redeemer.exUnits.steps()).toBe(700_000n);
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(Data.void()));
+    expect(redeemer.exUnits.mem).toBe(600_000n);
+    expect(redeemer.exUnits.steps).toBe(700_000n);
     expect(evaluateTx).toHaveBeenCalled();
   });
 
@@ -788,18 +782,16 @@ describe("context-dependent redeemers internal coverage", () => {
     const tx = signBuilder.toTransaction();
     const cert = firstCertificate(tx);
     expect(cert).toBeDefined();
-    expect(cert!.kind()).toBe(CML.CertificateKind.RegCert);
-    expect(cert!.as_reg_cert()?.deposit()).toBe(
-      lucidConfig.protocolParameters.keyDeposit,
-    );
+    expect(cert![0]).toBe(7n);
+    expect(cert![2]).toBe(lucidConfig.protocolParameters.keyDeposit);
 
-    const redeemers = tx.witness_set().redeemers();
+    const redeemers = tx.redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("publish");
     expect(redeemer.index).toBe(0n);
-    expect(redeemer.exUnits.mem()).toBe(610_000n);
-    expect(redeemer.exUnits.steps()).toBe(710_000n);
+    expect(redeemer.exUnits.mem).toBe(610_000n);
+    expect(redeemer.exUnits.steps).toBe(710_000n);
   });
 
   test("registerStake without redeemer remains witnessless StakeRegistration", async () => {
@@ -823,10 +815,9 @@ describe("context-dependent redeemers internal coverage", () => {
     const tx = signBuilder.toTransaction();
     const cert = firstCertificate(tx);
     expect(cert).toBeDefined();
-    expect(cert!.kind()).toBe(CML.CertificateKind.StakeRegistration);
-    expect(cert!.as_stake_registration()).toBeDefined();
-    expect(cert!.as_reg_cert()).toBeUndefined();
-    expect(tx.witness_set().redeemers()).toBeUndefined();
+    expect(cert![0]).toBe(0n);
+    expect(cert).toHaveLength(2);
+    expect(tx.redeemers).toHaveLength(0);
   });
 
   test("context-dependent registerStake redeemer can inspect event NFT mint", async () => {
@@ -872,18 +863,18 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const redeemers = signBuilder.toTransaction().witness_set().redeemers();
+    const redeemers = signBuilder.toTransaction().redeemers;
     expect(redeemers).toBeDefined();
     const publishRedeemer = canonicalRedeemerEntries(redeemers!).find(
       ({ tag }) => tag === "publish",
     );
     expect(publishRedeemer).toBeDefined();
     expect(publishRedeemer!.index).toBe(0n);
-    expect(publishRedeemer!.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(1n).to_canonical_cbor_hex(),
+    expect(canonicalData(publishRedeemer!.data)).toBe(
+      canonicalData(redeemerData(1n)),
     );
-    expect(publishRedeemer!.exUnits.mem()).toBe(700_000n);
-    expect(publishRedeemer!.exUnits.steps()).toBe(800_000n);
+    expect(publishRedeemer!.exUnits.mem).toBe(700_000n);
+    expect(publishRedeemer!.exUnits.steps).toBe(800_000n);
     expect(evaluateTx).toHaveBeenCalled();
     expect(stableRedeemer).toHaveBeenCalled();
   });
@@ -907,11 +898,11 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const keyTx = keySignBuilder.toTransaction();
-    expect(firstCertificate(keyTx)?.kind()).toBe(CML.CertificateKind.RegCert);
-    expect(firstCertificate(keyTx)?.as_reg_cert()?.deposit()).toBe(
+    expect(firstCertificate(keyTx)?.[0]).toBe(7n);
+    expect(firstCertificate(keyTx)?.[2]).toBe(
       lucidConfig.protocolParameters.keyDeposit,
     );
-    expect(keyTx.witness_set().redeemers()).toBeUndefined();
+    expect(keyTx.redeemers).toHaveLength(0);
 
     const nativeWalletInput = makeUtxo("b5");
     nativeWalletInput.assets = { lovelace: 100_000_000n };
@@ -936,13 +927,11 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const nativeTx = nativeSignBuilder.toTransaction();
-    expect(firstCertificate(nativeTx)?.kind()).toBe(
-      CML.CertificateKind.RegCert,
-    );
-    expect(firstCertificate(nativeTx)?.as_reg_cert()?.deposit()).toBe(
+    expect(firstCertificate(nativeTx)?.[0]).toBe(7n);
+    expect(firstCertificate(nativeTx)?.[2]).toBe(
       lucidConfig.protocolParameters.keyDeposit,
     );
-    expect(nativeTx.witness_set().redeemers()).toBeUndefined();
+    expect(nativeTx.redeemers).toHaveLength(0);
   });
 
   test("registerStake redeemer preserves missing script and reward validation errors", async () => {
@@ -992,21 +981,17 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const proposals = signBuilder.toTransaction().body().proposal_procedures();
+    const proposals = proposalsOf(signBuilder.toTransaction());
     expect(proposals).toBeDefined();
-    expect(proposals!.len()).toBe(1);
-    const proposal = proposals!.get(0);
-    expect(proposal.deposit()).toBe(
-      lucidConfig.protocolParameters.govActionDeposit,
-    );
-    expect(proposal.gov_action().kind()).toBe(CML.GovActionKind.InfoAction);
-    expect(proposal.reward_account().to_address().to_bech32(undefined)).toBe(
+    expect(proposals!.length).toBe(1);
+    const proposal = proposals![0];
+    expect(proposal[0]).toBe(lucidConfig.protocolParameters.govActionDeposit);
+    expect(proposal[2][0]).toBe(6n);
+    expect(getAddressDetails(toHex(proposal[1])).address.bech32).toBe(
       governanceReturnAddress,
     );
-    expect(proposal.anchor().anchor_url().get()).toBe(governanceAnchor.url);
-    expect(
-      signBuilder.toTransaction().witness_set().redeemers(),
-    ).toBeUndefined();
+    expect(proposal[3][0]).toBe(governanceAnchor.url);
+    expect(signBuilder.toTransaction().redeemers).toHaveLength(0);
   });
 
   test("propose builds all typed governance action variants", async () => {
@@ -1065,24 +1050,15 @@ describe("context-dependent redeemers internal coverage", () => {
       presetWalletInputs: [walletInput],
     });
 
-    const proposals = signBuilder.toTransaction().body().proposal_procedures();
-    expect(proposals?.len()).toBe(actions.length);
+    const proposals = proposalsOf(signBuilder.toTransaction());
+    expect(proposals?.length).toBe(actions.length);
     expect(
-      Array.from({ length: proposals!.len() }, (_, index) =>
-        proposals!.get(index).gov_action().kind(),
+      Array.from(
+        { length: proposals!.length },
+        (_, index) => proposals![index][2][0],
       ),
-    ).toEqual([
-      CML.GovActionKind.ParameterChangeAction,
-      CML.GovActionKind.HardForkInitiationAction,
-      CML.GovActionKind.TreasuryWithdrawalsAction,
-      CML.GovActionKind.NoConfidence,
-      CML.GovActionKind.UpdateCommittee,
-      CML.GovActionKind.NewConstitution,
-      CML.GovActionKind.InfoAction,
-    ]);
-    expect(
-      signBuilder.toTransaction().witness_set().redeemers(),
-    ).toBeUndefined();
+    ).toEqual([0n, 1n, 2n, 3n, 4n, 5n, 6n]);
+    expect(signBuilder.toTransaction().redeemers).toHaveLength(0);
   });
 
   test("propose rejects duplicate treasury withdrawal addresses", async () => {
@@ -1135,12 +1111,12 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const tx = signBuilder.toTransaction();
-    const proposals = tx.body().proposal_procedures();
-    expect(proposals?.len()).toBe(1);
-    expect(proposals!.get(0).gov_action().script_hash()?.to_hex()).toBe(
+    const proposals = proposalsOf(tx);
+    expect(proposals?.length).toBe(1);
+    expect(toHex(proposals![0][2][3] as Uint8Array)).toBe(
       mintingPolicyToId(nativeScript),
     );
-    expect(tx.witness_set().redeemers()).toBeUndefined();
+    expect(tx.redeemers).toHaveLength(0);
   });
 
   test("propose supports Plutus governance action witnesses with static redeemers", async () => {
@@ -1166,22 +1142,18 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const tx = signBuilder.toTransaction();
-    const proposals = tx.body().proposal_procedures();
-    expect(proposals?.len()).toBe(1);
-    expect(proposals!.get(0).gov_action().kind()).toBe(
-      CML.GovActionKind.ParameterChangeAction,
-    );
+    const proposals = proposalsOf(tx);
+    expect(proposals?.length).toBe(1);
+    expect(proposals![0][2][0]).toBe(0n);
 
-    const redeemers = tx.witness_set().redeemers();
+    const redeemers = tx.redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("propose");
     expect(redeemer.index).toBe(0n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(42n).to_canonical_cbor_hex(),
-    );
-    expect(redeemer.exUnits.mem()).toBe(620_000n);
-    expect(redeemer.exUnits.steps()).toBe(720_000n);
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(42n)));
+    expect(redeemer.exUnits.mem).toBe(620_000n);
+    expect(redeemer.exUnits.steps).toBe(720_000n);
     expect(evaluateTx).toHaveBeenCalled();
   });
 
@@ -1214,18 +1186,16 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const proposals = signBuilder.toTransaction().body().proposal_procedures();
-    expect(proposals?.len()).toBe(2);
-    const redeemers = signBuilder.toTransaction().witness_set().redeemers();
+    const proposals = proposalsOf(signBuilder.toTransaction());
+    expect(proposals?.length).toBe(2);
+    const redeemers = signBuilder.toTransaction().redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("propose");
     expect(redeemer.index).toBe(1n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(1n).to_canonical_cbor_hex(),
-    );
-    expect(redeemer.exUnits.mem()).toBe(630_000n);
-    expect(redeemer.exUnits.steps()).toBe(730_000n);
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(1n)));
+    expect(redeemer.exUnits.mem).toBe(630_000n);
+    expect(redeemer.exUnits.steps).toBe(730_000n);
     expect(stableRedeemer).toHaveBeenCalled();
   });
 
@@ -1263,13 +1233,11 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const tx = signBuilder.toTransaction();
-    expect(tx.body().proposal_procedures()?.len()).toBe(2);
-    const [redeemer] = canonicalRedeemerEntries(tx.witness_set().redeemers()!);
+    expect(proposalsOf(tx).length).toBe(2);
+    const [redeemer] = canonicalRedeemerEntries(tx.redeemers!);
     expect(redeemer.tag).toBe("propose");
     expect(redeemer.index).toBe(1n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(77n).to_canonical_cbor_hex(),
-    );
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(77n)));
 
     const [context] = signBuilder.toScriptContexts();
     expect(context.scriptContextScriptInfo).toHaveProperty("ProposingScript");
@@ -1397,10 +1365,8 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     expect(delayedRedeemer).not.toHaveBeenCalled();
-    expect(
-      proposalTx.toTransaction().witness_set().redeemers(),
-    ).toBeUndefined();
-    expect(voteTx.toTransaction().witness_set().redeemers()).toBeUndefined();
+    expect(proposalTx.toTransaction().redeemers).toHaveLength(0);
+    expect(voteTx.toTransaction().redeemers).toHaveLength(0);
   });
 
   test("vote adds key DRep voting procedures without Plutus redeemers", async () => {
@@ -1420,22 +1386,15 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const votingProcedures = signBuilder
-      .toTransaction()
-      .body()
-      .voting_procedures();
+    const votingProcedures = votesOf(signBuilder.toTransaction());
     expect(votingProcedures).toBeDefined();
-    expect(votingProcedures!.len()).toBe(1);
-    const cmlVoter = votingProcedures!.keys().get(0);
-    expect(cmlVoter.as_d_rep_key_hash()?.to_hex()).toBe(voter.credential.hash);
-    const actionVotes = votingProcedures!.get(cmlVoter)!;
-    expect(actionVotes.len()).toBe(1);
-    expect(actionVotes.get(actionVotes.keys().get(0))!.vote()).toBe(
-      CML.Vote.Yes,
-    );
-    expect(
-      signBuilder.toTransaction().witness_set().redeemers(),
-    ).toBeUndefined();
+    expect(votingProcedures!.size).toBe(1);
+    const ledgerVoter = [...votingProcedures!.keys()][0];
+    expect(toHex(ledgerVoter[1])).toBe(voter.credential.hash);
+    const actionVotes = votingProcedures!.get(ledgerVoter)!;
+    expect(actionVotes.size).toBe(1);
+    expect(actionVotes.get([...actionVotes.keys()][0])![0]).toBe(1n);
+    expect(signBuilder.toTransaction().redeemers).toHaveLength(0);
   });
 
   test.each([false, true])(
@@ -1450,17 +1409,17 @@ describe("context-dependent redeemers internal coverage", () => {
         {
           actionId: { txHash: "aa".repeat(32), index: 0n },
           vote: "Yes" as const,
-          expected: CML.Vote.Yes,
+          expected: 1n,
         },
         {
           actionId: { txHash: "bb".repeat(32), index: 1n },
           vote: "No" as const,
-          expected: CML.Vote.No,
+          expected: 0n,
         },
         {
           actionId: { txHash: "cc".repeat(32), index: 2n },
           vote: "Abstain" as const,
-          expected: CML.Vote.Abstain,
+          expected: 2n,
         },
       ];
 
@@ -1479,19 +1438,19 @@ describe("context-dependent redeemers internal coverage", () => {
           presetWalletInputs: [walletInput],
         })
       ).toTransaction();
-      const votingProcedures = tx.body().voting_procedures();
-      expect(votingProcedures?.len()).toBe(1);
+      const votingProcedures = votesOf(tx);
+      expect(votingProcedures?.size).toBe(1);
 
-      const cmlVoter = votingProcedures!.keys().get(0);
-      const actionVotes = votingProcedures!.get(cmlVoter)!;
-      expect(actionVotes.len()).toBe(actions.length);
+      const ledgerVoter = [...votingProcedures!.keys()][0];
+      const actionVotes = votingProcedures!.get(ledgerVoter)!;
+      expect(actionVotes.size).toBe(actions.length);
 
-      const retained = new Map<string, CML.Vote>();
-      for (let index = 0; index < actionVotes.len(); index++) {
-        const actionId = actionVotes.keys().get(index);
+      const retained = new Map<string, bigint>();
+      for (let index = 0; index < actionVotes.size; index++) {
+        const actionId = [...actionVotes.keys()][index];
         retained.set(
-          `${actionId.transaction_id().to_hex()}#${actionId.gov_action_index()}`,
-          actionVotes.get(actionId)!.vote(),
+          `${toHex(actionId[0])}#${actionId[1]}`,
+          actionVotes.get(actionId)![0],
         );
       }
       expect(retained).toEqual(
@@ -1502,7 +1461,7 @@ describe("context-dependent redeemers internal coverage", () => {
           ]),
         ),
       );
-      expect(tx.witness_set().redeemers()).toBeUndefined();
+      expect(tx.redeemers).toHaveLength(0);
     },
   );
 
@@ -1534,12 +1493,12 @@ describe("context-dependent redeemers internal coverage", () => {
         })
     ).toTransaction();
 
-    const votingProcedures = tx.body().voting_procedures();
-    expect(votingProcedures?.len()).toBe(1);
-    const cmlVoter = votingProcedures!.keys().get(0);
-    expect(votingProcedures!.get(cmlVoter)?.len()).toBe(2);
-    expect(tx.witness_set().native_scripts()?.len()).toBe(1);
-    expect(tx.witness_set().redeemers()).toBeUndefined();
+    const votingProcedures = votesOf(tx);
+    expect(votingProcedures?.size).toBe(1);
+    const ledgerVoter = [...votingProcedures!.keys()][0];
+    expect(votingProcedures!.get(ledgerVoter)?.size).toBe(2);
+    expect(nativeScriptsOf(tx).length).toBe(1);
+    expect(tx.redeemers).toHaveLength(0);
   });
 
   test("vote rejects an exact duplicate voter and governance action", async () => {
@@ -1578,19 +1537,15 @@ describe("context-dependent redeemers internal coverage", () => {
       .vote(voter, { txHash: "7b".repeat(32), index: 1n }, "No")
       .config();
 
-    expect(replayedConfig.governanceVoteBuilder).toBeUndefined();
-    replayedConfig.txBuilder.add_change_if_needed(
-      CML.Address.from_bech32(address),
-      false,
+    const voteBlocks = replayedConfig.blocks.filter(
+      (block) => block.type === "vote",
     );
-    const tx = replayedConfig.txBuilder
-      .build(CML.ChangeSelectionAlgo.Default, CML.Address.from_bech32(address))
-      .build_unchecked();
-    const votingProcedures = tx.body().voting_procedures();
-    expect(votingProcedures?.len()).toBe(1);
-    expect(votingProcedures?.get(votingProcedures.keys().get(0))?.len()).toBe(
-      2,
-    );
+    expect(voteBlocks).toHaveLength(1);
+    const votingProcedures = decodeCbor(
+      voteBlocks[0].cbor as string,
+    ) as VoteMap;
+    expect(votingProcedures.size).toBe(1);
+    expect([...votingProcedures.values()][0].size).toBe(2);
   });
 
   test("vote builds committee and stake pool voter procedures without Plutus redeemers", async () => {
@@ -1615,21 +1570,14 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const votingProcedures = signBuilder
-      .toTransaction()
-      .body()
-      .voting_procedures();
-    expect(votingProcedures?.len()).toBe(2);
-    const voters = Array.from({ length: votingProcedures!.len() }, (_, index) =>
-      votingProcedures!.keys().get(index).kind(),
+    const votingProcedures = votesOf(signBuilder.toTransaction());
+    expect(votingProcedures?.size).toBe(2);
+    const voters = Array.from(
+      { length: votingProcedures!.size },
+      (_, index) => [...votingProcedures!.keys()][index][0],
     );
-    expect(voters).toEqual([
-      CML.VoterKind.ConstitutionalCommitteeHotKeyHash,
-      CML.VoterKind.StakingPoolKeyHash,
-    ]);
-    expect(
-      signBuilder.toTransaction().witness_set().redeemers(),
-    ).toBeUndefined();
+    expect(voters).toEqual([0n, 4n]);
+    expect(signBuilder.toTransaction().redeemers).toHaveLength(0);
   });
 
   test("vote supports Plutus DRep witnesses and context-dependent redeemers", async () => {
@@ -1667,18 +1615,16 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const tx = signBuilder.toTransaction();
-    const votingProcedures = tx.body().voting_procedures();
-    expect(votingProcedures?.len()).toBe(1);
-    const redeemers = tx.witness_set().redeemers();
+    const votingProcedures = votesOf(tx);
+    expect(votingProcedures?.size).toBe(1);
+    const redeemers = tx.redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("vote");
     expect(redeemer.index).toBe(0n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(9n).to_canonical_cbor_hex(),
-    );
-    expect(redeemer.exUnits.mem()).toBe(640_000n);
-    expect(redeemer.exUnits.steps()).toBe(740_000n);
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(9n)));
+    expect(redeemer.exUnits.mem).toBe(640_000n);
+    expect(redeemer.exUnits.steps).toBe(740_000n);
     expect(stableRedeemer).toHaveBeenCalled();
   });
 
@@ -1723,13 +1669,11 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const tx = signBuilder.toTransaction();
-    expect(tx.body().voting_procedures()?.len()).toBe(2);
-    const [redeemer] = canonicalRedeemerEntries(tx.witness_set().redeemers()!);
+    expect(votesOf(tx).size).toBe(2);
+    const [redeemer] = canonicalRedeemerEntries(tx.redeemers!);
     expect(redeemer.tag).toBe("vote");
     expect(redeemer.index).toBe(0n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(88n).to_canonical_cbor_hex(),
-    );
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(88n)));
 
     const [context] = signBuilder.toScriptContexts();
     expect(context.scriptContextScriptInfo).toHaveProperty("VotingScript");
@@ -1792,23 +1736,19 @@ describe("context-dependent redeemers internal coverage", () => {
       });
 
     const tx = signBuilder.toTransaction();
-    expect(tx.body().voting_procedures()?.len()).toBe(2);
-    const votingProcedures = tx.body().voting_procedures()!;
+    expect(votesOf(tx).size).toBe(2);
+    const votingProcedures = votesOf(tx)!;
     const nativeActionVotes = votingProcedures.get(
-      Array.from({ length: votingProcedures.len() }, (_, index) =>
-        votingProcedures.keys().get(index),
-      ).find(
-        (voter) =>
-          voter.script_hash()?.to_hex() === nativeVoter.credential.hash,
-      )!,
+      Array.from(
+        { length: votingProcedures.size },
+        (_, index) => [...votingProcedures.keys()][index],
+      ).find((voter) => toHex(voter[1]) === nativeVoter.credential.hash)!,
     );
-    expect(nativeActionVotes?.len()).toBe(2);
-    const [redeemer] = canonicalRedeemerEntries(tx.witness_set().redeemers()!);
+    expect(nativeActionVotes?.size).toBe(2);
+    const [redeemer] = canonicalRedeemerEntries(tx.redeemers!);
     expect(redeemer.tag).toBe("vote");
     expect(redeemer.index).toBe(1n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(99n).to_canonical_cbor_hex(),
-    );
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(99n)));
 
     const [context] = signBuilder.toScriptContexts();
     expect(context.scriptContextScriptInfo).toHaveProperty("VotingScript");
@@ -1841,8 +1781,8 @@ describe("context-dependent redeemers internal coverage", () => {
       right.hash.localeCompare(left.hash),
     );
     const evaluateTx = vi.fn<Provider["evaluateTx"]>(async (txHex) => {
-      const tx = CML.Transaction.from_cbor_hex(txHex);
-      const entries = canonicalRedeemerEntries(tx.witness_set().redeemers()!);
+      const tx = inspectTransaction(txHex);
+      const entries = canonicalRedeemerEntries(tx.redeemers!);
       expect(entries.map(({ index }) => index)).toEqual([0n, 1n]);
       return entries.map(({ index }) => ({
         redeemer_tag: "vote" as const,
@@ -1877,26 +1817,21 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       })
     ).toTransaction();
-    const voters = CML.Transaction.from_cbor_bytes(tx.to_canonical_cbor_bytes())
-      .body()
-      .voting_procedures()!
-      .keys();
-    const canonicalHashes = Array.from({ length: voters.len() }, (_, index) =>
-      voters.get(index).script_hash()!.to_hex(),
-    );
+    const voters = [...votesOf(tx).keys()];
+    const canonicalHashes = voters.map((voter) => toHex(voter[1]));
     expect(insertionOrder.map(({ hash }) => hash)).toEqual(
       [...canonicalHashes].reverse(),
     );
 
-    const entries = canonicalRedeemerEntries(tx.witness_set().redeemers()!);
+    const entries = canonicalRedeemerEntries(tx.redeemers!);
     for (const entry of entries) {
-      const voterHash = voters.get(Number(entry.index)).script_hash()!.to_hex();
+      const voterHash = toHex(voters[Number(entry.index)][1]);
       const expected = candidates.find(({ hash }) => hash === voterHash)!;
-      expect(entry.data.to_canonical_cbor_hex()).toBe(
-        redeemerData(expected.data).to_canonical_cbor_hex(),
+      expect(canonicalData(entry.data)).toBe(
+        canonicalData(redeemerData(expected.data)),
       );
-      expect(entry.exUnits.mem()).toBe(650_000n + entry.index);
-      expect(entry.exUnits.steps()).toBe(750_000n + entry.index);
+      expect(entry.exUnits.mem).toBe(650_000n + entry.index);
+      expect(entry.exUnits.steps).toBe(750_000n + entry.index);
     }
     expect(evaluateTx).toHaveBeenCalled();
   });
@@ -1969,16 +1904,14 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const redeemers = signBuilder.toTransaction().witness_set().redeemers();
+    const redeemers = signBuilder.toTransaction().redeemers;
     expect(redeemers).toBeDefined();
     const [redeemer] = canonicalRedeemerEntries(redeemers!);
     expect(redeemer.tag).toBe("publish");
     expect(redeemer.index).toBe(1n);
-    expect(redeemer.data.to_canonical_cbor_hex()).toBe(
-      redeemerData(1n).to_canonical_cbor_hex(),
-    );
-    expect(redeemer.exUnits.mem()).toBe(600_000n);
-    expect(redeemer.exUnits.steps()).toBe(700_000n);
+    expect(canonicalData(redeemer.data)).toBe(canonicalData(redeemerData(1n)));
+    expect(redeemer.exUnits.mem).toBe(600_000n);
+    expect(redeemer.exUnits.steps).toBe(700_000n);
     expect(evaluateTx).toHaveBeenCalled();
     expect(stableRedeemer).toHaveBeenCalled();
   });
@@ -2024,23 +1957,23 @@ describe("context-dependent redeemers internal coverage", () => {
         presetWalletInputs: [walletInput],
       });
 
-    const redeemers = signBuilder.toTransaction().witness_set().redeemers();
+    const redeemers = signBuilder.toTransaction().redeemers;
     expect(redeemers).toBeDefined();
     const entries = canonicalRedeemerEntries(redeemers!);
     expect(entries.map(({ tag, index }) => [tag, index])).toEqual([
       ["publish", 0n],
       ["publish", 1n],
     ]);
-    expect(entries[0].data.to_canonical_cbor_hex()).toBe(
-      redeemerData(0n).to_canonical_cbor_hex(),
+    expect(canonicalData(entries[0].data)).toBe(
+      canonicalData(redeemerData(0n)),
     );
-    expect(entries[1].data.to_canonical_cbor_hex()).toBe(
-      redeemerData(1n).to_canonical_cbor_hex(),
+    expect(canonicalData(entries[1].data)).toBe(
+      canonicalData(redeemerData(1n)),
     );
-    expect(entries[0].exUnits.mem()).toBe(610_000n);
-    expect(entries[0].exUnits.steps()).toBe(710_000n);
-    expect(entries[1].exUnits.mem()).toBe(620_000n);
-    expect(entries[1].exUnits.steps()).toBe(720_000n);
+    expect(entries[0].exUnits.mem).toBe(610_000n);
+    expect(entries[0].exUnits.steps).toBe(710_000n);
+    expect(entries[1].exUnits.mem).toBe(620_000n);
+    expect(entries[1].exUnits.steps).toBe(720_000n);
     expect(evaluateTx).toHaveBeenCalled();
     expect(stableRedeemer).toHaveBeenCalled();
   });

@@ -1,6 +1,9 @@
 import * as Effect from "effect/Effect";
-import * as S from "@effect/schema/Schema";
-import { CML, makeReturn } from "../core.js";
+import { makeReturn } from "../core.js";
+import {
+  transactionJson,
+  type TransactionSnapshot,
+} from "@lucid-evolution/ledger";
 import { Wallet } from "@lucid-evolution/core-types";
 import { Either } from "effect/Either";
 import { TxSubmitError } from "../Errors.js";
@@ -12,7 +15,9 @@ export interface TxSigned {
    *
    * Supports both canonical and non-canonical formats.
    *
-   * Canonical format follows [RFC 7049 Section 3.9](https://datatracker.ietf.org/doc/html/rfc7049#section-3.9) rules
+   * Canonical export normalizes uncommitted CBOR while preserving hashed payloads.
+   * Transactions with existing signatures retain their original bytes. To produce
+   * a canonical body, use `.complete({ canonical: true })` before signing.
    *
    * Non-canonical format example:
    * ```typescript
@@ -29,7 +34,9 @@ export interface TxSigned {
    *
    * Supports both canonical and non-canonical formats.
    *
-   * Canonical format follows [RFC 7049 Section 3.9](https://datatracker.ietf.org/doc/html/rfc7049#section-3.9) rules
+   * Canonical export normalizes uncommitted CBOR while preserving hashed payloads.
+   * Transactions with existing signatures retain their original bytes. To produce
+   * a canonical body, use `.complete({ canonical: true })` before signing.
    *
    * Non-canonical format example:
    * ```typescript
@@ -48,7 +55,9 @@ export interface TxSigned {
    *
    * Supports both canonical and non-canonical formats.
    *
-   * Canonical format follows [RFC 7049 Section 3.9](https://datatracker.ietf.org/doc/html/rfc7049#section-3.9) rules
+   * Canonical export normalizes uncommitted CBOR while preserving hashed payloads.
+   * Transactions with existing signatures retain their original bytes. To produce
+   * a canonical body, use `.complete({ canonical: true })` before signing.
    *
    * Non-canonical format example:
    * ```typescript
@@ -68,7 +77,9 @@ export interface TxSigned {
    *
    * Supports both canonical and non-canonical formats.
    *
-   * Canonical format follows [RFC 7049 Section 3.9](https://datatracker.ietf.org/doc/html/rfc7049#section-3.9) rules
+   * Canonical export normalizes uncommitted CBOR while preserving hashed payloads.
+   * Transactions with existing signatures retain their original bytes. To produce
+   * a canonical body, use `.complete({ canonical: true })` before signing.
    *
    * Non-canonical format example:
    * ```typescript
@@ -80,7 +91,7 @@ export interface TxSigned {
    * ```
    */
   toCBOR: (options?: { canonical: boolean }) => CBORHex;
-  toTransaction: () => CML.Transaction;
+  toTransaction: () => TransactionSnapshot;
   /** Converts the transaction (transaction body and witnesses) to JSON format. */
   toJSON: () => object;
   /** Computes the hash of the transaction. */
@@ -88,15 +99,13 @@ export interface TxSigned {
 }
 export const makeSubmit = (
   wallet: Wallet,
-  txSigned: CML.Transaction,
+  txSigned: TransactionSnapshot,
 ): TxSigned => {
   const submit = (options: { canonical: boolean }) =>
     Effect.tryPromise({
       try: () =>
         wallet.submitTx(
-          options.canonical
-            ? canonicalTransactionHex(txSigned)
-            : txSigned.to_cbor_hex(),
+          options.canonical ? canonicalTransactionHex(txSigned) : txSigned.cbor,
         ),
       catch: (cause) => new TxSubmitError({ cause }),
     });
@@ -107,12 +116,9 @@ export const makeSubmit = (
     submitSafe: (options = { canonical: false }) =>
       makeReturn(submit(options)).safeRun(),
     toCBOR: (options = { canonical: false }) =>
-      options.canonical
-        ? canonicalTransactionHex(txSigned)
-        : txSigned.to_cbor_hex(),
+      options.canonical ? canonicalTransactionHex(txSigned) : txSigned.cbor,
     toTransaction: () => txSigned,
-    toJSON: () =>
-      S.decodeUnknownSync(S.parseJson(S.Object))(txSigned.to_json()),
-    toHash: () => CML.hash_transaction(txSigned.body()).to_hex(),
+    toJSON: () => transactionJson(txSigned),
+    toHash: () => txSigned.hash,
   };
 };

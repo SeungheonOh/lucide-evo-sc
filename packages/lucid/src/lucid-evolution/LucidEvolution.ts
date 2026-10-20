@@ -24,7 +24,7 @@ import {
   Wallet,
   WalletApi,
 } from "@lucid-evolution/core-types";
-import { CML } from "../core.js";
+import { getLedgerRuntime, inspectTransaction } from "@lucid-evolution/ledger";
 import { datumOf, metadataOf } from "./utils.js";
 import {
   createCostModels,
@@ -113,11 +113,11 @@ export type LucidConfig = {
   provider: Provider;
   network: Network;
   wallet: Wallet | undefined;
-  txbuilderconfig: CML.TransactionBuilderConfig;
-  costModels: CML.CostModels;
+  txbuilderconfig: ProtocolParameters;
+  costModels: import("@lucid-evolution/core-types").CostModels;
   protocolParameters: ProtocolParameters;
   evaluator?: EvaluatorAdapter;
-  /** Optional sc-tools backend; transaction and signing APIs are unchanged. */
+  /** Haskell WASM runtime override. */
   balancer?: ScToolsBalancer;
   /**
    * Per-instance slot-to-time mapping. Low-level callers that omit it retain
@@ -134,10 +134,10 @@ export type LucidOptions = {
   presetProtocolParameters?: ProtocolParameters;
   /**
    * Local phase-two evaluator to use when local UPLC evaluation is enabled.
-   * Defaults to the built-in Aiken/WASM-backed evaluator.
+   * Defaults to the built-in Haskell/WASM-backed evaluator.
    */
   evaluator?: EvaluatorAdapter;
-  /** Optional sc-tools backend; transaction and signing APIs are unchanged. */
+  /** Haskell WASM runtime override. */
   balancer?: ScToolsBalancer;
   /** Per-instance slot-to-time mapping. Required for uninitialized Custom networks. */
   slotConfig?: SlotConfig;
@@ -168,7 +168,10 @@ export const Lucid = async (
         : undefined,
     protocolParameters,
     evaluator: options.evaluator,
-    balancer: options.balancer,
+    balancer: options.balancer ?? {
+      type: "sc-tools",
+      runtime: getLedgerRuntime(),
+    },
     slotConfig,
   };
   const configuredProvider = (): Provider => {
@@ -225,13 +228,9 @@ export const Lucid = async (
         });
       }).pipe(Effect.runSync),
     fromTx: (tx: Transaction) =>
-      TxSignBuilder.makeTxSignBuilder(
-        config.wallet,
-        CML.Transaction.from_cbor_hex(tx),
-        {
-          slotConfig: config.slotConfig,
-        },
-      ),
+      TxSignBuilder.makeTxSignBuilder(config.wallet, inspectTransaction(tx), {
+        slotConfig: config.slotConfig,
+      }),
     selectWallet: {
       fromSeed: (
         seed: string,

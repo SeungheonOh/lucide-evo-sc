@@ -1,94 +1,60 @@
 import * as Effect from "effect/Effect";
-import { pipe } from "effect/Function";
+import { ledger, decodeCbor } from "@lucid-evolution/ledger";
 import { ERROR_MESSAGE, TxSignerError } from "../../Errors.js";
-import * as TxSignBuilder from "../TxSignBuilder.js";
-import {
+import type { TxSignBuilderConfig } from "../TxSignBuilder.js";
+import type {
   PrivateKey,
   TransactionWitnesses,
-  Wallet,
 } from "@lucid-evolution/core-types";
-import { CML } from "../../core.js";
-
 export const signError = (cause: unknown) => new TxSignerError({ cause });
-
-const mkWitnessFromWallet = (
-  wallet: Wallet | undefined,
-  txComplete: CML.Transaction,
-): Effect.Effect<CML.TransactionWitnessSet, TxSignerError, never> =>
-  pipe(
-    Effect.fromNullable(wallet),
-    Effect.catchAll(() => signError(ERROR_MESSAGE.MISSING_WALLET)),
-    Effect.tryMapPromise({
-      try: (wallet) => wallet.signTx(txComplete),
-      catch: (cause) => signError(cause),
-    }),
-  );
-
-export const withWallet = (
-  config: TxSignBuilder.TxSignBuilderConfig,
-): Effect.Effect<void, TxSignerError, never> =>
-  pipe(
-    mkWitnessFromWallet(config.wallet, config.txComplete),
-    Effect.map((witness) => config.witnessSetBuilder.add_existing(witness)),
-  );
-
 export const partialWithWallet = (
-  config: TxSignBuilder.TxSignBuilderConfig,
+  config: TxSignBuilderConfig,
 ): Effect.Effect<TransactionWitnesses, TxSignerError> =>
-  pipe(
-    mkWitnessFromWallet(config.wallet, config.txComplete),
-    Effect.map((witness) => witness.to_cbor_hex()),
-  );
-
-const mkWitnessFromPrivateKey = (
-  privateKey: PrivateKey,
-  txComplete: CML.Transaction,
-) =>
-  pipe(
-    Effect.try({
-      try: () => CML.PrivateKey.from_bech32(privateKey),
-      catch: signError,
-    }),
-    Effect.map((privateKey) =>
-      CML.make_vkey_witness(
-        CML.hash_transaction(txComplete.body()),
-        privateKey,
-      ),
-    ),
-  );
-
-export const withPrivateKey = (
-  config: TxSignBuilder.TxSignBuilderConfig,
-  privateKey: PrivateKey,
-) =>
-  pipe(
-    mkWitnessFromPrivateKey(privateKey, config.txComplete),
-    Effect.map((witness) => config.witnessSetBuilder.add_vkey(witness)),
-  );
-
-export const partialWithPrivateKey = (
-  config: TxSignBuilder.TxSignBuilderConfig,
-  privateKey: PrivateKey,
-) =>
-  pipe(
-    mkWitnessFromPrivateKey(privateKey, config.txComplete),
+  Effect.tryPromise({
+    try: async () => {
+      if (!config.wallet) throw new Error(ERROR_MESSAGE.MISSING_WALLET);
+      return config.wallet.signTx(config.txComplete.cbor);
+    },
+    catch: signError,
+  });
+export const withWallet = (config: TxSignBuilderConfig) =>
+  partialWithWallet(config).pipe(
     Effect.map((witness) => {
-      const witnessBuilder = CML.TransactionWitnessSetBuilder.new();
-      witnessBuilder.add_vkey(witness);
-      return witnessBuilder.build().to_cbor_hex();
+      config.witnessSets.push(witness);
     }),
   );
-
+export const partialWithPrivateKey = (
+  config: TxSignBuilderConfig,
+  privateKey: PrivateKey,
+): Effect.Effect<TransactionWitnesses, TxSignerError> =>
+  Effect.try({
+    try: () =>
+      ledger<string>("tx.sign", {
+        cbor: config.txComplete.cbor,
+        privateKeys: [privateKey],
+      }),
+    catch: signError,
+  });
+export const withPrivateKey = (
+  config: TxSignBuilderConfig,
+  privateKey: PrivateKey,
+) =>
+  partialWithPrivateKey(config, privateKey).pipe(
+    Effect.map((witness) => {
+      config.witnessSets.push(witness);
+    }),
+  );
 export const assemble = (
-  config: TxSignBuilder.TxSignBuilderConfig,
+  config: TxSignBuilderConfig,
   witnesses: TransactionWitnesses[],
 ) =>
-  Effect.forEach(witnesses, (witness) =>
-    pipe(
-      Effect.try({
-        try: () => CML.TransactionWitnessSet.from_cbor_hex(witness),
-        catch: signError,
-      }),
-      Effect.map((witness) => config.witnessSetBuilder.add_existing(witness)),
-    ),
-  );
+  Effect.try({
+    try: () => {
+      for (const witness of witnesses) {
+        if (!(decodeCbor(witness) instanceof Map))
+          throw new Error("Expected a CBOR transaction witness set");
+      }
+      config.witnessSets.push(...witnesses);
+    },
+    catch: signError,
+  });

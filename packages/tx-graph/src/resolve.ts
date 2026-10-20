@@ -7,8 +7,10 @@ import type {
   TxOutput,
   UTxO,
 } from "@lucid-evolution/core-types";
-import { getAddressDetails } from "@lucid-evolution/utils";
-import { CML } from "./core.js";
+import {
+  getAddressDetails,
+  validatorToScriptHash,
+} from "@lucid-evolution/utils";
 import type {
   TraceAssets,
   TraceOutRef,
@@ -370,28 +372,7 @@ const traceScriptRef = (script: Script): TraceScriptRef => ({
 
 const scriptHash = (script: Script): string | undefined => {
   try {
-    switch (script.type) {
-      case "Native":
-        return CML.NativeScript.from_cbor_hex(script.script).hash().to_hex();
-      case "PlutusV1":
-        return CML.PlutusScript.from_v1(
-          CML.PlutusV1Script.from_cbor_hex(script.script),
-        )
-          .hash()
-          .to_hex();
-      case "PlutusV2":
-        return CML.PlutusScript.from_v2(
-          CML.PlutusV2Script.from_cbor_hex(script.script),
-        )
-          .hash()
-          .to_hex();
-      case "PlutusV3":
-        return CML.PlutusScript.from_v3(
-          CML.PlutusV3Script.from_cbor_hex(script.script),
-        )
-          .hash()
-          .to_hex();
-    }
+    return validatorToScriptHash(script);
   } catch {
     return undefined;
   }

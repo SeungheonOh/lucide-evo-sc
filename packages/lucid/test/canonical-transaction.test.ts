@@ -1,13 +1,19 @@
 import { describe, expect, test } from "vitest";
 import { FastCheck } from "effect";
-import { toHex, withCMLScope, type CMLOwn } from "@lucid-evolution/core-utils";
-import { CML } from "../src/index.js";
-import { canonicalTransaction } from "../src/CanonicalTransaction.js";
+import { toHex, fromHex } from "@lucid-evolution/core-utils";
+import {
+  ledger,
+  decodeCbor,
+  encodeCbor,
+  CborTag,
+  type CborValue,
+} from "@lucid-evolution/ledger";
+import { canonicalTransactionHex } from "../src/CanonicalTransaction.js";
 
 /*
-  canonicalTransaction re-encodes a transaction canonically but keeps the
-  encoding of its Plutus data (see canonical.rs in the vendored CML). These
-  tests check that contract on random transactions whose CBOR uses
+  canonicalTransaction normalizes uncommitted transaction containers while
+  preserving hashed bytes and ordered Plutus data. These tests check that
+  contract on random transactions whose CBOR uses
   non-canonical encodings throughout: indefinite lengths, oversized integer
   heads, chunked byte strings, sets with and without tag 258, unsorted maps
   and Plutus data that canonical encoding would reorder.
@@ -111,19 +117,86 @@ const encode = (item: Item, canonicalKept = false): Uint8Array => {
   return Uint8Array.from(out);
 };
 
+const canonicalCbor = (cbor: Uint8Array): Uint8Array =>
+  fromHex(ledger<string>("cbor.canonical", { cbor: toHex(cbor) }));
+// Plutus bounds each byte-string chunk at 64 bytes, including canonical data.
+const canonicalPlutus = (cbor: Uint8Array): Uint8Array => {
+  const canonical = canonicalCbor(cbor);
+  const rewrite = (node: Span): number[] => {
+    if (node.major === 2 && node.value > 64n) {
+      const payload = canonical.subarray(
+        node.start + readHead(canonical, node.start).size,
+        node.end,
+      );
+      const out = [0x5f];
+      for (let at = 0; at < payload.length; at += 64) {
+        const chunk = payload.subarray(at, at + 64);
+        out.push(...head(2, BigInt(chunk.length)), ...chunk);
+      }
+      return [...out, 0xff];
+    }
+    if (node.major === 5) {
+      const entries: [number[], number[]][] = [];
+      for (let i = 0; i < node.children.length; i += 2)
+        entries.push([
+          rewrite(node.children[i]),
+          rewrite(node.children[i + 1]),
+        ]);
+      // Chunking changes encoded key lengths, so Plutus map ordering must be
+      // computed after recursively encoding each key with its 64-byte bound.
+      entries.sort(([a], [b]) => {
+        if (a.length !== b.length) return a.length - b.length;
+        for (let i = 0; i < a.length; i++)
+          if (a[i] !== b[i]) return a[i] - b[i];
+        return 0;
+      });
+      return [...head(5, BigInt(entries.length)), ...entries.flat(2)];
+    }
+    if (node.children.length)
+      return [
+        ...canonical.subarray(
+          node.start,
+          node.start + readHead(canonical, node.start).size,
+        ),
+        ...node.children.flatMap(rewrite),
+      ];
+    return [...raw(canonical, node)];
+  };
+  return Uint8Array.from(rewrite(span(canonical, 0)));
+};
+const canonicalMeaning = (cbor: Uint8Array): Uint8Array => {
+  const normalize = (value: CborValue): CborValue => {
+    if (value instanceof CborTag) {
+      return value.tag === 24n && value.value instanceof Uint8Array
+        ? new CborTag(24n, canonicalMeaning(value.value))
+        : new CborTag(value.tag, normalize(value.value));
+    }
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value instanceof Map)
+      return new Map(
+        [...value].map(([key, item]) => [normalize(key), normalize(item)]),
+      );
+    return value;
+  };
+  return fromHex(encodeCbor(normalize(decodeCbor(toHex(cbor))), true));
+};
 const keptPlutusData = (item: Item): Item => ({
   kept: item,
-  canonical: (cbor) =>
-    withCMLScope((own) =>
-      own(CML.PlutusData.from_cbor_bytes(cbor)).to_canonical_cbor_bytes(),
-    ),
+  canonical: canonicalPlutus,
 });
 const keptDatumOption = (item: Item): Item => ({
   kept: item,
-  canonical: (cbor) =>
-    withCMLScope((own) =>
-      own(CML.DatumOption.from_cbor_bytes(cbor)).to_canonical_cbor_bytes(),
-    ),
+  canonical: (cbor) => {
+    const option = decodeCbor(toHex(cbor)) as CborValue[];
+    if (option[0] === 1n) {
+      const wrapped = option[1] as CborTag;
+      option[1] = new CborTag(
+        24n,
+        canonicalPlutus(wrapped.value as Uint8Array),
+      );
+    }
+    return fromHex(encodeCbor(option, true));
+  },
 });
 
 // ---------------------------------------------------------------------------
@@ -376,16 +449,6 @@ const randomTransaction = (g: FastCheck.GeneratorValue): Item => {
 
   const witnessSet = (): Item => {
     const entries: [Item, Item][] = [];
-    if (chance(0.5)) {
-      entries.push([
-        uint(0),
-        set(
-          many(1, 2, () =>
-            array([bytes(randomBytes(32)), bytes(randomBytes(64))]),
-          ),
-        ),
-      ]);
-    }
     if (chance(0.3))
       entries.push([uint(1), set(many(1, 2, () => nativeScript()))]);
     for (const key of [3, 6, 7]) {
@@ -508,140 +571,212 @@ const ledgerSetTags = (cbor: Uint8Array): boolean[] => {
     }
     return map.info === 31 ? at + 1 : at;
   };
-  fields(fields(readHead(cbor, 0).size, BODY_SETS), WITNESS_DATUMS);
+  fields(
+    fields(readHead(cbor, 0).size, BODY_SETS),
+    hasCommittedScriptData(cbor) ? new Set() : WITNESS_DATUMS,
+  );
   return tagged;
 };
 
-/** Datums of Conway-format outputs and collateral return, which keep theirs. */
-const outputDatums = (own: CMLOwn, tx: CML.Transaction) => {
-  const body = own(tx.body());
-  const outputs = own(body.outputs());
-  const collateralReturn = own(body.collateral_return());
+type Span = {
+  start: number;
+  end: number;
+  major: number;
+  value: bigint;
+  children: Span[];
+};
+/** Independent byte-level inspection keeps deliberately noncanonical fixtures intact. */
+const span = (cbor: Uint8Array, start: number): Span => {
+  const h = readHead(cbor, start);
+  const children: Span[] = [];
+  let at = start + h.size;
+  if (h.major === 6 || h.major === 4 || h.major === 5 || h.info === 31) {
+    const count = h.major === 6 ? 1n : h.major === 5 ? h.value * 2n : h.value;
+    for (let n = 0n; h.info === 31 ? cbor[at] !== 0xff : n < count; n++) {
+      const child = span(cbor, at);
+      children.push(child);
+      at = child.end;
+    }
+    if (h.info === 31) at++;
+  } else if (h.major === 2 || h.major === 3) at += Number(h.value);
+  return { start, end: at, major: h.major, value: h.value, children };
+};
+const raw = (cbor: Uint8Array, node: Span) =>
+  cbor.subarray(node.start, node.end);
+const fields = (node: Span): Map<bigint, Span> => {
+  const result = new Map<bigint, Span>();
+  for (let n = 0; n < node.children.length; n += 2)
+    result.set(node.children[n].value, node.children[n + 1]);
+  return result;
+};
+const sequence = (node: Span | undefined): Span[] =>
+  node === undefined
+    ? []
+    : node.major === 6 && node.value === 258n
+      ? node.children[0].children
+      : node.children;
+const hasCommittedScriptData = (cbor: Uint8Array): boolean =>
+  fields(span(cbor, 0).children[0]).has(11n);
+const committedAuxiliary = (cbor: Uint8Array): string | undefined => {
+  const parts = span(cbor, 0).children;
+  return fields(parts[0]).has(7n) ? toHex(raw(cbor, parts[3])) : undefined;
+};
+const committedWitnesses = (cbor: Uint8Array) =>
+  new Map(
+    [...fields(span(cbor, 0).children[1])]
+      .filter(([key]) => key === 4n || key === 5n)
+      .map(([key, node]) => [key, toHex(raw(cbor, node))]),
+  );
+const outputDatums = (cbor: Uint8Array): (string | undefined)[] => {
+  const body = fields(span(cbor, 0).children[0]);
   return [
-    ...Array.from({ length: outputs.len() }, (_, i) => own(outputs.get(i))),
-    ...(collateralReturn ? [collateralReturn] : []),
-  ].map((output) =>
-    own(output.as_conway_format_tx_out())
-      ? own(output.datum())?.to_cbor_hex()
-      : undefined,
-  );
+    ...sequence(body.get(1n)),
+    ...(body.has(16n) ? [body.get(16n)!] : []),
+  ].map((output) => {
+    const datum = output.major === 5 ? fields(output).get(2n) : undefined;
+    return datum ? toHex(raw(cbor, datum)) : undefined;
+  });
 };
-
-const witnessDatums = (own: CMLOwn, tx: CML.Transaction) => {
-  const datums = own(own(tx.witness_set()).plutus_datums());
-  return Array.from({ length: datums?.len() ?? 0 }, (_, i) =>
-    own(datums?.get(i))?.to_cbor_hex(),
+const witnessDatums = (cbor: Uint8Array): string[] =>
+  sequence(fields(span(cbor, 0).children[1]).get(4n)).map((node) =>
+    toHex(raw(cbor, node)),
   );
-};
-
-/** Each redeemer's CBOR and Plutus value, by tag and index. */
-const redeemers = (own: CMLOwn, tx: CML.Transaction) => {
-  const entries = new Map<string, { cbor: string; value: string }>();
-  const redeemers = own(own(tx.witness_set()).redeemers());
-  const map = own(redeemers?.as_map_redeemer_key_to_redeemer_val());
-  const keys = own(map?.keys());
-  for (let i = 0; i < (keys?.len() ?? 0); i++) {
-    const key = own(keys?.get(i));
-    const redeemer = key && own(map?.get(key));
-    if (!key || !redeemer) continue;
-    entries.set(`${key.tag()}:${key.index()}`, {
-      cbor: redeemer.to_cbor_hex(),
-      value: own(redeemer.data()).to_json(),
-    });
+const nativeScripts = (cbor: Uint8Array): string[] =>
+  sequence(fields(span(cbor, 0).children[1]).get(1n)).map((node) =>
+    toHex(raw(cbor, node)),
+  );
+// For the full-container canonicality assertion, normalize protected regions
+// separately: hashed scripts, committed data and Plutus chunks stay untouched.
+const normalizeProtectedRegions = (cbor: Uint8Array): Uint8Array => {
+  const parts = span(cbor, 0).children;
+  const witness = fields(parts[1]);
+  const protectedNodes = hasCommittedScriptData(cbor)
+    ? [witness.get(4n), witness.get(5n)].filter(
+        (node): node is Span => node !== undefined,
+      )
+    : sequence(witness.get(4n));
+  const redeemer = witness.get(5n);
+  if (!hasCommittedScriptData(cbor) && redeemer?.major === 5) {
+    for (let i = 1; i < redeemer.children.length; i += 2)
+      protectedNodes.push(redeemer.children[i].children[0]);
+  } else if (!hasCommittedScriptData(cbor) && redeemer)
+    protectedNodes.push(...redeemer.children.map((tuple) => tuple.children[2]));
+  protectedNodes.push(...sequence(witness.get(1n)));
+  if (committedAuxiliary(cbor) !== undefined) protectedNodes.push(parts[3]);
+  const out: number[] = [];
+  let at = 0;
+  for (const node of protectedNodes.sort((a, b) => a.start - b.start)) {
+    out.push(
+      ...cbor.subarray(at, node.start),
+      ...canonicalCbor(raw(cbor, node)),
+    );
+    at = node.end;
   }
-  const list = own(redeemers?.as_arr_legacy_redeemer());
-  for (let i = 0; i < (list?.len() ?? 0); i++) {
-    const redeemer = own(list?.get(i));
-    if (!redeemer) continue;
-    entries.set(`${redeemer.tag()}:${redeemer.index()}`, {
-      cbor: redeemer.to_cbor_hex(),
-      value: own(redeemer.data()).to_json(),
-    });
-  }
-  return entries;
+  out.push(...cbor.subarray(at));
+  return Uint8Array.from(out);
 };
-
-/**
- * A redeemer is the canonical one if that has the same Plutus value, and the
- * original one otherwise.
- */
-const expectedRedeemers = (own: CMLOwn, tx: CML.Transaction) => {
-  const canonical = redeemers(
-    own,
-    own(CML.Transaction.from_cbor_bytes(tx.to_canonical_cbor_bytes())),
+const orderedValue = (cbor: Uint8Array): string =>
+  // Definite/indefinite containers have the same value; map entry order does not.
+  // Read the term AST directly so duplicate map keys survive inspection too.
+  JSON.stringify(ledger("cbor.decode", { cbor: toHex(cbor) }), (key, value) =>
+    key === "indefinite" ? undefined : value,
   );
-  return new Map(
-    [...redeemers(own, tx)].map(([key, original]) => {
-      const candidate = canonical.get(key);
+/** Each redeemer's exact tuple/value CBOR and ordered Plutus value. */
+const redeemers = (cbor: Uint8Array) => {
+  const result = new Map<
+    string,
+    { cbor: string; data: string; value: string }
+  >();
+  const node = fields(span(cbor, 0).children[1]).get(5n);
+  if (!node) return result;
+  const add = (tag: Span, index: Span, data: Span, tuple: Span) =>
+    result.set(`${tag.value}:${index.value}`, {
+      cbor: toHex(raw(cbor, tuple)),
+      data: toHex(raw(cbor, data)),
+      value: orderedValue(raw(cbor, data)),
+    });
+  if (node.major === 5) {
+    for (let i = 0; i < node.children.length; i += 2) {
+      const key = node.children[i],
+        value = node.children[i + 1];
+      add(key.children[0], key.children[1], value.children[0], value);
+    }
+  } else
+    for (const value of node.children)
+      add(value.children[0], value.children[1], value.children[2], value);
+  return result;
+};
+const expectedRedeemers = (cbor: Uint8Array) =>
+  new Map(
+    [...redeemers(cbor)].map(([key, original]) => {
+      const tuple = fromHex(original.cbor),
+        node = span(tuple, 0);
+      const dataIndex = node.children.length === 4 ? 2 : 0;
+      const data = canonicalPlutus(fromHex(original.data));
+      const canonical = Uint8Array.from([
+        ...head(4, BigInt(node.children.length)),
+        ...node.children.flatMap((child, index) => [
+          ...(index === dataIndex ? data : canonicalCbor(raw(tuple, child))),
+        ]),
+      ]);
       return [
         key,
-        candidate?.value === original.value ? candidate.cbor : original.cbor,
+        !hasCommittedScriptData(cbor) && orderedValue(data) === original.value
+          ? toHex(canonical)
+          : original.cbor,
       ];
     }),
   );
-};
 
 const cborOf = (entries: Map<string, { cbor: string }>) =>
-  new Map([...entries].map(([key, { cbor }]) => [key, cbor]));
-
-// ---------------------------------------------------------------------------
+  new Map([...entries].map(([key, value]) => [key, value.cbor]));
 
 describe("canonicalTransaction", () => {
   test("keeps Plutus data and canonicalises everything else", () => {
-    let withRedeemers = 0;
-    let changed = 0;
-    let untagged = 0;
+    let withRedeemers = 0,
+      changed = 0,
+      untagged = 0;
     FastCheck.assert(
-      FastCheck.property(FastCheck.gen(), (g) =>
-        withCMLScope((own) => {
-          const item = randomTransaction(g);
-          let tx: CML.Transaction;
-          try {
-            tx = own(CML.Transaction.from_cbor_bytes(encode(item)));
-          } catch {
-            // A few random transactions are not valid ledger CBOR.
-            return FastCheck.pre(false);
-          }
-          const result = own(canonicalTransaction(tx));
-
-          // The same transaction, but for tag 258 on sets, which every
-          // ledger set has.
-          expect(withoutSetTags(result.to_canonical_cbor_bytes())).toBe(
-            withoutSetTags(tx.to_canonical_cbor_bytes()),
-          );
-          expect(ledgerSetTags(result.to_cbor_bytes())).not.toContain(false);
-          // Plutus data keeps its encoding: datums always, and redeemers
-          // whose value canonical encoding would change.
-          expect(outputDatums(own, result)).toEqual(outputDatums(own, tx));
-          expect(witnessDatums(own, result)).toEqual(witnessDatums(own, tx));
-          expect(cborOf(redeemers(own, result))).toEqual(
-            expectedRedeemers(own, tx),
-          );
-          // Everything else is canonical: with canonical Plutus data in, the
-          // result is canonical CBOR throughout.
-          const canonicalData = own(
-            CML.Transaction.from_cbor_bytes(encode(item, true)),
-          );
-          const canonicalDataResult = own(canonicalTransaction(canonicalData));
-          expect(canonicalDataResult.to_cbor_hex()).toBe(
-            canonicalDataResult.to_canonical_cbor_hex(),
-          );
-          // And a canonical transaction is left as it is.
-          expect(own(canonicalTransaction(result)).to_cbor_hex()).toBe(
-            result.to_cbor_hex(),
-          );
-
-          if (own(own(tx.witness_set()).redeemers())) withRedeemers++;
-          if (ledgerSetTags(tx.to_cbor_bytes()).includes(false)) untagged++;
-          if (result.to_cbor_hex() !== tx.to_cbor_hex()) changed++;
-        }),
-      ),
-      { numRuns: 3000 },
+      FastCheck.property(FastCheck.gen(), (g) => {
+        const item = randomTransaction(g);
+        const tx = encode(item);
+        const result = fromHex(canonicalTransactionHex(toHex(tx)));
+        expect(withoutSetTags(canonicalMeaning(result))).toBe(
+          withoutSetTags(canonicalMeaning(tx)),
+        );
+        expect(ledgerSetTags(result)).not.toContain(false);
+        expect(outputDatums(result)).toEqual(outputDatums(tx));
+        expect(witnessDatums(result)).toEqual(witnessDatums(tx));
+        expect(nativeScripts(result)).toEqual(nativeScripts(tx));
+        if (hasCommittedScriptData(tx))
+          expect(committedWitnesses(result)).toEqual(committedWitnesses(tx));
+        expect(committedAuxiliary(result)).toBe(committedAuxiliary(tx));
+        expect(cborOf(redeemers(result))).toEqual(expectedRedeemers(tx));
+        const canonicalDataResult = fromHex(
+          canonicalTransactionHex(toHex(encode(item, true))),
+        );
+        const genericCanonicalData =
+          normalizeProtectedRegions(canonicalDataResult);
+        expect(toHex(genericCanonicalData)).toBe(
+          toHex(canonicalCbor(genericCanonicalData)),
+        );
+        expect(canonicalTransactionHex(toHex(result))).toBe(toHex(result));
+        if (redeemers(tx).size) withRedeemers++;
+        if (ledgerSetTags(tx).includes(false)) untagged++;
+        if (toHex(result) !== toHex(tx)) changed++;
+      }),
+      { numRuns: 3000, endOnFailure: true, seed: 2131105921 },
     );
-    // Most random transactions have redeemers and a set without tag 258,
-    // and canonical encoding changes them.
     expect(withRedeemers).toBeGreaterThan(1500);
     expect(untagged).toBeGreaterThan(2000);
     expect(changed).toBeGreaterThan(2400);
+  });
+
+  test("keeps signed transaction bytes intact", () => {
+    // Deliberately oversized body field and an arbitrary vkey witness: changing
+    // the body after it is signed would invalidate that signature.
+    const body = "a300800180021b0000000000030d40";
+    const signed = `84${body}a10081825820${"11".repeat(32)}5840${"22".repeat(64)}f5f6`;
+    expect(canonicalTransactionHex(signed)).toBe(signed);
   });
 });

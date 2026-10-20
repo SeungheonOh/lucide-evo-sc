@@ -3,8 +3,16 @@ import { describe, expect, test } from "vitest";
 import {
   PROTOCOL_PARAMETERS_DEFAULT,
   validatorToAddress,
+  utxoToTransactionInput,
 } from "@lucid-evolution/utils";
-import { CML } from "../src/core.js";
+import {
+  encodeCbor,
+  decodeCbor,
+  ledger,
+  type CborValue,
+} from "@lucid-evolution/ledger";
+import { fixtureTransaction } from "./transaction-fixture.js";
+import { Lucid } from "../../lucid/src/index.js";
 import {
   Emulator,
   generateEmulatorAccountFromPrivateKey,
@@ -24,11 +32,11 @@ import {
 const GENESIS_HASH = "00".repeat(32);
 const SCRIPT_UTXO_HASH = "11".repeat(32);
 
-// The emulator does not evaluate scripts on submit, so the script body only
-// has to deserialise; the same bytes serve as PlutusV2 and PlutusV3 scripts.
-const SCRIPT_BODY = "49480100002221200101";
-const plutusV2Script: Script = { type: "PlutusV2", script: SCRIPT_BODY };
-const plutusV3Script: Script = { type: "PlutusV3", script: SCRIPT_BODY };
+const plutusV2Script: Script = {
+  type: "PlutusV2",
+  script: "49480100002221200101",
+};
+const plutusV3Script: Script = { type: "PlutusV3", script: "450100002499" };
 
 const withProtocolMajorVersion = (
   protocolMajorVersion: number | undefined,
@@ -37,72 +45,7 @@ const withProtocolMajorVersion = (
   protocolMajorVersion,
 });
 
-const txInput = (txHash: string, outputIndex: number) =>
-  CML.TransactionInput.new(
-    CML.TransactionHash.from_hex(txHash),
-    BigInt(outputIndex),
-  );
-
 type OutRef = { txHash: string; outputIndex: number };
-
-const buildTx = (input: {
-  spend: OutRef;
-  read: OutRef[];
-  payTo: string;
-  amount: bigint;
-  signWith?: string;
-  redeemer?: boolean;
-  collateral?: OutRef;
-}): string => {
-  const inputs = CML.TransactionInputList.new();
-  inputs.add(txInput(input.spend.txHash, input.spend.outputIndex));
-  const outputs = CML.TransactionOutputList.new();
-  outputs.add(
-    CML.TransactionOutput.new(
-      CML.Address.from_bech32(input.payTo),
-      CML.Value.from_coin(input.amount),
-    ),
-  );
-  const body = CML.TransactionBody.new(inputs, outputs, 200_000n);
-  if (input.read.length > 0) {
-    const referenceInputs = CML.TransactionInputList.new();
-    for (const ref of input.read) {
-      referenceInputs.add(txInput(ref.txHash, ref.outputIndex));
-    }
-    body.set_reference_inputs(referenceInputs);
-  }
-  if (input.collateral) {
-    const collateralInputs = CML.TransactionInputList.new();
-    collateralInputs.add(
-      txInput(input.collateral.txHash, input.collateral.outputIndex),
-    );
-    body.set_collateral_inputs(collateralInputs);
-  }
-  const witnesses = CML.TransactionWitnessSet.new();
-  if (input.signWith) {
-    const vkeys = CML.VkeywitnessList.new();
-    vkeys.add(
-      CML.make_vkey_witness(
-        CML.hash_transaction(body),
-        CML.PrivateKey.from_bech32(input.signWith),
-      ),
-    );
-    witnesses.set_vkeywitnesses(vkeys);
-  }
-  if (input.redeemer) {
-    const redeemers = CML.LegacyRedeemerList.new();
-    redeemers.add(
-      CML.LegacyRedeemer.new(
-        CML.RedeemerTag.Spend,
-        0n,
-        CML.PlutusData.new_integer(CML.BigInteger.from_str("0")),
-        CML.ExUnits.new(0n, 0n),
-      ),
-    );
-    witnesses.set_redeemers(CML.Redeemers.new_arr_legacy_redeemer(redeemers));
-  }
-  return CML.Transaction.new(body, witnesses, true).to_cbor_hex();
-};
 
 const setup = (protocolMajorVersion: number | undefined) => {
   const account = generateEmulatorAccountFromPrivateKey({
@@ -121,7 +64,7 @@ const setup = (protocolMajorVersion: number | undefined) => {
         address: validatorToAddress("Custom", script),
         assets: { lovelace: 10_000_000n },
         datumHash: undefined,
-        datum: undefined,
+        datum: "d87980",
         scriptRef: script,
       },
       spent: false,
@@ -134,12 +77,12 @@ const spendOwnCoinReadingItself = async (
   protocolMajorVersion: number | undefined,
 ) => {
   const { account, emulator, accountOutRef } = setup(protocolMajorVersion);
-  const tx = buildTx({
-    spend: accountOutRef,
-    read: [accountOutRef],
-    payTo: account.address,
-    amount: 99_800_000n,
-    signWith: account.privateKey,
+  const tx = fixtureTransaction({
+    inputs: [accountOutRef],
+    referenceInputs: [accountOutRef],
+    outputs: [{ address: account.address, assets: { lovelace: 99_800_000n } }],
+    fee: 200_000n,
+    privateKeys: [account.privateKey],
   });
   return emulator.submitTx(tx);
 };
@@ -153,15 +96,33 @@ const spendScriptCoin = async (input: {
     input.protocolMajorVersion,
   );
   lockAt(input.script);
-  const tx = buildTx({
-    spend: scriptOutRef,
-    read: input.readItself ? [scriptOutRef] : [accountOutRef],
-    payTo: account.address,
-    amount: 9_800_000n,
-    redeemer: true,
-    // The ledger requires collateral for a transaction that runs scripts.
-    collateral: accountOutRef,
-    signWith: account.privateKey,
+  const lucid = await Lucid(emulator, "Custom");
+  lucid.selectWallet.fromPrivateKey(account.privateKey);
+  const prepared = await lucid
+    .newTx()
+    .collectFrom(
+      [emulator.ledger[scriptOutRef.txHash + scriptOutRef.outputIndex].utxo],
+      "00",
+    )
+    .readFrom([
+      emulator.ledger[accountOutRef.txHash + accountOutRef.outputIndex].utxo,
+    ])
+    .attach.SpendingValidator(input.script)
+    .pay.ToAddress(account.address, { lovelace: 9_800_000n })
+    .setMinFee(200_000n)
+    .complete({ coinSelection: false });
+  const transaction = decodeCbor(prepared.toCBOR()) as CborValue[];
+  const body = transaction[0] as Map<CborValue, CborValue>;
+  if (input.readItself)
+    body.set(18n, [decodeCbor(utxoToTransactionInput(scriptOutRef))]);
+  const cbor = encodeCbor(transaction);
+  const witnesses = ledger<string>("tx.sign", {
+    cbor,
+    privateKeys: [account.privateKey],
+  });
+  const tx = ledger<string>("tx.mergeWitnesses", {
+    cbor,
+    witnessSets: [witnesses],
   });
   return emulator.submitTx(tx);
 };
@@ -173,13 +134,13 @@ describe("Emulator reference inputs overlapping inputs", () => {
 
   test("protocol version 9 rejects the overlap", async () => {
     await expect(spendOwnCoinReadingItself(9)).rejects.toThrow(
-      /BabbageNonDisjointRefInputs.*0{64}#0/,
+      /BabbageNonDisjointRefInputs/,
     );
   });
 
   test("protocol version 10 rejects the overlap", async () => {
     await expect(spendOwnCoinReadingItself(10)).rejects.toThrow(
-      /BabbageNonDisjointRefInputs.*0{64}#0/,
+      /BabbageNonDisjointRefInputs/,
     );
   });
 
@@ -199,7 +160,7 @@ describe("Emulator reference inputs overlapping inputs", () => {
         script: plutusV3Script,
         readItself: true,
       }),
-    ).rejects.toThrow(/ReferenceInputsNotDisjointFromInputs.*1{64}#0/);
+    ).rejects.toThrow(/ReferenceInputsNotDisjointFromInputs/);
   });
 
   test("protocol version 11 accepts a PlutusV3 script with disjoint reference inputs", async () => {
@@ -210,7 +171,7 @@ describe("Emulator reference inputs overlapping inputs", () => {
     });
   });
 
-  test("an unset protocol version follows the current mainnet rule", async () => {
+  test("an unset protocol version preserves the original Emulator version 11 rules", async () => {
     await spendOwnCoinReadingItself(undefined);
     await expect(
       spendScriptCoin({

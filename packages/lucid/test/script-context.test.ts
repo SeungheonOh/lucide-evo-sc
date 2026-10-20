@@ -1,13 +1,8 @@
 import { expect, test } from "vitest";
 import { Constr, Data, type Data as PlutusData } from "@lucid-evolution/plutus";
-import * as UPLC from "@lucid-evolution/uplc";
+import { inspectTransaction } from "@lucid-evolution/ledger";
+import { applyParamsToScript, datumToHash } from "@lucid-evolution/utils";
 import {
-  applyParamsToScript,
-  utxoToTransactionInput,
-  utxoToTransactionOutput,
-} from "@lucid-evolution/utils";
-import {
-  CML,
   Emulator,
   EvaluatorAdapter,
   EvalRedeemer,
@@ -27,8 +22,8 @@ import {
   validatorToAddress,
   validatorToRewardAddress,
 } from "../src/index.js";
-import scripts from "./specs/contracts/plutus.json" assert { type: "json" };
-import { canonicalRedeemerEntries } from "../src/tx-builder/internal/RedeemerContext.js";
+import scripts from "./specs/contracts/plutus.json" with { type: "json" };
+
 import { CONSTANTS } from "./emulator/Constants.js";
 
 const PUB_KEY_HASH = "11".repeat(28);
@@ -165,11 +160,7 @@ const uniqueUtxos = (utxos: UTxO[]): UTxO[] => {
 const fixedBudgetEvaluator: EvaluatorAdapter = {
   name: "fixed-budget",
   evaluate: async ({ tx }) => {
-    const redeemers = CML.Transaction.from_cbor_hex(tx)
-      .witness_set()
-      .redeemers();
-    if (!redeemers) return [];
-    return canonicalRedeemerEntries(redeemers).map(
+    return inspectTransaction(tx).redeemers.map(
       (entry): EvalRedeemer => ({
         redeemer_tag: entry.tag,
         redeemer_index: Number(entry.index),
@@ -179,26 +170,13 @@ const fixedBudgetEvaluator: EvaluatorAdapter = {
   },
 };
 
-const evaluateExpectingEchoFailure = (
-  tx: CML.Transaction,
+const evaluateExpectingEchoFailure = async (
+  tx: string,
   additionalUtxos: UTxO[],
-  costModels: CML.CostModels,
-  slotConfig: (typeof SLOT_CONFIG_NETWORK)["Custom"],
+  emulator: Emulator,
 ) => {
-  const inputs = additionalUtxos.map(utxoToTransactionInput);
-  const outputs = additionalUtxos.map(utxoToTransactionOutput);
   try {
-    UPLC.eval_phase_two_raw(
-      tx.to_cbor_bytes(),
-      inputs.map((input) => input.to_cbor_bytes()),
-      outputs.map((output) => output.to_cbor_bytes()),
-      costModels.to_cbor_bytes(),
-      50_000_000_000n,
-      100_000_000n,
-      BigInt(slotConfig.zeroTime),
-      BigInt(slotConfig.zeroSlot),
-      slotConfig.slotLength,
-    );
+    await emulator.evaluateTx(tx, additionalUtxos);
   } catch (error) {
     return error instanceof Error
       ? `${error.message}\n${error.stack ?? ""}`
@@ -214,7 +192,7 @@ const extractTrace = (message: string, prefix: string): string => {
 };
 
 const hashScriptContextCbor = (contextCbor: string): string =>
-  CML.hash_plutus_data(CML.PlutusData.from_cbor_hex(contextCbor)).to_hex();
+  datumToHash(contextCbor);
 
 const encodeCborHeader = (major: number, value: number | bigint): string => {
   const n = BigInt(value);
@@ -536,7 +514,19 @@ test("TxSignBuilder orders ScriptContexts and redeemers by ledger script purpose
 
 test("TxSignBuilder ScriptContexts match serialized ledger ScriptContexts for complex transactions", async () => {
   const account = generateEmulatorAccount({ lovelace: 75_000_000_000n });
-  const emulator = new Emulator([account], PROTOCOL_PARAMETERS_DEFAULT);
+  const emulator = new Emulator(
+    [account],
+    // The trace validator serializes the entire context. Preserve the larger
+    // evaluation budget this fixture used before moving to the ledger evaluator.
+    {
+      ...PROTOCOL_PARAMETERS_DEFAULT,
+      maxTxExMem: 100_000_000n,
+      maxTxExSteps: 50_000_000_000n,
+    },
+    0n,
+    undefined,
+    { stakePools: [CONSTANTS.EMULATOR_POOL_ID] },
+  );
   const lucid = await Lucid(emulator, "Custom");
   lucid.selectWallet.fromSeed(account.seedPhrase);
 
@@ -702,11 +692,10 @@ test("TxSignBuilder ScriptContexts match serialized ledger ScriptContexts for co
     }
     const expectedCbor = builtinSerialisedContext(expectedContext);
     const expectedHash = hashScriptContextCbor(expectedCbor);
-    const failure = evaluateExpectingEchoFailure(
-      signBuilder.toTransaction(),
+    const failure = await evaluateExpectingEchoFailure(
+      signBuilder.toCBOR(),
       uniqueUtxos([...walletUtxos, ...scriptInputs, referenceInput]),
-      costModels,
-      lucid.config().slotConfig!,
+      emulator,
     );
     const actualCbor = extractTrace(failure, ECHO_CBO_PREFIX);
 

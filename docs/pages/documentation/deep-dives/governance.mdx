@@ -194,7 +194,7 @@ await lucid.newTx()
 <summary>Understanding Delegation Certificates</summary>
 When you delegate your voting power, Evolution library creates a certificate
 that's included in your transaction. Behind the scenes, this is handled by the
-`Certificate.new_vote_deleg_cert` method in CML. The certificate contains:
+Haskell ledger vote-delegation certificate encoder. The certificate contains:
 
 - Stake credential derived from your reward address
 - DRep you're delegating to

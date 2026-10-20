@@ -1,54 +1,21 @@
 import { assert, test } from "vitest";
-import * as UPLC from "@lucid-evolution/uplc";
-import * as CML from "@lucid-evolution/cml";
-import {
-  createCostModels,
-  fromCMLRedeemerTag,
-  PROTOCOL_PARAMETERS_DEFAULT,
-  utxoToTransactionInput,
-  utxoToTransactionOutput,
-} from "@lucid-evolution/utils";
+import { PROTOCOL_PARAMETERS_DEFAULT } from "@lucid-evolution/utils";
 import { SLOT_CONFIG_NETWORK } from "@lucid-evolution/plutus";
 import { EvalRedeemer, UTxO } from "@lucid-evolution/core-types";
+import { makeHaskellEvaluator } from "../src/index.js";
 
-// NOTE: This test should probably be moved to another location.
-// NOTE: UPLC.eval_phase_two_raw return a redeemer list which is the old format
-// soon we need to transform the list into a redeemer map using CML.MapRedeemerKeyToRedeemerVal
-test("UPLC evaluation", () => {
-  createCostModels(PROTOCOL_PARAMETERS_DEFAULT.costModels);
-  const ins = evalSample3.utxos.map((utxo) => utxoToTransactionInput(utxo));
-  const outs = evalSample3.utxos.map((utxo) => utxoToTransactionOutput(utxo));
-  const slotConfig = SLOT_CONFIG_NETWORK["Preprod"];
-  const evalUPLC = UPLC.eval_phase_two_raw(
-    CML.Transaction.from_cbor_hex(evalSample3.transaction).to_cbor_bytes(),
-    ins.map((value) => value.to_cbor_bytes()),
-    outs.map((value) => value.to_cbor_bytes()),
-    createCostModels(PROTOCOL_PARAMETERS_DEFAULT.costModels).to_cbor_bytes(),
-    PROTOCOL_PARAMETERS_DEFAULT.maxTxExSteps,
-    PROTOCOL_PARAMETERS_DEFAULT.maxTxExMem,
-    BigInt(slotConfig.zeroTime),
-    BigInt(slotConfig.zeroSlot),
-    slotConfig.slotLength,
-  );
-
-  const evalRedeemers: EvalRedeemer[] = [];
-
-  for (const bytes of evalUPLC) {
-    const redeemer = CML.LegacyRedeemer.from_cbor_bytes(bytes);
-    evalRedeemers.push({
-      ex_units: {
-        mem: Number(redeemer.ex_units().mem()),
-        steps: Number(redeemer.ex_units().steps()),
-      },
-      redeemer_index: Number(redeemer.index()),
-      redeemer_tag: fromCMLRedeemerTag(redeemer.tag()),
-    });
-  }
+test("Haskell evaluates the recorded Plutus workload with upstream execution budgets", async () => {
+  const evalRedeemers = await makeHaskellEvaluator().evaluate({
+    tx: evalSample3.transaction,
+    additionalUTxOs: evalSample3.utxos,
+    context: {
+      network: "Preprod",
+      slotConfig: SLOT_CONFIG_NETWORK.Preprod,
+      protocolParameters: PROTOCOL_PARAMETERS_DEFAULT,
+      costModels: PROTOCOL_PARAMETERS_DEFAULT.costModels,
+    },
+  });
   assert.deepStrictEqual(evalRedeemers, evalSample3.redeemersExUnits);
-  // const mapRedeeemer = CML.MapRedeemerKeyToRedeemerVal.new()
-  // for (const redeemer of evalRedeemers) {
-  //   mapRedeeemer.insert(CML.RedeemerKey.new(CML.RedeemerTag.))
-  // }
 });
 
 export const evalSample3: {
