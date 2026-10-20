@@ -32,5 +32,19 @@ metadata = {
     'wasmSha256': hashlib.sha256(data).hexdigest(),
     'gzipSha256': hashlib.sha256(compressed).hexdigest(),
 }
+if len(sys.argv) > 2:
+    reactor = Path(sys.argv[2]).read_bytes()
+    if reactor[:4] != b'\0asm':
+        raise SystemExit('Expected a WebAssembly reactor')
+    reactor_gzip = gzip.compress(reactor, compresslevel=9, mtime=0)
+    (OUTPUT / 'sc-tools-ledger.wasm').write_bytes(reactor)
+    (BROWSER / 'sc-tools-ledger.wasm.gz').write_bytes(reactor_gzip)
+    metadata['ledger'] = {
+        'version': 1,
+        'wasmBytes': len(reactor),
+        'gzipBytes': len(reactor_gzip),
+        'wasmSha256': hashlib.sha256(reactor).hexdigest(),
+        'gzipSha256': hashlib.sha256(reactor_gzip).hexdigest(),
+    }
 (BROWSER / 'runtime-manifest.json').write_text(json.dumps(metadata, indent=2) + '\n')
 print(json.dumps(metadata, indent=2))

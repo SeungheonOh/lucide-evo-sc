@@ -14,6 +14,12 @@ import Cardano.Api qualified as C
 import Cardano.Api.Experimental qualified as E
 import Cardano.Api.Ledger qualified as L
 import Cardano.Ledger.Core (ppKeyDepositL)
+import Cardano.Ledger.Core qualified as L
+import Cardano.Ledger.Babbage.Core qualified as L
+import Cardano.Api.Tx (toShelleyTxOut, fromShelleyTxIn)
+import Cardano.Ledger.TxIn qualified as TxIn
+import Cardano.Ledger.Conway qualified as Era
+import Cardano.Ledger.State qualified as LedgerState
 import Cardano.Ledger.Address (getNetwork)
 import Data.Scientific (Scientific)
 import Cardano.Binary qualified as CB
@@ -135,6 +141,28 @@ plutus o = do
     "PlutusV2" -> SomePlutus C.PlutusScriptV2 <$> cbor (C.AsPlutusScript C.AsPlutusScriptV2) bytes
     "PlutusV3" -> SomePlutus C.PlutusScriptV3 <$> cbor (C.AsPlutusScript C.AsPlutusScriptV3) bytes
     _ -> fail "Choose PlutusV1, PlutusV2, or PlutusV3"
+-- Keep native scripts in the ledger's memoized representation when their
+-- byte encoding contributes to a policy ID or script address.
+nativeLedgerScript :: Text -> Parser (L.Script Era.ConwayEra)
+nativeLedgerScript text = do
+  bytes <- hexBytes text
+  eitherP (LB.decodeFullAnnotator (LB.natVersion @10) "native script" LB.decCBOR (BL.fromStrict (BS.pack [130,0] <> bytes)))
+
+nativeLedgerHash :: Text -> Parser C.ScriptHash
+nativeLedgerHash text = C.fromShelleyScriptHash . L.hashScript <$> nativeLedgerScript text
+
+outputLedger :: Value -> Parser (L.TxOut Era.ConwayEra)
+outputLedger value = do
+  typed <- output value
+  native <- withObject "output" (\o -> o .:? "referenceScript" >>= maybe (pure Nothing) (withObject "reference script" (.:? "nativeScriptCbor"))) value
+  let ledger = toShelleyTxOut C.ShelleyBasedEraConway (C.toCtxUTxOTxOut typed)
+  case native of
+    Nothing -> pure ledger
+    Just text -> do
+      script <- nativeLedgerScript text
+      pure (ledger & L.referenceScriptTxOutL %~ const (pure script))
+
+
 nativeScriptP :: Object -> Parser C.SimpleScript
 nativeScriptP o = o .:? "nativeScriptCbor" >>= maybe (o .: "nativeScript" >>= parseJSON) (fmap (\(C.SimpleScript s) -> s) . cbor (C.AsScript C.AsSimpleScript))
 
@@ -236,8 +264,13 @@ block params = withObject "transaction block" $ \o -> do
         case reference of
           Just _ -> pure ()
           Nothing -> do
-            C.ScriptInAnyLang _ actual <- anyScript witnessValue
-            unless (C.PolicyId (C.hashScript actual) == policy) (fail "Policy ID does not match the minting script")) witnessValue
+            native <- wo .:? "nativeScriptCbor"
+            hash <- case native of
+              Just text -> nativeLedgerHash text
+              Nothing -> do
+                C.ScriptInAnyLang _ actual <- anyScript witnessValue
+                pure (C.hashScript actual)
+            unless (C.PolicyId hash == policy) (fail "Policy ID does not match the minting script")) witnessValue
       assets <- (o .: "assets" :: Parser [Value]) >>= traverse (withObject "minted asset" $ \a -> (,) <$> (a .: "assetName" >>= raw C.AsAssetName) <*> (C.Quantity <$> intField a "quantity"))
       when (null assets) (fail "Mint block needs an asset")
       build $ forM_ assets $ \(name,qty) -> B.addMintWithTxBody policy name qty (const sw)
@@ -318,7 +351,7 @@ history xs = case xs of
   [a,b,c,d,e,f,g,h] -> pure $ C.EraHistory $ H.mkInterpreter $ H.Summary $ NonEmptyCons a $ NonEmptyCons b $ NonEmptyCons c $ NonEmptyCons d $ NonEmptyCons e $ NonEmptyCons f $ NonEmptyCons g $ NonEmptyOne h
   _ -> fail "Expected 1–8 era summaries"
 
-data Context = Context {ctxUtxo :: C.UTxO Era, ctxParams :: C.LedgerProtocolParameters Era, ctxHistory :: C.EraHistory, ctxStart :: SystemStart, ctxNetwork :: C.NetworkId}
+data Context = Context {ctxUtxo :: C.UTxO Era, ctxLedgerUtxo :: LedgerState.UTxO Era.ConwayEra, ctxParams :: C.LedgerProtocolParameters Era, ctxHistory :: C.EraHistory, ctxStart :: SystemStart, ctxNetwork :: C.NetworkId}
 newtype Chain a = Chain {unChain :: ReaderT Context (ExceptT (CS.BalanceTxError Era) IO) a}
   deriving (Functor, Applicative, Monad, MonadIO, MonadReader Context, MonadError (CS.BalanceTxError Era))
 instance MonadBlockchain Era Chain where
@@ -340,6 +373,11 @@ parseContext o = do
   collateral <- wallet .:? "collateral" .!= [] >>= traverse walletOutput
   fallbackCollateral <- wallet .:? "collateralFallback" .!= [] >>= traverse walletOutput
   external <- o .:? "resolvedInputs" .!= [] >>= traverse resolvedOutput
+  ledgerWallet <- wallet .: "utxos" :: Parser [Value]
+  ledgerCollateral <- wallet .:? "collateral" .!= []
+  ledgerFallback <- wallet .:? "collateralFallback" .!= []
+  ledgerExternal <- o .:? "resolvedInputs" .!= []
+  ledgerUtxos <- traverse resolvedLedgerOutput (ledgerWallet <> ledgerCollateral <> ledgerFallback <> ledgerExternal)
   change <- wallet .: "changeAddress" >>= address
   chain <- o .: "chain"
   params <- C.LedgerProtocolParameters <$> (chain .: "protocolParameters" >>= parseJSON . protocolJSON)
@@ -367,7 +405,11 @@ parseContext o = do
   forM_ (spent <> refs <> cols) $ \i -> unless (Map.member i allUtxos) (fail ("Missing resolved UTXO: " <> T.unpack (inputText i)))
   forM_ (C.txOuts body) $ \(C.TxOut a _ _ _) -> unless (addressNetwork a == C.toShelleyNetwork network) (fail "Recipient address is on a different network")
   extra <- o .:? "additionalWitnesses" .!= 0
-  pure (Context (C.UTxO allUtxos) params eras start network, C.UTxO (Map.withoutKeys (Map.fromList wutxos) (Set.fromList refs)),change,builder,extra)
+  pure (Context (C.UTxO allUtxos) (LedgerState.UTxO (Map.fromList ledgerUtxos)) params eras start network, C.UTxO (Map.withoutKeys (Map.fromList wutxos) (Set.fromList refs)),change,builder,extra)
+
+resolvedLedgerOutput :: Value -> Parser (TxIn.TxIn, L.TxOut Era.ConwayEra)
+resolvedLedgerOutput (String text) = hexBytes text >>= eitherP . LB.decodeFull' (LB.natVersion @10)
+resolvedLedgerOutput value = withObject "resolved input" (\o -> (,) <$> (o .: "input" >>= input >>= pure . C.toShelleyTxIn) <*> (o .: "output" >>= outputLedger)) value
 
 resolvedOutput :: Value -> Parser (C.TxIn, C.TxOut C.CtxUTxO Era)
 resolvedOutput (String t) = walletOutput t

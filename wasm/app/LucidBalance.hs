@@ -2,13 +2,17 @@
 module LucidBalance (balanceRequest, evaluateRequest) where
 
 import LiveTx
+import Ledger.Canonical qualified as Canonical
 import Cardano.Api qualified as C
 import Cardano.Api.Experimental qualified as E
-import GHC.IsList (toList)
-import Cardano.Api.Tx (substituteExecutionUnits)
+import GHC.IsList (toList, fromList)
+import Cardano.Api.Tx (substituteExecutionUnits, toScriptIndex)
+import Cardano.Api.Query (LedgerEpochInfo(..))
 import Cardano.Ledger.Binary qualified as LB
 import Cardano.Api.Ledger qualified as L
+import Cardano.Ledger.Api qualified as L
 import Cardano.Ledger.Core qualified as L
+import Cardano.Ledger.Babbage.Core qualified as L
 import Cardano.Ledger.Alonzo.PParams qualified as L
 import Cardano.Ledger.Keys (coerceKeyRole)
 import Cardano.Ledger.Conway.TxCert qualified as LC
@@ -26,7 +30,7 @@ import Data.List (sortOn, sort)
 import Data.Ord (Down(..))
 import Control.Monad (when, unless, forM)
 import Control.Monad.Except
-import Control.Lens ((^.))
+import Control.Lens ((^.), (&), (.~), (%~))
 
 -- Values and witnesses stay in Cardano types throughout balancing. Coin selection
 -- uses convex-wallet; evaluation, fees, and deposits use the ledger APIs used by sc-tools.
@@ -78,16 +82,38 @@ unitsJSON (i, C.ExecutionUnits steps mem) = case indexJSON i of
   _ -> Null
 
 balanceRequest :: Value -> IO Value
-balanceRequest v = pure $ either failure id $ parseEither parse v >>= runBalance
+balanceRequest v = pure $ either failure id $ parseEither prepare v >>= parseEither parse >>= runBalance
   where failure e = object ["ok" .= False, "error" .= e]
+        prepare value = withObject "balanceV2" (\o -> do
+          options <- o .:? "options" .!= mempty
+          canonical <- options .:? "canonical" .!= False
+          if canonical then Canonical.request value else pure value) value
         parse = withObject "balanceV2" $ \o -> do
           ctx <- parseContext o
           walletJSON <- o .: "wallet"
           collateralInputs <- walletJSON .: "utxos" >>= traverse walletOutput
           extraCollateral <- walletJSON .:? "collateral" .!= [] >>= traverse walletOutput
           fallbackCollateral <- walletJSON .:? "collateralFallback" .!= [] >>= traverse walletOutput
+          blocks <- o .: "blocks" :: Parser [Value]
+          explicitOutputs <- fmap concat $ forM blocks $ withObject "block" $ \block -> do
+            kind <- block .: "type" :: Parser T.Text
+            if kind == "output" then (:[]) <$> (block .: "output" >>= outputLedger) else pure []
+          let nativeOutputs = Map.fromList [(index,output ^. L.referenceScriptTxOutL) | (index,output) <- zip [0 :: Int ..] explicitOutputs]
+          nativeWitnesses <- fmap concat $ forM blocks $ withObject "block" $ \block -> do
+            witness <- block .:? "witness"
+            case witness of
+              Nothing -> pure []
+              Just value -> withObject "witness" (\w -> do
+                encoded <- w .:? "nativeScriptCbor"
+                case encoded of
+                  Nothing -> pure []
+                  Just text -> do
+                    script <- nativeLedgerScript text
+                    normalized <- nativeScriptP w
+                    pure [(C.hashScript (C.SimpleScript normalized),script)]) value
           opts <- o .:? "options" .!= mempty
           select <- opts .:? "coinSelection" .!= True
+          canonical <- opts .:? "canonical" .!= False
           minFee <- opts .:? "minFee" >>= maybe (pure 0) integerP
           explicitFee <- opts .:? "explicitFee" .!= False
           collateral <- opts .:? "setCollateral" >>= maybe (pure 5000000) integerP
@@ -103,7 +129,7 @@ balanceRequest v = pure $ either failure id $ parseEither parse v >>= runBalance
             cred <- credentialP d; amount <- C.Coin <$> intField d "deposit"; pure (coerceKeyRole (C.toShelleyStakeCredential cred), amount))
           when (minFee < 0 || collateral < 0) (fail "Fee and collateral must be nonnegative")
           unless (mode `elem` ["local","provided","bootstrap"]) (fail "Invalid evaluation mode")
-          pure (ctx,select,C.Coin minFee,explicitFee,collateral,dust,mode,Map.fromList units,expected,Set.fromList pools,Map.fromList refunds,Map.fromList drepRefunds,Map.fromList (collateralInputs <> fallbackCollateral),Map.fromList extraCollateral)
+          pure (ctx,select,C.Coin minFee,explicitFee,collateral,dust,mode,Map.fromList units,expected,Set.fromList pools,Map.fromList refunds,Map.fromList drepRefunds,Map.fromList (collateralInputs <> fallbackCollateral),Map.fromList extraCollateral,canonical,Map.fromListWith (<>) [(hash,[script]) | (hash,script) <- nativeWitnesses],nativeOutputs)
 
 credentialP o = do
   typ <- o .: "type" :: Parser String
@@ -112,13 +138,26 @@ credentialP o = do
     else if typ == "Script" then C.StakeCredentialByScript <$> raw C.AsScriptHash hash
     else fail "Invalid credential"
 
-runBalance ((ctx,wallet,change,builder,extra),selection,minFee,explicitFee,collateralFloor,allowDust,mode,supplied,expected,pools,stakeDeposits,drepDeposits,collateralWallet,preferredCollateral) = do
+runBalance ((ctx,wallet,change,builder,extra),selection,minFee,explicitFee,collateralFloor,allowDust,mode,supplied,expected,pools,stakeDeposits,drepDeposits,collateralWallet,preferredCollateral,canonical,nativeWitnesses,nativeOutputs) = do
   let pp = ctxParams ctx
       ledgerPP = C.unLedgerProtocolParameters pp
       C.UTxO allUtxos = ctxUtxo ctx
       C.UTxO walletMap = wallet
       original = B.buildTx builder
       initial = original { C.txProtocolParams = C.BuildTxWith (Just pp) }
+      makeBody content = do
+        originalBody <- mkBody content
+        let C.ShelleyTxBody era ledgerBody scripts scriptData auxiliary validity = originalBody
+            replaceScript script = Map.findWithDefault [script] (C.fromShelleyScriptHash (L.hashScript script)) nativeWitnesses
+            outputs = ledgerBody ^. L.outputsTxBodyL
+            replaced = fromList [output & L.referenceScriptTxOutL .~ Map.findWithDefault (output ^. L.referenceScriptTxOutL) index nativeOutputs | (index,output) <- zip [0 :: Int ..] (toList outputs)]
+            body = C.ShelleyTxBody era (ledgerBody & L.outputsTxBodyL .~ replaced) (concatMap replaceScript scripts) scriptData auxiliary validity
+        if not canonical then pure body else do
+          transaction <- parseEither (const $ do
+            bytes <- Canonical.transaction (C.serialiseToCBOR (C.makeSignedTransaction [] body))
+            eitherP (C.deserialiseFromCBOR (C.AsTx C.AsConwayEra) bytes)) Null
+          pure (C.getTxBody transaction)
+
       -- Explicit deregistration refunds default to Lucid's parameter snapshot.
       defaultRefunds = case C.txCertificates initial of
         C.TxCertificatesNone -> Map.empty
@@ -127,7 +166,7 @@ runBalance ((ctx,wallet,change,builder,extra),selection,minFee,explicitFee,colla
         C.TxCertificatesNone -> Map.empty
         C.TxCertificates _ cs -> Map.fromList [pair | (E.Certificate cert,_) <- toList cs, Just pair <- [LC.getUnRegDRepTxCert cert]]
       balance b = do
-        txbody <- mkBody b
+        txbody <- makeBody b
         pure $ C.txOutValueToValue $ C.evaluateTransactionBalance C.ShelleyBasedEraConway ledgerPP pools (Map.union stakeDeposits defaultRefunds) (Map.union drepDeposits defaultDRepRefunds) (ctxUtxo ctx) txbody
       asFunding m = UtxoSet (Map.map (\o -> (C.InAnyCardanoEra C.ConwayEra o,())) m)
       addFunds need body = do
@@ -226,15 +265,16 @@ runBalance ((ctx,wallet,change,builder,extra),selection,minFee,explicitFee,colla
           else do
             let finalFee = if dust then fee + C.Coin ada else fee
                 content = (setFee finalFee col) { C.txOuts = C.txOuts original <> (if bal /= mempty && not dust then changeOuts else []) }
-            body <- mkBody content
+            body <- makeBody content
             -- Bootstrap budgets only shape delayed redeemers. With an explicit
             -- fee, match CML by not charging the maximum transaction budget to
             -- a candidate that will be evaluated again before it can be signed.
             feeBody <- if mode == "bootstrap" && explicitFee
-              then liftE (substituteExecutionUnits (Map.map (const (C.ExecutionUnits 0 0)) units) content) >>= mkBody
+              then liftE (substituteExecutionUnits (Map.map (const (C.ExecutionUnits 0 0)) units) content) >>= makeBody
               else pure body
             let count = C.estimateTransactionKeyWitnessCount content + extra
-                minimumFee = max minFee (C.calculateMinTxFee C.ShelleyBasedEraConway ledgerPP (ctxUtxo ctx) feeBody count)
+                C.ShelleyTx _ feeTx = C.makeSignedTransaction [] feeBody
+                minimumFee = max minFee (L.calcMinFeeTx (ctxLedgerUtxo ctx) ledgerPP feeTx (fromIntegral count))
                 ids = sort (map (inputText . fst) (C.txIns content))
                 unsigned = C.makeSignedTransaction [] body
                 result refresh = object ["ok" .= True,"transaction" .= inspect unsigned,"needsRedeemers" .= refresh,"costModels" .= (case toJSON ledgerPP of Object o -> KM.lookup "costModels" o; _ -> Nothing),"inputs" .= ids,"witnessEstimate" .= count,"exUnits" .= map unitsJSON (Map.toList units)]
@@ -243,7 +283,7 @@ runBalance ((ctx,wallet,change,builder,extra),selection,minFee,explicitFee,colla
             else if maybe False ((/= ids) . sort) expected then pure (result True)
             else if mode /= "local" then pure (result False)
             else do
-              evaluated <- traverse (fmap snd . liftE) (C.evaluateTransactionExecutionUnits C.ConwayEra (ctxStart ctx) (C.toLedgerEpochInfo (ctxHistory ctx)) pp (ctxUtxo ctx) body)
+              evaluated <- evaluateLedger ctx body
               let fingerprint = C.serialiseToCBOR unsigned
               if evaluated == units && previous == Just fingerprint then do
                 require (BS.length fingerprint + fromIntegral count * 101 <= fromIntegral (ledgerPP ^. L.ppMaxTxSizeL)) "Transaction exceeds maxTxSize"
@@ -256,9 +296,19 @@ runBalance ((ctx,wallet,change,builder,extra),selection,minFee,explicitFee,colla
 
 evaluateRequest :: Value -> IO Value
 evaluateRequest v = pure $ either (\e -> object ["ok" .= False,"error" .= e]) id $ parseEither parser v >>= \(ctx,tx) -> do
-  values <- traverse (fmap snd . liftE) (C.evaluateTransactionExecutionUnits C.ConwayEra (ctxStart ctx) (C.toLedgerEpochInfo (ctxHistory ctx)) (ctxParams ctx) (ctxUtxo ctx) (C.getTxBody tx))
+  values <- evaluateLedger ctx (C.getTxBody tx)
   pure $ object ["ok" .= True,"exUnits" .= map unitsJSON (Map.toList values)]
   where parser = withObject "evaluate" $ \o -> do
           (ctx,_,_,_,_) <- parseContext o
           tx <- o .: "cbor" >>= cbor (C.AsTx C.AsConwayEra)
           pure (ctx,tx)
+
+-- Keep memoized reference-script bytes in both fee calculation and evaluation.
+-- Cardano API's SimpleScript value intentionally discards their CBOR encoding.
+evaluateLedger ctx body = do
+  let C.ShelleyTx _ tx = C.makeSignedTransaction [] body
+      LedgerEpochInfo epochInfo = C.toLedgerEpochInfo (ctxHistory ctx)
+      evaluated = L.evalTxExUnitsWithLogs (C.unLedgerProtocolParameters (ctxParams ctx)) tx (ctxLedgerUtxo ctx) epochInfo (ctxStart ctx)
+  Map.fromList <$> traverse (\(purpose,result) -> do
+    (_,units) <- liftE result
+    pure (toScriptIndex C.AlonzoEraOnwardsConway purpose,C.fromAlonzoExUnits units)) (Map.toList evaluated)

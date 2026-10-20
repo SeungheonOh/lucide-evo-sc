@@ -4,7 +4,8 @@ import LiveTx
 import Cardano.Api qualified as C
 import Cardano.Api.Ledger qualified as L
 import Cardano.Api.Query (toLedgerUTxO)
-import Cardano.Api.Tx (toShelleyTxOut)
+import Cardano.Api.Tx (toShelleyTxOut, fromShelleyTxIn)
+import Cardano.Ledger.State qualified as UTxO
 import Cardano.Binary qualified as CB
 import Cardano.Ledger.Binary qualified as LB
 import Cardano.Ledger.Shelley.API (LedgerEnv(..), Coin(..))
@@ -62,7 +63,7 @@ simulatorRequest value = case parseEither parse value of
           (_,next) <- M.runMockchainT action params state
           pure (respond next [])
       "setFixtures" -> case parseEither (\o -> do
-          utxos <- o .: "utxos" >>= traverse resolvedOutput
+          utxos <- o .: "utxos" >>= traverse resolvedLedgerOutput
           datums <- o .: "datums" >>= traverse (cbor C.AsHashableScriptData)
           treasury <- intField o "treasury"
           deposit <- maybe (fail "Stake deposit is outside uint64") pure (toCompact (C.unLedgerProtocolParameters (npProtocolParameters params) ^. ppKeyDepositL))
@@ -79,7 +80,7 @@ simulatorRequest value = case parseEither parse value of
           pure (utxos,datums,treasury,Map.fromList entries)) request of
         Left e -> pure (failure e)
         Right (utxos,datums,treasury,accts) -> do
-          let ledger = toLedgerUTxO C.ShelleyBasedEraConway (C.UTxO (Map.fromList utxos))
+          let ledger = UTxO.UTxO (Map.fromList utxos)
               old = M.mcsPoolState state ^. Lens.utxoState
               deposits xs = sum [C.unCoin (fromCompact (a ^. LS.depositAccountStateL)) | a <- Map.elems xs]
               depositDelta = deposits accts - deposits (accounts state)
@@ -125,7 +126,7 @@ simulatorRequest value = case parseEither parse value of
       (ctx,_,_,_,_) <- parseContext contextObject
       let params = NodeParams (ctxNetwork ctx) (ctxParams ctx) (ctxStart ctx) (ctxHistory ctx) Set.empty (mkSlotLength 1)
       saved <- o .:? "state"
-      initialInputs <- o .:? "utxos" .!= [] >>= traverse resolvedOutput
+      initialInputs <- o .:? "utxos" .!= [] >>= traverse resolvedLedgerOutput
       initialPools <- o .:? "stakePools" .!= [] >>= traverse (\text -> case C.deserialiseFromBech32 text of
         Right pool -> pure pool
         Left _ -> raw (C.AsHash C.AsStakePoolKey) text)
@@ -134,7 +135,7 @@ simulatorRequest value = case parseEither parse value of
       state <- case saved of
         Nothing -> do
           let s = M.initialState params
-              ledger = toLedgerUTxO C.ShelleyBasedEraConway (C.UTxO (Map.fromList initialInputs))
+              ledger = UTxO.UTxO (Map.fromList initialInputs)
               us = smartUTxOState (C.unLedgerProtocolParameters (ctxParams ctx)) ledger (Coin 0) (Coin 0) def (Coin 0)
           pure s { M.mcsPoolState = M.mcsPoolState s & Lens.utxoState .~ us
                      & lsCertStateL . LS.certPStateL . LS.psStakePoolsL .~ Map.fromList [(h,def) | C.StakePoolKeyHash h <- initialPools],
@@ -155,8 +156,8 @@ simulatorRequest value = case parseEither parse value of
 
 encodeState state = object ["ledger" .= hexText (LB.serialize' (LB.natVersion @10) (M.mcsPoolState state)),"datums" .= map (hexText . C.serialiseToCBOR) (Map.elems (M.mcsDatums state)),"treasury" .= show (case ledgerAccount (M.mcsEnv state) of ChainAccountState (Coin t) _ -> t),"index" .= fromEnum (ledgerIx (M.mcsEnv state))]
 datumJSON state = [object ["hash" .= C.serialiseToRawBytesHexText h,"cbor" .= hexText (C.serialiseToCBOR d)] | (h,d) <- Map.toList (M.mcsDatums state)]
-outputs state = let C.UTxO utxos = M.fromLedgerUTxO C.ShelleyBasedEraConway (M.mcsPoolState state ^. Lens.utxoState . Lens._UTxOState . _1)
-                in [object ["input" .= inputText i, "cbor" .= hexText (LB.serialize' (LB.natVersion @10) (toShelleyTxOut C.ShelleyBasedEraConway o))] | (i,o) <- Map.toList utxos]
+outputs state = let UTxO.UTxO utxos = M.mcsPoolState state ^. Lens.utxoState . Lens._UTxOState . _1
+                in [object ["input" .= inputText (fromShelleyTxIn i), "cbor" .= hexText (LB.serialize' (LB.natVersion @10) o)] | (i,o) <- Map.toList utxos]
 
 accounts state = M.mcsPoolState state ^. lsCertStateL . certDStateL . accountsL . accountsMapL
 coinString :: Coin -> String

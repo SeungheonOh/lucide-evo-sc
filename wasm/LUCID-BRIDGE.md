@@ -9,12 +9,111 @@ existing pinned toolchain, then run `bash wasm/build.sh`.
 The original JSON actions and browser editor remain available. `capabilities`
 returns `bridgeVersion: 2`.
 
+## Persistent ledger reactor
+
+The build also produces `sc-tools-ledger.wasm`. This WASI reactor owns Lucid's
+address, key, script, Plutus data, CBOR, output, and transaction operations.
+`Ledger.hs` dispatches those operations to Cardano API, Cardano ledger,
+cardano-crypto, Convex, and the Haskell codecs. JavaScript supplies UTF-8 JSON and
+WASI services. No CML code or Rust WASM is part of this artifact.
+
+A browser asynchronously instantiates the reactor once. It then calls the
+exports synchronously, so existing synchronous Lucid utilities remain
+synchronous. This avoids Chromium's 8 MB limit on synchronous WASM instantiation.
+The same reactor accepts the original balancing and mockchain requests.
+
+The ABI exports these functions:
+
+| Export | Contract |
+| --- | --- |
+| `_initialize()` | Initializes WASI once through the host WASI adapter. |
+| `lucid_init()` | Initializes the Haskell runtime once after WASI. |
+| `lucid_alloc(length)` | Allocates an input byte buffer. |
+| `lucid_run(pointer, length)` | Reads UTF-8 JSON and returns an allocated result buffer. |
+| `lucid_result_len()` | Returns the previous result's byte length. |
+| `lucid_free(pointer)` | Frees an allocated input or result buffer. |
+| `memory` | Exposes the reactor's linear memory. |
+
+The caller reads the result before the next request and frees both buffers.
+Requests run serially within an instance. Memory views must be refreshed after
+calls because Haskell can grow linear memory. The host implements WASI
+`random_get` with secure operating-system or Web Crypto randomness.
+
+Primitive requests have the form
+`{ action: "ledger", operation, ...payload }`. Successful responses have
+`{ ok: true, result }`. Errors have `{ ok: false, error }`. Integer values use
+decimal strings when they cannot safely pass through JavaScript numbers.
+
+| Operation | Input fields | Result |
+| --- | --- | --- |
+| `cbor.encode` | `value`, optional `canonical` | CBOR hex. |
+| `cbor.decode` | `cbor` | A typed CBOR term. |
+| `cbor.canonical` | `cbor` | Canonical CBOR hex. |
+| `cbor.encodingLevel` | `cbor` | The script wrapper count, capped at two. |
+| `hash.blake2b` | `hex`, `size` of 28 or 32 | Digest hex. |
+| `data.encode` | Detailed-schema `data`, `canonical` | Plutus data CBOR hex. |
+| `data.decode` | `cbor` | Detailed-schema Plutus data. |
+| `data.hash` | `cbor` | Datum hash of the supplied encoding. |
+| `address.inspect` | `address` | Lucid address details. |
+| `address.fromCredentials` | `network`, `payment`, `stake` | Bech32 address. |
+| `key.generate` | None | Bech32 Ed25519 private key. |
+| `key.fromSeed` | `entropy`, `password`, `accountIndex`, `network`, `addressType` | Lucid seed-wallet keys and addresses. |
+| `key.fromPrivate` | `privateKey` | Bech32 public key, public key hex, and key hash. |
+| `key.hash` | `publicKey` as raw hex or bech32 | Key hash. |
+| `key.sign` | `privateKey`, `message` as hex | Signature hex. |
+| `key.verify` | `publicKey`, `message`, `signature` | Boolean. |
+| `native.encode` | Native JSON `script` | Native script CBOR hex. |
+| `script.hash` | Script `type`, `script` | Script hash. Plutus input contains two CBOR wrappers. |
+| `script.applyParams` | `script`, datum-CBOR `params` | Applied script CBOR with one wrapper. |
+| `output.encode` | Lucid `utxo` | Ledger transaction-output CBOR. |
+| `output.decode` | `cbor` | Lucid transaction output. |
+| `output.minAda` | `output` or `cbor`, `coinsPerUtxoByte` | Minimum lovelace. |
+| `tx.inspect` | `cbor` | Transaction details, body CBOR, Lucid outputs, datums, and redeemers. |
+| `tx.hash` | `cbor` | Transaction ID. |
+| `tx.minFee` | `cbor`, full `protocolParameters`, CIP-30 `utxos` | Minimum ledger fee for the current signatures. |
+| `tx.sign` | `cbor`, `privateKeys` | Witness-set CBOR. |
+| `tx.mergeWitnesses` | `cbor`, `witnessSets` | Transaction CBOR. |
+| `tx.canonical` | `cbor` | Transaction CBOR with canonical ledger containers and preserved Plutus encodings. |
+| `tx.requiredKeys` | `cbor`, Lucid `utxos` | Relevant key hashes for wallet signing. |
+
+CBOR terms use `{ int: "123" }`, `{ bytes: "abcd" }`, `{ text: "value" }`,
+`{ list: [...] }`, `{ map: [[key, value]] }`, and
+`{ tag: "258", value: term }`. Booleans and null are JSON literals. Lists and
+maps can set `indefinite: true` to preserve their encoding. The codec also
+supports `float` and `simple` terms for non-ledger CBOR consumers.
+
+`data.encode` preserves Lucid's established Plutus ordering, duplicate-map-key
+behavior, constructor encodings, and 64-byte byte-string chunks. `tx.inspect`
+returns datum and redeemer bytes from Cardano's memoized ledger values. It does
+not re-encode them through a JSON data model. `tx.canonical` preserves the
+complete original bytes of signed transactions. For unsigned transactions it
+normalizes ledger containers while retaining exact inline datum options and
+witness datums. Existing script integrity commitments also preserve the complete
+original datum and redeemer witness fields, including their container encodings.
+Auxiliary data covered by an existing metadata hash retains its exact bytes.
+Redeemer values retain their complete original encoding when
+canonicalizing data would change the order of Plutus map entries.
+
+Native scripts retain their original memoized CBOR through hashes, attached
+witnesses, reference outputs, fee calculation, evaluation, and mockchain state.
+Minimum ADA uses the serialized ledger output, including the original native
+reference bytes. Required signing keys come from the ledger's certificate and
+governance authorization rules.
+
+`node wasm/check-ledger.mjs` checks the built reactor directly. It covers key
+derivation, signatures, codecs, minimum ADA, transaction balance and signing,
+and submission to the actual convex-mockchain ledger.
+
 ## Balancing
 
 `balanceV2` accepts the original `chain`, `wallet`, `resolvedInputs`, and `blocks`
 plus `options`:
 
 - `coinSelection`: whether wallet inputs can fund the transaction.
+- `canonical`: canonicalize the transaction body before fee calculation and
+  evaluation, and normalize eligible redeemers before computing the script
+  integrity hash. Ordered Plutus maps retain their
+  encoding when canonicalization would change their value.
 - `minFee`, `setCollateral`: nonnegative decimal lovelace strings.
 - `explicitFee`: whether Lucid explicitly set the fee floor. Bootstrap candidates
   do not charge maximum synthetic execution budgets against that explicit fee;

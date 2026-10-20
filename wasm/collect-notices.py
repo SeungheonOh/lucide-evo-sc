@@ -21,7 +21,9 @@ def walk(key):
     for dep in nodes[key].get('depends', []):
         walk(dep)
 
-walk(next(key for key, node in nodes.items() if node['pkg-name'] == 'sc-tools-browser'))
+for key, node in nodes.items():
+    if node['pkg-name'] == 'sc-tools-browser':
+        walk(key)
 packages = {(nodes[key]['pkg-name'], nodes[key]['pkg-version']): nodes[key] for key in visited}
 notice = re.compile(r'^(unlicense|licen[cs]e|copying|copyright|notice)([.\-_].*)?$', re.I)
 sections = ['sc-tools browser runtime — third-party notices\n\n'

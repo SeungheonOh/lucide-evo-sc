@@ -10,10 +10,12 @@ import Control.Exception (SomeException, try, displayException)
 import LiveTx qualified
 import Simulator
 import LucidBalance
+import Ledger (ledgerRequest)
 handleRequest :: Value -> IO Value
 handleRequest value = do
   result <- try $ case parseEither (withObject "request" (.: "action")) value of
-    Right ("balanceV2" :: String) -> balanceRequest value
+    Right ("ledger" :: String) -> ledgerRequest value
+    Right "balanceV2" -> balanceRequest value
     Right "lucidContext" -> pure (contextRequest value)
     Right "mockchain" -> simulatorRequest value
     Right "evaluateV2" -> evaluateRequest value
@@ -21,7 +23,7 @@ handleRequest value = do
     _ -> LiveTx.handleRequest value
   pure $ LiveTx.exactJSON $ either (\e -> object ["ok" .= False,"error" .= displayException (e :: SomeException)]) id result
 
--- A balancing context has the same information as Lucid's CML configuration.
+-- A balancing context contains Lucid's provider parameters and slot mapping.
 -- All parameters used for fees, deposits, limits and script evaluation are
 -- supplied by Lucid. Defaults fill fields used only by consensus/governance
 -- transitions, which balancing never runs. This is not a live node snapshot.

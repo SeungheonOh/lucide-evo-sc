@@ -23,7 +23,8 @@ source "$toolchain_dir/env"
   exit 1
 }
 python3 wasm/prepare-dependencies.py
-wasm32-wasi-cabal build --project-file="$cache_dir/cabal.project" --builddir="$cache_dir/build" -j"${BUILD_JOBS:-4}" exe:sc-tools-browser
+wasm32-wasi-cabal build --project-file="$cache_dir/cabal.project" --builddir="$cache_dir/build" -j"${BUILD_JOBS:-4}" exe:sc-tools-browser exe:sc-tools-ledger
 executable=$(wasm32-wasi-cabal list-bin --project-file="$cache_dir/cabal.project" --builddir="$cache_dir/build" exe:sc-tools-browser)
-python3 wasm/package-runtime.py "$executable"
+reactor=$(wasm32-wasi-cabal list-bin --project-file="$cache_dir/cabal.project" --builddir="$cache_dir/build" exe:sc-tools-ledger)
+python3 wasm/package-runtime.py "$executable" "$reactor"
 python3 wasm/collect-notices.py "$toolchain_dir"
